@@ -6,6 +6,9 @@ M03 — Tensor Parallelism
     W2: row-parallel      [H_0, H_1] @ [W2_0; W2_1] -> all-reduce
 
 前向和反向的梯度都与 dense MLP 对齐。
+
+说明: 本 demo 在单进程内用 list of shards 模拟 N 个 rank, 通信原语
+      (all-reduce) 是纯 numpy 求和。真实分布式场景需 NCCL/Gloo 后端。
 """
 from __future__ import annotations
 

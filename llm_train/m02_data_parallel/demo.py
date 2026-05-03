@@ -3,6 +3,9 @@ M02 — Data Parallel / DDP
 
 每张卡保留完整模型副本, 处理不同数据 shard, 反向后 all-reduce 梯度。
 真实 PyTorch DDP 还会把梯度按 bucket 分组以重叠通信和反向计算。
+
+说明: 本 demo 在单进程内用 N 个 list 元素模拟 N 个 rank, 通信原语
+      (all-reduce) 是纯 numpy 求和。真实分布式场景需 NCCL/Gloo 后端。
 """
 from __future__ import annotations
 

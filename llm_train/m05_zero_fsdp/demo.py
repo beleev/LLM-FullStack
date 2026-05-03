@@ -7,6 +7,10 @@ DDP 每张卡都有完整 params / grads / optimizer states。ZeRO 和 FSDP 的�
     - ZeRO-3/FSDP: params + gradients + optimizer states 都分片
 
 本 demo 用一个向量参数演示 reduce-scatter 梯度 + 本地 shard 更新 + all-gather 参数。
+
+说明: 在单进程内用 N 个 list 元素模拟 N 个 rank, 通信原语 (reduce-scatter /
+      all-gather) 是纯 numpy 操作。算法流程与真实 ZeRO/FSDP 一致, 但生产
+      环境需 NCCL/Gloo 后端实现跨卡通信。
 """
 from __future__ import annotations
 
