@@ -2,7 +2,7 @@
   <div>
     <h1 class="page-title">规模化训练 · 把单机 loop 拆成分布式系统</h1>
     <p class="page-subtitle">
-      <code class="inline">llm_train/</code> 用 numpy 把真实训练框架里最常见的机制压成小张量演示。
+      <RepoLink path="llm_train/" label="llm_train/" tiny /> 用 numpy 把真实训练框架里最常见的机制压成小张量演示。
       重点不是模拟 GPU, 而是看清楚: 同一个 <code class="inline">loss → grad → update</code>
       如何在多卡、低精度、显存受限和故障恢复下仍然保持数学等价。
     </p>
@@ -58,7 +58,7 @@
               <td class="axis">{{ a.name }}</td>
               <td>{{ a.problem }}</td>
               <td>{{ a.equiv }}</td>
-              <td class="mono small">{{ a.file }}</td>
+              <td class="mono small"><RepoLink :path="`llm_train/${a.file}`" :label="a.file" tiny /></td>
             </tr>
           </tbody>
         </table>
@@ -77,7 +77,7 @@
           <h3>{{ c.title }} <span class="tag">{{ c.tag }}</span></h3>
           <p class="desc">{{ c.desc }}</p>
           <pre class="code">{{ c.code }}</pre>
-          <p class="hint"><strong>看代码:</strong> <code class="inline">{{ c.file }}</code></p>
+          <p class="hint"><strong>看代码:</strong> <CodeRef :value="c.file" base="llm_train/" tiny /></p>
         </div>
       </div>
     </section>
@@ -85,8 +85,8 @@
     <section class="section">
       <h2>4. 从 llm_basic 到 full_loop</h2>
       <p class="lead">
-        <code class="inline">llm_basic/train.py</code> 的主循环只有 get_batch、forward、loss、backward、update。
-        <code class="inline">llm_train/full_loop/demo.py</code> 没有改变这条语义, 只是把每一步展开成工程动作。
+        <RepoLink path="llm_basic/train.py" label="llm_basic/train.py" tiny /> 的主循环只有 get_batch、forward、loss、backward、update。
+        <RepoLink path="llm_train/full_loop/demo.py" label="llm_train/full_loop/demo.py" tiny /> 没有改变这条语义, 只是把每一步展开成工程动作。
       </p>
       <div class="grid grid-2" style="gap: 16px;">
         <div class="card">
@@ -122,7 +122,8 @@
       <h2>5. 模块索引 · 运行时看什么</h2>
       <p class="lead">
         每个模块都会打印"现象 → 数字 → 结论"。先跑单模块, 再跑
-        <code class="inline">python -m llm_train.run_all</code> 看完整学习顺序。
+        <code class="inline">python -m llm_train.run_all</code> 看完整学习顺序
+        (<RepoLink path="llm_train/run_all.py" label="llm_train/run_all.py" tiny />)。
       </p>
       <div class="card" style="padding: 0; overflow-x: auto;">
         <table class="train-table">
@@ -139,7 +140,7 @@
               <td class="axis">{{ m.name }}</td>
               <td>{{ m.concept }}</td>
               <td>{{ m.link }}</td>
-              <td class="mono small">{{ m.file }}</td>
+              <td class="mono small"><RepoLink :path="m.file" tiny /></td>
             </tr>
           </tbody>
         </table>
@@ -157,6 +158,8 @@
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import EvolutionChain from '@/components/EvolutionChain.vue'
+import CodeRef from '@/components/CodeRef.vue'
+import RepoLink from '@/components/RepoLink.vue'
 import { trainModules } from '@/data/models.js'
 
 const trainChain = [

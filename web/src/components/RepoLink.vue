@@ -1,27 +1,22 @@
 <template>
   <a
-    v-if="!isGlob"
     class="repo-ref"
-    :class="[variant, { tiny }]"
+    :class="[variant, { tiny, glob: isGlob }]"
     :href="href"
     target="_blank"
     rel="noopener"
-    :title="`查看源码 · ${displayPath}`"
+    :title="`查看源码 · ${targetPath || displayPath}`"
   >
     <span class="ref-icon" aria-hidden="true">{{ icon }}</span>
     <code class="ref-path">{{ displayLabel }}</code>
     <span v-if="lineDisplay" class="ref-line">L{{ lineDisplay }}</span>
     <span class="ref-arrow" aria-hidden="true">↗</span>
   </a>
-  <code v-else class="repo-ref glob" :class="{ tiny }" :title="'通配路径 — 不直接跳转'">
-    <span class="ref-icon" aria-hidden="true">∗</span>
-    {{ displayLabel }}
-  </code>
 </template>
 
 <script setup>
 import { computed } from 'vue'
-import { repoUrl, parseRef } from '@/utils/repo.js'
+import { repoUrl, parseRef, concreteRepoPath } from '@/utils/repo.js'
 
 const props = defineProps({
   path:    { type: String, required: true },
@@ -38,9 +33,11 @@ const lineDisplay = computed(() => lineNum.value || null)
 const href = computed(() => repoUrl(displayPath.value, lineNum.value))
 const displayLabel = computed(() => props.label || displayPath.value)
 const isGlob = computed(() => /[{*]|\.\.|,/.test(displayPath.value))
+const targetPath = computed(() => concreteRepoPath(displayPath.value))
 const icon = computed(() => {
-  if (displayPath.value.endsWith('/')) return '📁'
-  if (displayPath.value.endsWith('.py')) return '🐍'
+  if (isGlob.value) return '∗'
+  if (targetPath.value.endsWith('/')) return '📁'
+  if (targetPath.value.endsWith('.py')) return '🐍'
   return '📄'
 })
 </script>
@@ -100,9 +97,8 @@ const icon = computed(() => {
   transition: all 0.12s;
 }
 .repo-ref.glob {
-  cursor: default;
   color: var(--text-muted);
   border-style: dashed;
 }
-.repo-ref.glob:hover { color: var(--text-muted); border-color: var(--border); }
+.repo-ref.glob:hover { color: var(--accent); border-color: var(--accent); }
 </style>

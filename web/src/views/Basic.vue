@@ -2,10 +2,10 @@
   <div>
     <h1 class="page-title">最小可跑闭环 · 用 numpy 把 Transformer 写穿</h1>
     <p class="page-subtitle">
-      <code class="inline">llm_basic/</code> 不依赖 PyTorch, 用 numpy 当"会广播的容器",
+      <RepoLink path="llm_basic/" label="llm_basic/" tiny /> 不依赖 PyTorch, 用 numpy 当"会广播的容器",
       把 forward / backward / Adam / 采样全部肉眼可见地展开。
       <strong>它的任务只有一个</strong>: 让你看清楚梯度是怎么流过模型的 — 以后再看
-      llm_models 里的 PyTorch 代码, 你会知道每一行 autograd 在背后做了什么。
+      <RepoLink path="llm_models/" label="llm_models/" tiny /> 里的 PyTorch 代码, 你会知道每一行 autograd 在背后做了什么。
     </p>
 
     <ChapterIntro
@@ -42,19 +42,19 @@
           <table class="pipeline">
             <tbody>
               <tr>
-                <td class="pp-name mono">prepare.py</td>
-                <td class="pp-desc">下载 Tiny Shakespeare → 字符级编码 → <code class="inline">train.bin / val.bin / meta.npz</code></td>
+                <td class="pp-name mono"><RepoLink path="llm_basic/prepare.py" label="prepare.py" tiny /></td>
+                <td class="pp-desc">下载 Tiny Shakespeare → 字符级编码 → <RepoLink path="llm_basic/train.bin" label="train.bin" tiny /> / <RepoLink path="llm_basic/val.bin" label="val.bin" tiny /> / <RepoLink path="llm_basic/meta.npz" label="meta.npz" tiny /></td>
               </tr>
               <tr>
-                <td class="pp-name mono">train.py</td>
+                <td class="pp-name mono"><RepoLink path="llm_basic/train.py" label="train.py" tiny /></td>
                 <td class="pp-desc">5 行循环: get_batch → forward → loss → backward → adam_step (~2 分钟跑 2000 步, val_loss 4.17 → 1.9)</td>
               </tr>
               <tr>
-                <td class="pp-name mono">sample.py</td>
+                <td class="pp-name mono"><RepoLink path="llm_basic/sample.py" label="sample.py" tiny /></td>
                 <td class="pp-desc">加载 ckpt → 自回归生成 (temperature + top-k)</td>
               </tr>
               <tr>
-                <td class="pp-name mono">gradcheck.py</td>
+                <td class="pp-name mono"><RepoLink path="llm_basic/gradcheck.py" label="gradcheck.py" tiny /></td>
                 <td class="pp-desc">数值梯度 vs 解析梯度, 逐参数验证 backward 写对了 (~1 秒)</td>
               </tr>
             </tbody>
@@ -62,7 +62,7 @@
         </div>
 
         <div class="card">
-          <h3>7 个函数对 <span class="tag">model.py 全貌</span></h3>
+          <h3>7 个函数对 <span class="tag"><RepoLink path="llm_basic/model.py" label="model.py" tiny /></span></h3>
           <table class="pairs">
             <tbody>
               <tr v-for="p in pairs" :key="p.name">
@@ -89,7 +89,7 @@
         <pre class="code">{{ modelDiagram }}</pre>
         <p class="hint">
           形状: <code class="inline">B=batch, T=seq_len, D=dim, V=vocab</code>。
-          完整代码见 <code class="inline">llm_basic/model.py:transformer_forward</code>。
+          完整代码见 <RepoLink path="llm_basic/model.py:transformer_forward" label="llm_basic/model.py:transformer_forward" tiny />。
         </p>
       </div>
     </section>
@@ -107,7 +107,7 @@
           <p class="desc" style="margin-bottom: 10px;">{{ g.intuition }}</p>
           <pre class="code">{{ g.formula }}</pre>
           <p class="hint" style="margin-top: 8px;">
-            <strong>代码位置:</strong> <code class="inline">{{ g.where }}</code>
+            <strong>代码位置:</strong> <RepoLink :path="`llm_basic/${g.where}`" :label="g.where" tiny />
           </p>
         </div>
       </div>
@@ -123,7 +123,7 @@
 
       <div class="grid grid-2" style="gap: 16px;">
         <div class="card">
-          <h3>train.py 主循环 <span class="tag">5 行而已</span></h3>
+          <h3><RepoLink path="llm_basic/train.py" label="train.py" tiny /> 主循环 <span class="tag">5 行而已</span></h3>
           <pre class="code">{{ trainLoopCode }}</pre>
           <p class="hint">
             没有 <code class="inline">zero_grad()</code> — 因为我们每步都返回新 dict;
@@ -133,14 +133,14 @@
         </div>
 
         <div class="card">
-          <h3>Adam · 4 步 + 2 个修正 <span class="tag">optim.py</span></h3>
+          <h3>Adam · 4 步 + 2 个修正 <span class="tag"><RepoLink path="llm_basic/optim.py" label="optim.py" tiny /></span></h3>
           <pre class="code">{{ adamCode }}</pre>
           <div class="adam-why">
             <p><strong>为什么不用 SGD?</strong></p>
             <p class="hint">
               Transformer 各层梯度尺度差异大 (lm_head 远大于 embedding),
               SGD 单一学习率压不住。Adam 用二阶矩 √v̂ 给每个参数自适应缩放,
-              小学习率也能稳定收敛。代码就 30 行 (<code class="inline">optim.py</code>)。
+              小学习率也能稳定收敛。代码就 30 行 (<RepoLink path="llm_basic/optim.py" label="optim.py" tiny />)。
             </p>
           </div>
         </div>
@@ -169,7 +169,7 @@
     <section class="section">
       <h2>6. 这版本省了什么 · 引出阶段 2</h2>
       <p class="lead">
-        下面每一行的"真模型怎么做"对应 <code class="inline">llm_models/</code>
+        下面每一行的"真模型怎么做"对应 <RepoLink path="llm_models/" label="llm_models/" tiny />
         下的某个组件。看懂了这张表, 阶段 2 的每个章节都是在补一行。
       </p>
       <div class="card" style="padding: 0; overflow-x: auto;">
@@ -191,6 +191,7 @@
                 <router-link v-if="d.route" :to="{ name: d.route }" class="dt-link">
                   {{ d.routeLabel }} →
                 </router-link>
+                <RepoLink v-else-if="d.file" :path="d.file" :label="d.routeLabel" tiny />
                 <span v-else class="muted small">{{ d.routeLabel }}</span>
               </td>
             </tr>
@@ -209,6 +210,7 @@
 <script setup>
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
+import RepoLink from '@/components/RepoLink.vue'
 
 const pairs = [
   { name: 'embedding',   role: 'token / pos lookup',          key: 'np.add.at 处理重复索引' },
@@ -319,7 +321,7 @@ const diffs = [
   { topic: '层数',      basic: '1 层',                      modern: 'N 层 (一个 for 循环就够)',            route: 'blocks', routeLabel: '阶段 2.3' },
   { topic: 'FFN 形态',  basic: '稠密 MLP',                  modern: 'MoE: 一组小 FFN + router top-k',       route: 'moe', routeLabel: '阶段 2.4' },
   { topic: '推理',      basic: '每步重算整段 forward',      modern: 'KV cache: 只算新 token 的 Q, 复用 K/V',  route: 'infer-kv-memory', routeLabel: '阶段 5.1' },
-  { topic: '优化器',    basic: '裸 Adam',                   modern: 'AdamW + warmup + cosine + grad clip',  routeLabel: '(参考 llm_models/training/trainer.py)' },
+  { topic: '优化器',    basic: '裸 Adam',                   modern: 'AdamW + warmup + cosine + grad clip',  routeLabel: '参考 trainer.py', file: 'llm_models/training/trainer.py' },
   { topic: '精度',      basic: '全 float64 (gradcheck 需要)', modern: 'bf16 / fp16 混合精度 + loss scaling',  route: 'train', routeLabel: '阶段 3' },
 ]
 </script>

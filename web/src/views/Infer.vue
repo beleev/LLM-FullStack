@@ -2,7 +2,7 @@
   <div>
     <h1 class="page-title">推理与部署优化 · 从能生成到高吞吐服务</h1>
     <p class="page-subtitle">
-      <code class="inline">llm_infer/</code> 把训练好的自回归模型放进服务环境:
+      <RepoLink path="llm_infer/" label="llm_infer/" tiny /> 把训练好的自回归模型放进服务环境:
       同样是不断生成下一个 token, 但目标从"loss 下降"变成"首 token 快、吞吐高、显存稳、输出可控"。
     </p>
 
@@ -57,7 +57,7 @@
           <pre class="code">{{ cacheCode }}</pre>
           <p class="hint">
             首步 prefill 保存每层 K/V, 后续 <code class="inline">decode_step</code>
-            只处理一个新 token。对应 <code class="inline">llm_infer/m01_kv_cache/demo.py</code>。
+            只处理一个新 token。对应 <RepoLink path="llm_infer/m01_kv_cache/demo.py" label="llm_infer/m01_kv_cache/demo.py" tiny />。
           </p>
         </div>
       </div>
@@ -74,7 +74,7 @@
           <h3>{{ p.name }} <span class="tag">{{ p.tag }}</span></h3>
           <p class="desc">{{ p.desc }}</p>
           <pre class="code">{{ p.code }}</pre>
-          <p class="hint"><code class="inline">{{ p.file }}</code></p>
+          <p class="hint"><CodeRef :value="p.file" base="llm_infer/" tiny /></p>
         </div>
       </div>
     </section>
@@ -100,7 +100,7 @@
               <td class="axis">{{ m.name }}</td>
               <td>{{ m.concept }}</td>
               <td>{{ m.link }}</td>
-              <td class="mono small">{{ m.file }}</td>
+              <td class="mono small"><RepoLink :path="m.file" tiny /></td>
             </tr>
           </tbody>
         </table>
@@ -110,7 +110,7 @@
     <section class="section">
       <h2>5. full_engine · 把模块接成服务主循环</h2>
       <p class="lead">
-        <code class="inline">full_engine/engine.py</code> 是最值得对照原始代码读的一页:
+        <RepoLink path="llm_infer/full_engine/engine.py" label="full_engine/engine.py" tiny /> 是最值得对照原始代码读的一页:
         它不追求完整 vLLM, 但把 add_request、prefill、decode、block manager、prefix cache 和 sampling 串在同一条控制流里。
       </p>
       <div class="grid grid-2" style="gap: 16px;">
@@ -142,7 +142,7 @@
           <tbody>
             <tr v-for="r in engineMap" :key="r.concept">
               <td class="axis">{{ r.concept }}</td>
-              <td class="mono small">{{ r.file }}</td>
+              <td class="mono small"><CodeRef :value="r.file" base="llm_infer/" tiny /></td>
               <td>{{ r.focus }}</td>
             </tr>
           </tbody>
@@ -161,6 +161,8 @@
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import EvolutionChain from '@/components/EvolutionChain.vue'
+import CodeRef from '@/components/CodeRef.vue'
+import RepoLink from '@/components/RepoLink.vue'
 import { inferModules } from '@/data/models.js'
 
 const inferChain = [

@@ -184,14 +184,12 @@ import { tracks, timeline } from '@/data/models.js'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import RepoLink from '@/components/RepoLink.vue'
+import { splitRefs } from '@/utils/repo.js'
 
 // 把 "a.py + b.py" 形式的多文件 / 含通配符的文件描述拆成可链接片段
 const splitFiles = (s) => {
   if (!s) return []
-  return String(s)
-    .split(/(?:\s\+\s|\s·\s|,\s*)/)
-    .map(x => x.trim())
-    .filter(Boolean)
+  return splitRefs(s, 'auto').map(r => r.label || r.path)
 }
 
 // 模型表里的 m.file 是相对 llm_models/ 的, 这里补回前缀

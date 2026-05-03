@@ -41,8 +41,7 @@
           <div class="onboard-num">2</div>
           <h3>需要先会什么</h3>
           <p class="desc">
-            会一点 Python + 高中线性代数即可。<br>
-            <span class="muted-line">不需要 PyTorch — 阶段 1 用 numpy 把所有东西摊开。</span>
+            会一点 Python + 高中线性代数即可。<span class="muted-line">不需要 PyTorch — 阶段 1 用 numpy 把所有东西摊开。</span>
           </p>
         </div>
         <div class="card onboard-card">
@@ -118,7 +117,13 @@
               <span v-for="c in s.chapters" :key="c.route" class="mono file-tag">{{ c.label }}</span>
             </div>
             <div v-else-if="s.files" class="stage-files">
-              <span v-for="f in s.files" :key="f" class="mono file-tag">{{ f }}</span>
+              <RepoLink
+                v-for="f in s.files"
+                :key="f"
+                :path="`${s.code}${f}`"
+                :label="f"
+                tiny
+              />
             </div>
             <div v-else-if="s.note" class="stage-note">{{ s.note }}</div>
           </component>
@@ -145,7 +150,7 @@
       </div>
 
       <div class="timeline-wrap card">
-        <svg :viewBox="`0 0 ${W} ${H}`" width="100%" :height="H">
+        <svg class="timeline-svg" :viewBox="`0 0 ${W} ${H}`" width="100%" :height="H">
           <g>
             <line v-for="y in years" :key="'yg-'+y"
                   :x1="xOfYear(y)" :x2="xOfYear(y)"
@@ -171,12 +176,12 @@
              @click="goto(m.id)"
              @mouseenter="hover = m.id" @mouseleave="hover = null"
              class="node">
-            <circle :cx="xOfYear(m.year) + nudge(m)" :cy="trackY(m.track)"
+            <circle :cx="nodeX(m)" :cy="trackY(m.track)"
                     :r="hover === m.id ? 10 : 7"
                     :fill="tracks[m.track].color"
                     stroke="var(--bg-card)" stroke-width="2.5" />
-            <text :x="xOfYear(m.year) + nudge(m)"
-                  :y="trackY(m.track) - 14"
+            <text :x="labelX(m)"
+                  :y="labelY(m)"
                   text-anchor="middle"
                   font-size="11"
                   :fill="hover === m.id ? 'var(--text)' : 'var(--text-muted)'"
@@ -199,7 +204,9 @@
               <span class="v mono">{{ v }}</span>
             </div>
           </div>
-          <div class="hover-foot mono">{{ hovered.file }}</div>
+          <div class="hover-foot mono">
+            <RepoLink :path="`llm_models/${hovered.file}`" :label="hovered.file" tiny />
+          </div>
         </div>
       </div>
     </section>
@@ -260,12 +267,21 @@ const xOfYear = (y) => {
 }
 const trackY = (k) => ({ left: 80, eye: 160, right: 240 }[k])
 
-const nudge = (m) => {
-  const same = timeline.filter(x => x.year === m.year && x.track === m.track)
+const sameSlot = (m) =>
+  timeline
+    .filter(x => x.year === m.year && x.track === m.track)
+    .sort((a, b) => a.id.localeCompare(b.id))
+
+const slotOffset = (m, step) => {
+  const same = sameSlot(m)
   if (same.length <= 1) return 0
   const idx = same.findIndex(x => x.id === m.id)
-  return (idx - (same.length - 1) / 2) * 26
+  return (idx - (same.length - 1) / 2) * step
 }
+
+const nodeX = (m) => xOfYear(m.year) + slotOffset(m, 30)
+const labelX = (m) => xOfYear(m.year) + slotOffset(m, 84)
+const labelY = (m) => trackY(m.track) - 28 + slotOffset(m, 18)
 
 const labels = {
   attn: '注意力',
@@ -520,7 +536,14 @@ const toFor = (s) => {
   border-radius: 50%;
 }
 
-.timeline-wrap { position: relative; }
+.timeline-wrap {
+  position: relative;
+  overflow-x: auto;
+}
+.timeline-svg {
+  display: block;
+  min-width: 960px;
+}
 .node { cursor: pointer; transition: all 0.15s; }
 
 .hover-card {

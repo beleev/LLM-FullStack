@@ -2,7 +2,7 @@
   <div>
     <h1 class="page-title">Agent 应用层 · 把模型接成可行动系统</h1>
     <p class="page-subtitle">
-      <code class="inline">llm_agent/</code> 不接真实 LLM API, 而是用可预测的
+      <RepoLink path="llm_agent/" label="llm_agent/" tiny /> 不接真实 LLM API, 而是用可预测的
       <code class="inline">RuleBasedLLM</code> 把应用层 harness 摊开:
       工具、权限、上下文、记忆、扩展、持久化和子智能体如何围绕一个很薄的 loop 工作。
     </p>
@@ -48,7 +48,7 @@
           <h3>{{ p.name }} <span class="tag">{{ p.tag }}</span></h3>
           <p class="desc">{{ p.desc }}</p>
           <pre class="code">{{ p.code }}</pre>
-          <p class="hint"><code class="inline">{{ p.file }}</code></p>
+          <p class="hint"><CodeRef :value="p.file" base="llm_agent/" tiny /></p>
         </div>
       </div>
     </section>
@@ -82,7 +82,7 @@
       <h2>4. 模块索引 · 运行时看什么</h2>
       <p class="lead">
         每个 demo 都可以单独跑; <code class="inline">python -m llm_agent.run_all</code>
-        会按学习路径整体跑一遍。
+        会按学习路径整体跑一遍 (<RepoLink path="llm_agent/run_all.py" label="llm_agent/run_all.py" tiny />)。
       </p>
       <div class="card" style="padding: 0; overflow-x: auto;">
         <table class="agent-table">
@@ -99,7 +99,7 @@
               <td class="axis">{{ m.name }}</td>
               <td>{{ m.concept }}</td>
               <td>{{ m.link }}</td>
-              <td class="mono small">{{ m.file }}</td>
+              <td class="mono small"><RepoLink :path="m.file" tiny /></td>
             </tr>
           </tbody>
         </table>
@@ -109,7 +109,7 @@
     <section class="section">
       <h2>5. full_loop · mini-Claude-Code-style harness</h2>
       <p class="lead">
-        <code class="inline">full_loop/demo.py</code> 把所有机制接到同一个 Agent 中:
+        <RepoLink path="llm_agent/full_loop/demo.py" label="full_loop/demo.py" tiny /> 把所有机制接到同一个 Agent 中:
         search、note、weather、shell、delegate 五类工具共用一条执行面。
       </p>
       <div class="grid grid-2" style="gap: 16px;">
@@ -130,6 +130,7 @@
           </div>
           <p class="hint">
             对应命令: <code class="inline">python -m llm_agent.full_loop.demo</code>
+            (<RepoLink path="llm_agent/full_loop/demo.py" label="源码" tiny />)
           </p>
         </div>
       </div>
@@ -146,6 +147,8 @@
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import EvolutionChain from '@/components/EvolutionChain.vue'
+import CodeRef from '@/components/CodeRef.vue'
+import RepoLink from '@/components/RepoLink.vue'
 import { agentModules } from '@/data/models.js'
 
 const agentChain = [

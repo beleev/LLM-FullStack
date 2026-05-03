@@ -189,7 +189,7 @@ K_n = R(nθ) · k
 
     <section class="section">
       <h2>代码路径</h2>
-      <p class="lead">本页对应 <code class="inline">llm_models/layers/core/position_encoding.py</code> 的三个类 — 注意它们都在 <code class="inline">core/</code> 子包内, 因为任何 Transformer 都会复用其中之一。</p>
+      <p class="lead">本页对应 <RepoLink path="llm_models/layers/core/position_encoding.py" label="llm_models/layers/core/position_encoding.py" tiny /> 的三个类 — 注意它们都在 <RepoLink path="llm_models/layers/core/" label="core/" tiny /> 子包内, 因为任何 Transformer 都会复用其中之一。</p>
       <div class="grid grid-3">
         <div class="card"><h3 style="font-size: 13px;">SinPositionalEncoding</h3><p class="desc">原始 Transformer, 加在 embedding 上。绝对位置, 长度外推差。</p></div>
         <div class="card"><h3 style="font-size: 13px;">RotaryPositionalEncoding</h3><p class="desc">对 Q/K 做旋转, 编码相对位置。无可学参数, 长度可外推。</p></div>
@@ -209,6 +209,7 @@ import { ref, computed } from 'vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import EvolutionChain from '@/components/EvolutionChain.vue'
+import RepoLink from '@/components/RepoLink.vue'
 
 const variants = [
   { id: 'sin',   label: 'Sinusoidal (2017)' },

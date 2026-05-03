@@ -166,7 +166,7 @@
             </div>
             <p class="desc" style="margin-top: 16px; max-width: 280px;">
               N = <span class="mono">{{ N }}</span> 个 token 的因果注意力矩阵。
-              <span v-if="current.id === 'dsa'"><br>sparse_top_k = <span class="mono">{{ Math.min(p.sparse_top_k, N) }}</span>, 每行仅亮 top-k 列。</span>
+              <span v-if="current.id === 'dsa'">sparse_top_k = <span class="mono">{{ Math.min(p.sparse_top_k, N) }}</span>, 每行仅亮 top-k 列。</span>
             </p>
           </div>
         </div>
@@ -176,7 +176,7 @@
     <!-- 源码速览 -->
     <section class="section">
       <h2>核心代码</h2>
-      <p class="lead">对应 <code class="inline">llm_models/layers/core/attention.py</code> 里的 <span class="mono">{{ classFor(current.id) }}</span> — 当前选中的变体即此类。</p>
+      <p class="lead">对应 <RepoLink path="llm_models/layers/core/attention.py" label="llm_models/layers/core/attention.py" tiny /> 里的 <span class="mono">{{ classFor(current.id) }}</span> — 当前选中的变体即此类。</p>
       <pre class="code" v-html="highlight(codeSnippet)"></pre>
     </section>
 
@@ -193,6 +193,7 @@ import { variants } from '@/data/attention.js'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import EvolutionChain from '@/components/EvolutionChain.vue'
+import RepoLink from '@/components/RepoLink.vue'
 
 const evoSteps = [
   { name: 'MHA', year: 2017, color: '#9ca3af',

@@ -4,7 +4,7 @@
     <p class="page-subtitle">
       本库的核心设计洞察: <strong>模型差异集中在"构造参数"而非"新类"</strong>。
       从下面的零件菜单里各选一个, 看看你拼出了哪个模型。对应
-      <code class="inline">llm_models/layers/core/blocks.py::PreLNBlock(attn, ffn, norm_cls)</code>。
+      <RepoLink path="llm_models/layers/core/blocks.py:PreLNBlock" label="llm_models/layers/core/blocks.py::PreLNBlock(attn, ffn, norm_cls)" tiny />。
     </p>
 
     <ChapterIntro
@@ -214,7 +214,8 @@
       <h2>内部矩阵变换</h2>
       <p class="lead">
         展开所选零件的"计算流 + 权重矩阵"。每一步都标注张量的符号形状与按当前参数计算出的数值;
-        拖动形状滑条, 所有数字会同步刷新。源代码: <code class="inline">llm_models/layers/core/{attention,feedforward,normalization,position_encoding}.py</code>。
+        拖动形状滑条, 所有数字会同步刷新。源代码:
+        <RepoLink path="llm_models/layers/core/{attention,feedforward,normalization,position_encoding}.py" label="llm_models/layers/core/{attention,feedforward,normalization,position_encoding}.py" tiny />。
       </p>
       <InspectorPanel :config="config" :tab="inspectorTab" @update:tab="inspectorTab = $event" />
     </section>
@@ -232,6 +233,7 @@ import { tracks } from '@/data/models.js'
 import InspectorPanel from '@/components/InspectorPanel.vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
+import RepoLink from '@/components/RepoLink.vue'
 
 const inspectorTab = ref('attn')
 

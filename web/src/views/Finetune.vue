@@ -3,7 +3,7 @@
     <h1 class="page-title">任务适配 · SFT / LoRA / DPO</h1>
     <p class="page-subtitle">
       微调的核心问题是: <strong>用尽量少的数据和算力, 把一个通用 base model 拨到具体任务上</strong>。
-      <code class="inline">llm_finetune/</code> 用三个最小可跑的实现, 串起从"全参 SFT"到
+      <RepoLink path="llm_finetune/" label="llm_finetune/" tiny /> 用三个最小可跑的实现, 串起从"全参 SFT"到
       "PEFT (LoRA)"再到"无 RM 的偏好对齐 (DPO)"的完整脉络。
     </p>
 
@@ -68,8 +68,7 @@
             (都是带 -100 的 cross_entropy)。单独命名是为了:
             <strong>1)</strong> 教学叙事清晰; <strong>2)</strong> 留扩展位
             (NEFTune 噪声 / focal-style 加权); <strong>3)</strong> 与 DPOLoss 命名对仗。
-            <br/>
-            对应代码: <code class="inline">llm_finetune/methods/sft.py:SFTLoss</code>
+            对应代码: <RepoLink path="llm_finetune/methods/sft.py:SFTLoss" label="llm_finetune/methods/sft.py:SFTLoss" tiny />
           </p>
         </div>
       </div>
@@ -145,8 +144,7 @@
           </div>
         </div>
         <p class="hint">
-          代码: <code class="inline">llm_finetune/methods/lora.py:LoRALinear / apply_lora /
-          merge_lora_weights / get_lora_state_dict</code>
+          代码: <RepoLink path="llm_finetune/methods/lora.py:LoRALinear" label="llm_finetune/methods/lora.py:LoRALinear / apply_lora / merge_lora_weights / get_lora_state_dict" tiny />
         </p>
       </div>
 
@@ -196,8 +194,8 @@
           <p class="hint">
             为什么 ref 用 <code class="inline">no_grad</code> + <code class="inline">eval()</code>?
             前者省激活显存, 后者关掉 dropout 让 log π_ref 是确定函数。
-            否则随机性会污染偏好梯度。<br/>
-            代码: <code class="inline">llm_finetune/methods/dpo.py:DPOLoss / DPOTrainer.train_step</code>
+            否则随机性会污染偏好梯度。
+            代码: <RepoLink path="llm_finetune/methods/dpo.py:DPOLoss" label="llm_finetune/methods/dpo.py:DPOLoss / DPOTrainer.train_step" tiny />
           </p>
         </div>
       </div>
@@ -268,6 +266,7 @@
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import EvolutionChain from '@/components/EvolutionChain.vue'
+import RepoLink from '@/components/RepoLink.vue'
 
 const alignSteps = [
   { name: 'SFT',        year: '2022',

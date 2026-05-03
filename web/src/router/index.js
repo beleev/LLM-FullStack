@@ -43,6 +43,12 @@ const routes = [
 
   // ── 阶段 2 · llm_models (5 章) ────────────────────────────────────
   {
+    path: '/models',
+    name: 'models',
+    component: () => import('@/views/Models.vue'),
+    meta: { title: '常见模型结构', stage: 'models', chapter: '阶段 2 · llm_models' },
+  },
+  {
     path: '/attention',
     name: 'attention',
     component: () => import('@/views/Attention.vue'),

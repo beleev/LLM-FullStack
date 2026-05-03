@@ -32,37 +32,53 @@
 
         <!-- 六阶段 -->
         <template v-for="s in stages" :key="s.id">
-          <div class="section-label">
-            阶段 {{ s.idx }} · <span class="mono">{{ s.code }}</span>
-            <span v-if="s.status === 'planned'" class="planned-tag">待补</span>
-          </div>
+          <section class="nav-stage" :class="{ open: isStageOpen(s.id) }">
+            <button
+              class="stage-toggle"
+              type="button"
+              :aria-expanded="isStageOpen(s.id)"
+              :aria-controls="`stage-${s.id}-nav`"
+              @click="toggleStage(s.id)"
+            >
+              <span class="idx">{{ s.idx }}</span>
+              <span class="stage-toggle-title">阶段 {{ s.idx }} · {{ s.title }}</span>
+              <span v-if="s.status === 'planned'" class="planned-tag">待补</span>
+              <span class="chevron" aria-hidden="true">▾</span>
+            </button>
 
-          <!-- ready & 单页 -->
-          <router-link
-            v-if="s.status === 'ready' && s.route"
-            :to="{ name: s.route }"
-            class="nav-link"
-          >
-            <span class="idx">{{ s.idx }}</span>
-            <span>{{ chapterTitle(s.route) }}</span>
-          </router-link>
+            <div
+              v-show="isStageOpen(s.id)"
+              :id="`stage-${s.id}-nav`"
+              class="stage-links"
+            >
+              <!-- ready & 阶段总览 -->
+              <router-link
+                v-if="s.status === 'ready' && s.route"
+                :to="{ name: s.route }"
+                class="nav-link sub overview"
+              >
+                <span class="idx">{{ s.idx }}.0</span>
+                <span>阶段总览</span>
+              </router-link>
 
-          <!-- ready & 阶段内子章 -->
-          <router-link
-            v-for="c in s.chapters || []"
-            :key="c.route"
-            :to="{ name: c.route }"
-            class="nav-link sub"
-          >
-            <span class="idx">{{ s.idx }}.{{ subIdx(s, c.route) }}</span>
-            <span>{{ chapterTitle(c.route) }}</span>
-          </router-link>
+              <!-- ready & 阶段内小标题 -->
+              <router-link
+                v-for="c in s.chapters || []"
+                :key="c.route"
+                :to="{ name: c.route }"
+                class="nav-link sub"
+              >
+                <span class="idx">{{ s.idx }}.{{ subIdx(s, c.route) }}</span>
+                <span>{{ c.label }}</span>
+              </router-link>
 
-          <!-- planned: 灰显, 不可点击 -->
-          <div v-if="s.status === 'planned'" class="nav-link disabled">
-            <span class="idx">·</span>
-            <span>{{ s.title }}</span>
-          </div>
+              <!-- planned: 灰显, 不可点击 -->
+              <div v-if="s.status === 'planned'" class="nav-link disabled sub">
+                <span class="idx">·</span>
+                <span>{{ s.title }}</span>
+              </div>
+            </div>
+          </section>
         </template>
 
         <!-- 终章 -->
@@ -95,11 +111,12 @@
 
 <script setup>
 import { ref, onMounted, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { stages } from '@/data/models.js'
 import { repoUrl } from '@/utils/repo.js'
 
 const router = useRouter()
+const route = useRoute()
 const allRoutes = router.getRoutes()
 
 const chapterTitle = (name) => {
@@ -109,6 +126,20 @@ const chapterTitle = (name) => {
 
 const subIdx = (stage, route) =>
   (stage.chapters || []).findIndex(c => c.route === route) + 1
+
+const openStages = ref(Object.fromEntries(stages.map(s => [s.id, true])))
+const isStageOpen = (id) => openStages.value[id] !== false
+const toggleStage = (id) => {
+  openStages.value = { ...openStages.value, [id]: !isStageOpen(id) }
+}
+
+watch(
+  () => route.meta.stage,
+  (stage) => {
+    if (stage) openStages.value = { ...openStages.value, [stage]: true }
+  },
+  { immediate: true },
+)
 
 // ── 主题切换 ──────────────────────────────────────────────────────
 const THEME_KEY = 'llm-theme'
@@ -179,12 +210,6 @@ const toggleTheme = () => { theme.value = theme.value === 'dark' ? 'light' : 'da
 }
 .footer p { margin-top: 4px; }
 
-.section-label .mono {
-  font-size: 10px;
-  color: var(--text-muted);
-  text-transform: none;
-  letter-spacing: 0.2px;
-}
 .planned-tag {
   margin-left: 6px;
   padding: 1px 6px;
@@ -197,7 +222,58 @@ const toggleTheme = () => { theme.value = theme.value === 'dark' ? 'light' : 'da
   letter-spacing: 0.6px;
 }
 
+.nav-stage {
+  margin: 2px 0 4px;
+}
+.stage-toggle {
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 24px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: transparent;
+  border: 0;
+  border-left: 2px solid transparent;
+  border-radius: 0;
+  color: var(--text);
+  text-align: left;
+}
+.stage-toggle:hover {
+  background: var(--bg-card);
+  border-left-color: var(--border-strong);
+}
+.stage-toggle .idx {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  border-radius: 5px;
+  background: var(--bg-card);
+  color: var(--text-muted);
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-family: "SF Mono", Menlo, monospace;
+}
+.stage-toggle-title {
+  min-width: 0;
+  flex: 1;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.chevron {
+  color: var(--text-dim);
+  font-size: 12px;
+  transition: transform 0.15s;
+}
+.nav-stage.open .chevron { transform: rotate(180deg); }
+.stage-links {
+  padding: 1px 0 5px;
+}
 .nav-link.sub { padding-left: 38px; font-size: 12.5px; }
+.nav-link.sub .idx { width: 34px; }
+.nav-link.overview { color: var(--text); }
 .nav-link.disabled {
   display: flex; align-items: center; gap: 12px;
   padding: 10px 24px;

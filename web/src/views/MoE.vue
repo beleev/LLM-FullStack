@@ -195,8 +195,8 @@
               <td>64–256 个细粒度专家</td>
             </tr>
             <tr><td class="row-label">代码位置</td>
-              <td><code class="inline">layers/sparse/moe.py</code></td>
-              <td><code class="inline">models/moe/deepseekV3.py</code></td>
+              <td><RepoLink path="llm_models/layers/sparse/moe.py" label="layers/sparse/moe.py" tiny /></td>
+              <td><RepoLink path="llm_models/models/moe/deepseekV3.py" label="models/moe/deepseekV3.py" tiny /></td>
             </tr>
           </tbody>
         </table>
@@ -214,6 +214,7 @@
 import { ref, reactive, computed, watch, onMounted } from 'vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
+import RepoLink from '@/components/RepoLink.vue'
 
 const variant = ref('deepseek')
 const numExperts = ref(8)

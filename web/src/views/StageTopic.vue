@@ -32,9 +32,17 @@
       </p>
       <div class="card link-card">
         <div v-for="l in page.links" :key="`${l.from}-${l.to}`" class="link-row">
-          <span class="mono endpoint">{{ l.from }}</span>
+          <component
+            :is="topicRef(l.from).linked ? RepoLink : 'span'"
+            v-bind="topicRef(l.from).linked ? { path: topicRef(l.from).path, label: l.from, tiny: true } : {}"
+            class="mono endpoint"
+          >{{ l.from }}</component>
           <span class="arrow">→</span>
-          <span class="mono endpoint">{{ l.to }}</span>
+          <component
+            :is="topicRef(l.to).linked ? RepoLink : 'span'"
+            v-bind="topicRef(l.to).linked ? { path: topicRef(l.to).path, label: l.to, tiny: true } : {}"
+            class="mono endpoint"
+          >{{ l.to }}</component>
           <span class="body">{{ l.body }}</span>
         </div>
       </div>
@@ -57,7 +65,15 @@
           <tbody>
             <tr v-for="r in page.sourceRows" :key="r.concept">
               <td class="concept">{{ r.concept }}</td>
-              <td class="mono small">{{ r.code }}</td>
+              <td class="mono small">
+                <RepoLink
+                  v-if="topicRef(r.code).linked"
+                  :path="topicRef(r.code).path"
+                  :label="r.code"
+                  tiny
+                />
+                <span v-else>{{ r.code }}</span>
+              </td>
               <td>{{ r.takeaway }}</td>
             </tr>
           </tbody>
@@ -94,7 +110,9 @@ import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
-import { learningPath, topicPages } from '@/data/models.js'
+import RepoLink from '@/components/RepoLink.vue'
+import { learningPath, stageBy, topicPages } from '@/data/models.js'
+import { looksLikeRepoRef, normalizeRepoRef, splitRefs } from '@/utils/repo.js'
 
 const route = useRoute()
 const page = computed(() => topicPages[route.name])
@@ -106,6 +124,33 @@ const currentIndex = computed(() =>
 const toNav = (item) => item ? { name: item.route, label: item.label } : null
 const prev = computed(() => toNav(learningPath[currentIndex.value - 1]))
 const next = computed(() => toNav(learningPath[currentIndex.value + 1]))
+
+const stageCode = computed(() => stageBy[route.meta.stage]?.code || '')
+const contextRefs = computed(() =>
+  splitRefs(page.value?.code || '', 'auto').map(r => normalizeRepoRef(r.label || r.path).path)
+)
+
+const topicRef = (ref) => {
+  const raw = String(ref || '').trim()
+  if (!looksLikeRepoRef(raw)) return { linked: false, path: raw }
+
+  const parsed = normalizeRepoRef(raw)
+  if (parsed.path.startsWith('llm_')) return { linked: true, path: raw }
+
+  const path = parsed.path
+  const match = contextRefs.value.find(p => p.endsWith(path) || p.endsWith(`/${path}`))
+  if (match) return { linked: true, path: match }
+
+  if (stageCode.value === 'llm_basic/' && /^[\w.-]+\.(py|txt|bin|npz|md)(?::|$)/.test(raw)) {
+    return { linked: true, path: `${stageCode.value}${raw}` }
+  }
+
+  if (stageCode.value && path.includes('/')) {
+    return { linked: true, path: `${stageCode.value}${raw}` }
+  }
+
+  return { linked: false, path: raw }
+}
 </script>
 
 <style scoped>

@@ -234,7 +234,8 @@ input[type="range"]::-moz-range-thumb {
   color: var(--text-muted);
   font-size: 14px;
   margin-bottom: 32px;
-  max-width: 760px;
+  max-width: 1120px;
+  text-wrap: pretty;
 }
 
 /* ---- Card ---- */
@@ -263,8 +264,8 @@ input[type="range"]::-moz-range-thumb {
 }
 .card .desc { color: var(--text-muted); font-size: 13px; }
 .grid { display: grid; gap: 16px; }
-.grid-2 { grid-template-columns: repeat(2, 1fr); }
-.grid-3 { grid-template-columns: repeat(3, 1fr); }
+.grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 @media (max-width: 960px) {
   .grid-2, .grid-3 { grid-template-columns: 1fr; }
 }
@@ -359,7 +360,8 @@ code.inline {
 .section p.lead {
   color: var(--text-muted);
   margin-bottom: 20px;
-  max-width: 760px;
+  max-width: 1120px;
+  text-wrap: pretty;
 }
 
 /* ---- Stat ---- */
