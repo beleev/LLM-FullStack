@@ -10,7 +10,6 @@ build/
 dist/
 *.egg-info/
 *.egg
-package-lock.json
 
 # Virtual environments
 .venv/
