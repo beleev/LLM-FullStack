@@ -1,0 +1,191 @@
+<template>
+  <div v-if="page">
+    <h1 class="page-title">{{ page.title }}</h1>
+    <p class="page-subtitle">{{ page.subtitle }}</p>
+
+    <ChapterIntro
+      :tldr="page.tldr"
+      :question="page.question"
+      :code="page.code"
+      :prereq="prev"
+      :next-step="next"
+    />
+
+    <section class="section">
+      <h2>1. 本章抓手</h2>
+      <p class="lead">
+        先用三句话锁定概念边界, 再回到原始代码。读代码时只追关键变量,
+        不把注意力分散到框架细节上。
+      </p>
+      <div class="grid grid-3">
+        <div v-for="p in page.points" :key="p.title" class="card point-card">
+          <h3>{{ p.title }}</h3>
+          <p class="desc">{{ p.body }}</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>2. 知识怎么接上前后文</h2>
+      <p class="lead">
+        每个子章都不是孤立概念。下面按“上一层抽象 → 本章机制 → 后续用途”读。
+      </p>
+      <div class="card link-card">
+        <div v-for="l in page.links" :key="`${l.from}-${l.to}`" class="link-row">
+          <span class="mono endpoint">{{ l.from }}</span>
+          <span class="arrow">→</span>
+          <span class="mono endpoint">{{ l.to }}</span>
+          <span class="body">{{ l.body }}</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>3. 原始代码对照</h2>
+      <p class="lead">
+        这一节只列读代码必须抓住的行级意图: 变量代表什么, 为什么这样写, 它验证了什么。
+      </p>
+      <div class="card" style="padding: 0; overflow-x: auto;">
+        <table class="topic-table">
+          <thead>
+            <tr>
+              <th>概念</th>
+              <th>代码位置 / 表达式</th>
+              <th>读这一行要理解什么</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in page.sourceRows" :key="r.concept">
+              <td class="concept">{{ r.concept }}</td>
+              <td class="mono small">{{ r.code }}</td>
+              <td>{{ r.takeaway }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>4. 最小代码骨架</h2>
+      <p class="lead">
+        下面是从原始代码里抽出的核心控制流。完整实现仍以对应 Python 文件为准。
+      </p>
+      <div class="card">
+        <h3>{{ page.snippetTitle }} <span v-if="page.run" class="tag">可运行</span></h3>
+        <pre class="code">{{ page.snippet }}</pre>
+        <p v-if="page.run" class="hint">
+          运行入口: <code class="inline">{{ page.run }}</code>
+        </p>
+      </div>
+    </section>
+
+    <ChapterNav :prev="prev" :next="next" />
+  </div>
+
+  <div v-else>
+    <h1 class="page-title">章节未找到</h1>
+    <p class="page-subtitle">当前路由没有对应的 topicPages 配置。</p>
+    <ChapterNav :prev="{ name: 'home', label: '主线总览' }" />
+  </div>
+</template>
+
+<script setup>
+import { computed } from 'vue'
+import { useRoute } from 'vue-router'
+import ChapterIntro from '@/components/ChapterIntro.vue'
+import ChapterNav from '@/components/ChapterNav.vue'
+import { learningPath, topicPages } from '@/data/models.js'
+
+const route = useRoute()
+const page = computed(() => topicPages[route.name])
+
+const currentIndex = computed(() =>
+  learningPath.findIndex(item => item.route === route.name)
+)
+
+const toNav = (item) => item ? { name: item.route, label: item.label } : null
+const prev = computed(() => toNav(learningPath[currentIndex.value - 1]))
+const next = computed(() => toNav(learningPath[currentIndex.value + 1]))
+</script>
+
+<style scoped>
+.point-card h3 {
+  margin-bottom: 6px;
+}
+
+.link-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.link-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.9fr) 24px minmax(120px, 0.9fr) 2fr;
+  gap: 10px;
+  align-items: baseline;
+  padding: 10px 12px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.link-row .endpoint {
+  color: var(--text);
+  font-size: 12px;
+}
+.link-row .arrow {
+  color: var(--accent);
+  text-align: center;
+}
+.link-row .body {
+  color: var(--text-muted);
+  line-height: 1.55;
+}
+
+table.topic-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+table.topic-table th {
+  text-align: left;
+  padding: 12px 14px;
+  background: var(--bg-elev);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  border-bottom: 1px solid var(--border-strong);
+}
+table.topic-table td {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+table.topic-table .concept {
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+}
+table.topic-table .small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.hint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+@media (max-width: 960px) {
+  .link-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  .link-row .arrow {
+    text-align: left;
+  }
+}
+</style>

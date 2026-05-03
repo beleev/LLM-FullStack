@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-models"
+version = "0.1.0"
+description = "大语言模型实现库 - 包含 Transformer, GPT-3, DeepSeek-V3 等模型的 PyTorch 实现"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "LLM Team", email = "llm@example.com"}
+]
+keywords = [
+    "llm",
+    "transformer",
+    "gpt",
+    "deepseek",
+    "attention",
+    "deep-learning",
+    "pytorch",
+    "nlp"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20.0",
+    "torch>=1.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+]
+docs = [
+    "sphinx>=6.0.0",
+    "sphinx-rtd-theme>=1.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/llm-models"
+Documentation = "https://github.com/example/llm-models#readme"
+Repository = "https://github.com/example/llm-models.git"
+Issues = "https://github.com/example/llm-models/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["llm_models*", "llm_finetune*", "llm_infer*", "llm_train*", "llm_agent*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
