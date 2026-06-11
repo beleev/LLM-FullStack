@@ -21,6 +21,8 @@
 - get_subsequent_mask: 由 token id 序列生成因果掩码
 - build_causal_mask: 因果掩码的通用版本（接受 seq_len + device，
   当只有 embedding 没有 token id 时使用）
+- build_sliding_window_mask: 带状因果掩码（滑动窗口注意力 SWA，Mistral / Gemma /
+  GPT-OSS），可选保留开头 sink token（StreamingLLM / GPT-OSS attention sink）
 - combine_causal_and_padding_mask: 合并因果掩码与 padding mask
 - combine_masks: 通用的两个掩码 AND 合并
 """
@@ -113,6 +115,65 @@ def build_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
     # 然后 == 0 反转，得到"非未来位置 = 可见"的下三角 bool 矩阵
     mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
     return (mask == 0).unsqueeze(0)
+
+
+def build_sliding_window_mask(
+    seq_len: int,
+    window_size: int,
+    device: torch.device,
+    sink_tokens: int = 0,
+) -> torch.Tensor:
+    """
+    生成滑动窗口（带状）因果掩码 — Sliding Window Attention (SWA)
+
+    全因果掩码下，位置 t 能看到 [0, t] 共 t+1 个位置，注意力计算与 KV cache
+    都随序列长度线性/平方增长。SWA 把可见范围截断成最近 W 个位置：
+
+        可见(t, s) = (s <= t) 且 (s > t - W)
+
+    于是注意力矩阵从"下三角"变成"带状下三角"：
+      - 单层感受野被限制在 W 内，但信息可以跨层接力 —— L 层的理论感受野 ≈ L·W
+        (Mistral-7B: 32 层 × 4096 窗口 ≈ 131K)
+      - 推理时 KV cache 只需保留最近 W 个位置（rolling buffer 环形覆写），
+        显存从 O(T) 封顶到 O(W)
+
+    sink_tokens > 0 时额外保留开头 S 个位置永远可见。这是 StreamingLLM (2023)
+    的发现：softmax 必须把注意力分给"某些位置"，模型训练后习惯把多余注意力
+    倾倒在开头几个 token 上（attention sink）。如果窗口滑过把它们逐出 cache，
+    输出分布会崩坏；保留 4 个 sink 即可在无限流式输入下保持质量。
+    GPT-OSS (2025) 进一步把 sink 做成了每个 head 可学习的 logit。
+
+    Args:
+        seq_len: 序列长度
+        window_size: 窗口大小 W（>= 1）；W >= seq_len 时退化为全因果掩码
+        device: 目标设备
+        sink_tokens: 额外永远可见的开头位置数 S（默认 0 = 纯 SWA）
+
+    Returns:
+        带状掩码 [1, seq_len, seq_len]，True = 可见，False = 屏蔽
+
+    Example:
+        >>> build_sliding_window_mask(5, window_size=2, device="cpu")[0].int()
+        tensor([[1, 0, 0, 0, 0],     # 位置 0 只看自己
+                [1, 1, 0, 0, 0],     # 位置 1 看 {0, 1}
+                [0, 1, 1, 0, 0],     # 位置 2 看 {1, 2} — 0 滑出窗口
+                [0, 0, 1, 1, 0],
+                [0, 0, 0, 1, 1]])
+    """
+    if window_size < 1:
+        raise ValueError(f"window_size 至少为 1, 当前 {window_size}")
+
+    i = torch.arange(seq_len, device=device).unsqueeze(1)  # query 位置 [T, 1]
+    j = torch.arange(seq_len, device=device).unsqueeze(0)  # key 位置   [1, T]
+
+    # 带状下三角: 因果 (j <= i) 且 在窗口内 (j > i - W)
+    visible = (j <= i) & (j > i - window_size)
+
+    if sink_tokens > 0:
+        # 开头 S 个位置对所有"未来"位置永远可见 (仍需满足因果性 j <= i)
+        visible = visible | ((j < sink_tokens) & (j <= i))
+
+    return visible.unsqueeze(0)
 
 
 def combine_causal_and_padding_mask(

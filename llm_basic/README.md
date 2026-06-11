@@ -1,25 +1,24 @@
-# llm_basic — 从零手写一个最小 Transformer LM
+# llm\_basic — 从零手写一个最小 Transformer LM
 
 零依赖（除了 numpy）的字符级语言模型，用来**演示训练和推理的全过程**：
-前向、反向、优化器、采样、gradcheck — 全部肉眼可见。
+前向、反向、优化器、采样、gradcheck — 全部肉眼可见。把"工程实现的细节"剥掉，只看"数学是怎么流过模型的"。
 
-适合作为读完 `ref/llama2.c` 后的下一步：把"工程实现的细节"剥掉，只看"数学是怎么流过模型的"。
-
----
+***
 
 ## 文件结构
 
-| 文件 | 作用 | 行数 |
-|---|---|---|
-| `prepare.py` | 下载 Tiny Shakespeare，做字符级编码，写 `train.bin` / `val.bin` / `meta.npz` | ~70 |
-| `tokenizer.py` | 字符级 tokenizer（encode / decode，从 meta 加载） | ~40 |
-| `model.py` | **核心。** 每个组件成对出现：`xxx_forward(...)` + `xxx_backward(...)`。Transformer = embedding + 1×Block(RMSNorm + 单头 causal attention + ReLU MLP + 残差) + RMSNorm + lm_head | ~370 |
-| `optim.py` | Adam，30 行 | ~60 |
-| `gradcheck.py` | 数值梯度 vs 解析梯度，逐参数验证 backward 正确 | ~140 |
-| `train.py` | 训练循环：get_batch → forward → loss → backward → adam_step | ~150 |
-| `sample.py` | 自回归采样（temperature + top-k） | ~110 |
+| 文件             | 作用                                                                                                                                                              | 行数    |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| `prepare.py`   | 下载 Tiny Shakespeare，做字符级编码，写 `train.bin` / `val.bin` / `meta.npz`                                                                                               | \~70  |
+| `tokenizer.py` | 字符级 tokenizer（encode / decode，从 meta 加载）                                                                                                                        | \~40  |
+| `model.py`     | **核心。** 每个组件成对出现：`xxx_forward(...)` + `xxx_backward(...)`。Transformer = embedding + 1×Block(RMSNorm + 单头 causal attention + ReLU MLP + 残差) + RMSNorm + lm\_head | \~370 |
+| `optim.py`     | Adam，30 行                                                                                                                                                       | \~60  |
+| `gradcheck.py` | 数值梯度 vs 解析梯度，逐参数验证 backward 正确                                                                                                                                  | \~140 |
+| `train.py`     | 训练循环：get\_batch → forward → loss → backward → adam\_step                                                                                                        | \~150 |
+| `sample.py`    | 自回归采样（temperature + top-k）                                                                                                                                      | \~110 |
+| `bpe.py`       | 手写 byte-level BPE（GPT-2 同款思想）：训练合并规则 / encode / decode / 压缩率对比                                                                                                  | \~150 |
 
----
+***
 
 ## 为什么这样设计
 
@@ -29,7 +28,7 @@
 - **参数用 dict 存、更新返回新 dict**：方便 gradcheck 临时改一个值再还原
 - **float64 全程**：gradcheck 必须的精度
 
----
+***
 
 ## 快速上手
 
@@ -45,12 +44,15 @@ python gradcheck.py
 # 3) 训练（CPU 上 2000 步约 2 分钟，loss 4.17 → ~1.9）
 python train.py
 
+# (可选) 体验 BPE：看高频相邻对如何被合并成"词"，对比字符级压缩率
+python bpe.py --merges 300
+
 # 4) 生成
 python sample.py "ROMEO:" --max-new 300 --temperature 0.8
 python sample.py "" --top-k 10
 ```
 
----
+***
 
 ## 模型结构
 
@@ -79,13 +81,15 @@ softmax + cross-entropy → loss
 ```
 
 默认超参（`train.py`）：
+
 ```
 DIM = 64, HIDDEN_DIM = 128, SEQ_LEN = 64
 BATCH_SIZE = 32, LR = 3e-4, MAX_ITERS = 2000
 ```
-模型 ~45K 参数。
 
----
+模型 \~45K 参数。
+
+***
 
 ## gradcheck 输出示例
 
@@ -103,7 +107,7 @@ all gradients within tolerance — analytical backward looks correct.
 
 如果哪一行写 `[BAD]`，去找对应的 `xxx_backward` 函数 —— 大概率是某个 transpose 写反、sum 维度搞错，或 softmax Jacobian 漏了一项。
 
----
+***
 
 ## 阅读路径
 
@@ -118,29 +122,26 @@ all gradients within tolerance — analytical backward looks correct.
 4. 读 `train.py` + `optim.py` —— 看循环怎么转
 5. 读 `sample.py` —— 看推理怎么走
 
----
-
-## 跟 `ref/llama2.c` 的对照
+***
 
 这个最小实现刻意做了简化，缺了什么、为什么：
 
-| 简化项 | 真模型怎么做 | 为什么省略 |
-|---|---|---|
-| 学得式位置 embedding | RoPE 旋转编码 | RoPE 反向较复杂，先看绝对位置 emb |
-| 单头 attention | Multi-Head / GQA | 多头只是 reshape 后的并行，原理一样 |
-| ReLU + 普通 MLP | SwiGLU + 三个 linear | SwiGLU 反向多一项乘法，不影响骨架 |
-| 1 层 | N 层 | 多层就是一个 for 循环 |
-| 无 KV cache | 推理时缓存 K,V | 加上 cache 就能去掉 sample.py 里的"每步重算整个 forward" |
-| Adam | AdamW + warmup + cosine | 学习率调度对 demo 不必要 |
-| 全 float64 | bf16/fp16 | 学习模型时优先精度，不是速度 |
+| 简化项             | 真模型怎么做                  | 为什么省略                                      |
+| --------------- | ----------------------- | ------------------------------------------ |
+| 学得式位置 embedding | RoPE 旋转编码               | RoPE 反向较复杂，先看绝对位置 emb                      |
+| 单头 attention    | Multi-Head / GQA        | 多头只是 reshape 后的并行，原理一样                     |
+| ReLU + 普通 MLP   | SwiGLU + 三个 linear      | SwiGLU 反向多一项乘法，不影响骨架                       |
+| 1 层             | N 层                     | 多层就是一个 for 循环                              |
+| 无 KV cache      | 推理时缓存 K,V               | 加上 cache 就能去掉 sample.py 里的"每步重算整个 forward" |
+| Adam            | AdamW + warmup + cosine | 学习率调度对 demo 不必要                            |
+| 全 float64       | bf16/fp16               | 学习模型时优先精度，不是速度                             |
 
----
+***
 
 ## 性能参考
 
-- prepare.py: ~5 秒（含网络下载）
-- gradcheck.py: ~1 秒
-- train.py 2000 iters: ~2 分钟（M1 / 现代 CPU）
-- sample.py 300 tokens: ~5 秒（朴素无 KV cache）
+- prepare.py: \~5 秒（含网络下载）
+- gradcheck.py: \~1 秒
+- train.py 2000 iters: \~2 分钟（M1 / 现代 CPU）
+- sample.py 300 tokens: \~5 秒（朴素无 KV cache）
 
-整个项目跑一遍也就 5 分钟，看代码 + 推公式才是大头。

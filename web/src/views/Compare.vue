@@ -10,7 +10,7 @@
       tldr="竖着读模型表 = 一个组件维度的演进史; 横着读六阶段表 = 一个 LLM 从公式到可行动系统的工程闭环。"
       question="遇到一个真实大模型系统, 你能快速判断问题发生在结构、训练、微调、推理还是 Agent harness 层吗?"
       :goals="[
-        '快速对照 17 种主流模型的零件配置 (attn / ffn / norm / pos)',
+        '快速对照 20 种主流模型的零件配置 (attn / ffn / norm / pos)',
         '看清「早期 → 现代」每个维度的演进轨迹',
         '把六阶段闭环放回同一张地图: 哪一层出问题该读哪个目录',
       ]"
@@ -258,25 +258,25 @@ const projectRows = [
     code: 'llm_train/',
     question: '同一个训练循环如何扩到多卡并保持等价?',
     link: '把 loss/grad/update 拆成 batch、矩阵、层、状态、精度和通信。',
-    file: 'm01..m10/demo.py · full_loop/demo.py',
+    file: 'm01..m13/demo.py · full_loop/demo.py',
   },
   {
     code: 'llm_finetune/',
     question: '如何用少量数据和参数把 base model 拨到任务上?',
     link: 'SFT 改数据目标, LoRA 改可训练参数, DPO 改偏好优化流程。',
-    file: 'methods/{sft,lora,dpo}.py',
+    file: 'methods/{sft,lora,qlora,dpo,grpo,distill}.py',
   },
   {
     code: 'llm_infer/',
     question: '训练好的模型如何低延迟、高吞吐、可控地产出 token?',
     link: '把自回归生成接上 KV cache、分页、调度、前缀复用和采样约束。',
-    file: 'm01..m15/demo.py · full_engine/engine.py',
+    file: 'm01..m17/demo.py · full_engine/engine.py',
   },
   {
     code: 'llm_agent/',
     question: '推理服务如何变成能调用工具、保留状态、隔离子任务的系统?',
     link: '把模型输出接上工具、权限、上下文、记忆、Hook、持久化和子智能体。',
-    file: 'm01..m07/demo.py · full_loop/demo.py',
+    file: 'm01..m08/demo.py · full_loop/demo.py',
   },
 ]
 </script>

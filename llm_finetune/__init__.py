@@ -12,16 +12,24 @@ llm_finetune — 大模型微调教学章节
         ↓
     LoRA           —— 参数高效微调 (PEFT) 的事实标准, 在权重旁加低秩适配器
         ↓
-    DPO            —— 对齐 (alignment) 的现代方法, 不需要 reward model
+    DPO            —— 离线偏好对齐, 跳过 reward model 与 RL
+        ↓
+    Reward Model   —— 把人类相对偏好蒸馏成标量分 (RLHF 第二阶段)
+        ↓
+    GRPO           —— 在线 RL: 组内相对优势替代 critic (DeepSeek-R1 配方)
+        ↓
+    Distillation   —— 大模型能力压进小模型 (软标签 + 温度)
 
-为什么挑这三个?
-    - 覆盖三类 **目标差异**: 任务对齐 / 资源效率 / 偏好对齐
-    - 各自代表了 finetune 的一个 "时代": SFT(2022) → LoRA(2021) → DPO(2023)
+为什么挑这六个?
+    - 覆盖四类 **目标差异**: 任务对齐 / 资源效率 / 偏好对齐 / 能力迁移
+    - 各自代表了 finetune 的一个 "时代":
+      LoRA(2021) → SFT(2022) → RM+RLHF(2022) → DPO(2023) → GRPO(2024-25)
+      蒸馏(2015) 则贯穿始终, 在 R1 时代再次成为主角
     - 都能在小尺寸 LLaMA 上 CPU 跑通, 教学闭环
 
 模块结构:
-    methods/        微调算法实现 (sft, lora, dpo)
-    data/           合成数据生成器 (instruction / preference)
+    methods/        微调算法实现 (sft, lora, dpo, reward_model, grpo, distill)
+    data/           合成数据生成器 (instruction / preference / prompt)
     utils/          参数管理工具 (冻结/统计/保存)
     run_finetune/   可运行的端到端示例脚本
 
@@ -44,8 +52,22 @@ from llm_finetune.methods.dpo import (
     DPOTrainer,
     compute_sequence_logprobs,
 )
+from llm_finetune.methods.reward_model import RewardModel, bradley_terry_loss
+from llm_finetune.methods.grpo import (
+    GRPOTrainer,
+    completion_logprobs,
+    make_region_reward,
+)
+from llm_finetune.methods.distill import DistillLoss, soften_demo
+from llm_finetune.methods.qlora import (
+    QLoRALinear,
+    apply_qlora,
+    nf4_quantize,
+    nf4_dequantize,
+)
 from llm_finetune.data.instruction_data import InstructionDataGenerator
 from llm_finetune.data.preference_data import PreferenceDataGenerator
+from llm_finetune.data.prompt_data import PromptDataGenerator
 from llm_finetune.utils.param_utils import (
     count_parameters,
     freeze_module,
@@ -67,6 +89,22 @@ __all__ = [
     "DPOTrainer",
     "PreferenceDataGenerator",
     "compute_sequence_logprobs",
+    # Reward Model
+    "RewardModel",
+    "bradley_terry_loss",
+    # GRPO
+    "GRPOTrainer",
+    "PromptDataGenerator",
+    "completion_logprobs",
+    "make_region_reward",
+    # Distillation
+    "DistillLoss",
+    "soften_demo",
+    # QLoRA
+    "QLoRALinear",
+    "apply_qlora",
+    "nf4_quantize",
+    "nf4_dequantize",
     # 工具
     "count_parameters",
     "freeze_module",

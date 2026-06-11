@@ -173,6 +173,18 @@
       </div>
     </section>
 
+    <!-- mask 一族: 投影压缩之外的另一条降本路线 -->
+    <section class="section">
+      <h2>另外两条路线: 改 mask, 或干脆不存 KV</h2>
+      <p class="lead">
+        MHA→GQA→MLA 压缩的是 <b>KV 投影</b>; Mistral / StreamingLLM / DSA 改的是 <b>mask</b> — 谁能看见谁;
+        而 <b>线性注意力</b> (Gated DeltaNet, <RepoLink path="llm_models/layers/sparse/linear_attention.py" label="linear_attention.py" tiny />)
+        干脆用固定大小的状态矩阵替掉整个 KV cache — Qwen3-Next 用它替换了 75% 的层, 剩下 25% 全注意力兜底召回。
+        三条路线正交, 可以叠加。详见章节「SWA · MTP · 混合线性」。
+      </p>
+      <AttnMaskLab />
+    </section>
+
     <!-- 源码速览 -->
     <section class="section">
       <h2>核心代码</h2>
@@ -194,6 +206,7 @@ import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import EvolutionChain from '@/components/EvolutionChain.vue'
 import RepoLink from '@/components/RepoLink.vue'
+import AttnMaskLab from '@/components/labs/AttnMaskLab.vue'
 
 const evoSteps = [
   { name: 'MHA', year: 2017, color: '#9ca3af',

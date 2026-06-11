@@ -19,6 +19,7 @@ export const modelChapters = [
   { route: 'position',  label: '位置编码',       hint: 'Sin / Learnable → RoPE → M-RoPE' },
   { route: 'blocks',    label: 'Block 组装器',  hint: '4 个零件 × 几种组合 = 所有主流 LLM' },
   { route: 'moe',       label: 'MoE 路由',       hint: 'Mixtral 与 DeepSeek 的两套哲学' },
+  { route: 'models-mtp', label: 'SWA · MTP · 混合线性', hint: 'Mistral 滑动窗口 + 多 token 预测 + Qwen3-Next DeltaNet' },
   { route: 'diffusion', label: '扩散生成',       hint: 'DDPM ε-pred → Flow Matching v-pred' },
 ]
 
@@ -26,21 +27,23 @@ export const trainChapters = [
   { route: 'train-batch-ddp', label: 'batch 与 DDP', hint: '梯度累积、数据并行、all-reduce' },
   { route: 'train-model-parallel', label: 'TP / PP 切模型', hint: '层内矩阵切分与层间流水线' },
   { route: 'train-memory', label: '状态与显存', hint: 'ZeRO/FSDP、activation checkpoint、resume' },
-  { route: 'train-precision-stability', label: '精度与稳定性', hint: 'AMP、loss scaling、clip、warmup' },
+  { route: 'train-precision-stability', label: '精度与稳定性', hint: 'AMP、loss scaling、FP8 block scaling、clip、warmup' },
+  { route: 'train-moe-seq', label: 'EP 与序列并行', hint: 'MoE all-to-all 路由 + Ring Attention' },
   { route: 'train-collectives-loop', label: '通信与 full_loop', hint: 'collectives 到完整训练主循环' },
 ]
 
 export const finetuneChapters = [
   { route: 'finetune-sft', label: 'SFT 数据与 loss', hint: 'prompt mask 与 response-only CE' },
-  { route: 'finetune-lora', label: 'LoRA 参数高效微调', hint: '低秩补丁、注入、merge' },
+  { route: 'finetune-lora', label: 'LoRA 参数高效微调', hint: '低秩补丁、注入、merge、QLoRA NF4 量化基座' },
   { route: 'finetune-dpo', label: 'DPO 偏好对齐', hint: 'chosen/rejected 与 reference policy' },
+  { route: 'finetune-rlhf', label: 'RM · GRPO · 蒸馏', hint: '奖励模型、组内相对优势、软标签蒸馏' },
   { route: 'finetune-runs', label: '训练脚本与落盘', hint: 'run_finetune、adapter、state_dict' },
 ]
 
 export const inferChapters = [
   { route: 'infer-kv-memory', label: 'KV 与缓存内存', hint: 'KV cache、paged attention、prefix/radix cache' },
   { route: 'infer-scheduler', label: '调度与 prefill', hint: 'continuous batching、chunked prefill、P/D 分离' },
-  { route: 'infer-decode-control', label: '解码加速与约束', hint: 'speculative、sampling、structured output' },
+  { route: 'infer-decode-control', label: '解码加速与约束', hint: 'speculative/EAGLE、sampling、structured output' },
   { route: 'infer-compute', label: '算子与压缩', hint: 'quantization、FlashAttention、CUDA Graph、TP' },
   { route: 'infer-engine', label: 'mini-vLLM 引擎', hint: 'full_engine 主循环与 Multi-LoRA serving' },
 ]
@@ -75,7 +78,7 @@ export const stages = [
     idx: 2,
     code: 'llm_models/',
     title: '常见模型结构',
-    oneliner: '把零件 (attn / ffn / norm / pos) 装进 Pre-LN Block, 堆出 17 种主流模型。',
+    oneliner: '把零件 (attn / ffn / norm / pos) 装进 Pre-LN Block, 堆出 20 种主流模型。',
     status: 'ready',
     route: 'models',
     // 这一阶段拆成 5 个章节, 用 chapters 映射;  Compare 合到终章。
@@ -90,7 +93,7 @@ export const stages = [
     status: 'ready',
     route: 'train',
     chapters: trainChapters,
-    files: ['m01..m10/demo.py', 'core/collectives.py', 'full_loop/demo.py'],
+    files: ['m01..m13/demo.py', 'core/collectives.py', 'full_loop/demo.py'],
   },
   {
     id: 'finetune',
@@ -101,7 +104,7 @@ export const stages = [
     status: 'ready',
     route: 'finetune',
     chapters: finetuneChapters,
-    files: ['methods/sft.py', 'methods/lora.py', 'methods/dpo.py', 'utils/param_utils.py'],
+    files: ['methods/{sft,lora,qlora}.py', 'methods/dpo.py', 'methods/grpo.py', 'methods/distill.py'],
   },
   {
     id: 'infer',
@@ -112,7 +115,7 @@ export const stages = [
     status: 'ready',
     route: 'infer',
     chapters: inferChapters,
-    files: ['m01..m15/demo.py', 'full_engine/engine.py', 'core/tiny_model.py'],
+    files: ['m01..m17/demo.py', 'full_engine/engine.py', 'core/tiny_model.py'],
   },
   {
     id: 'agent',
@@ -208,6 +211,27 @@ export const trainModules = [
     concept: 'warmup、cosine、grad clip、NaN guard',
     link: '不是提高上限, 而是让坏 step 不毁掉长训练',
     file: 'llm_train/m10_training_stability/demo.py',
+  },
+  {
+    id: 'm11',
+    name: 'Expert Parallel',
+    concept: 'MoE 专家切卡, token 经 all-to-all 找专家',
+    link: 'dispatch → 本地专家算 → combine; 路由倾斜 = 热点 + 丢 token',
+    file: 'llm_train/m11_expert_parallel/demo.py',
+  },
+  {
+    id: 'm12',
+    name: 'Sequence Parallel',
+    concept: '序列切卡, KV 块沿环传递 (Ring Attention)',
+    link: 'online softmax 跨卡增量合并, 任何时刻只持有 1/D 的 KV',
+    file: 'llm_train/m12_sequence_parallel/demo.py',
+  },
+  {
+    id: 'm13',
+    name: 'FP8 Training',
+    concept: 'E4M3 管精度 / E5M2 管范围, block-wise scaling 防 outlier',
+    link: '乘法省一半, 但 scaling 粒度 + FP32 master 一个都不能少',
+    file: 'llm_train/m13_fp8_training/demo.py',
   },
   {
     id: 'full',
@@ -325,6 +349,20 @@ export const inferModules = [
     file: 'llm_infer/m15_pd_disaggregation/demo.py',
   },
   {
+    id: 'm16',
+    name: 'Attention Sinks',
+    concept: 'sink + 滑动窗口, KV cache 有界化 (StreamingLLM)',
+    link: '保住 softmax 的"下水道", 流式无限输入不爆显存',
+    file: 'llm_infer/m16_attention_sinks/demo.py',
+  },
+  {
+    id: 'm17',
+    name: 'EAGLE Speculative',
+    concept: 'draft 吃 target 的 hidden state, 在特征空间自回归',
+    link: '特征比 token 信息多得多 → 接受率显著高于 token-only draft',
+    file: 'llm_infer/m17_eagle_speculative/demo.py',
+  },
+  {
     id: 'full',
     name: 'Full Engine',
     concept: 'mini-vLLM: 分页、连续批、前缀缓存、采样集成',
@@ -384,6 +422,13 @@ export const agentModules = [
     file: 'llm_agent/m07_subagents/demo.py',
   },
   {
+    id: 'm08',
+    name: 'Retrieval',
+    concept: 'TF-IDF 向量检索: idf 压高频词, 余弦给连续分级',
+    link: '关键词 → TF-IDF → 神经 embedding, 工具接口不变',
+    file: 'llm_agent/m08_retrieval/demo.py',
+  },
+  {
     id: 'full',
     name: 'Full Loop',
     concept: '工具、权限、Hook、记忆、持久化和子智能体组合',
@@ -394,6 +439,7 @@ export const agentModules = [
 
 export const topicPages = {
   'basic-data': {
+    widgets: ['BpeLab'],
     title: '数据与 tokenizer · 把文本变成可训练张量',
     subtitle: '先别看 Transformer。训练闭环的第一个问题是: 字符串如何稳定地变成 ids, 再变成 batch。',
     tldr: 'prepare.py 负责把原始文本固化成 train.bin / val.bin / meta.npz; tokenizer.py 定义 encode/decode 的可逆映射。',
@@ -788,6 +834,7 @@ loss = -F.logsigmoid(logits).mean()`,
   },
 
   'infer-kv-memory': {
+    widgets: ['AttnMaskLab'],
     title: 'KV 与缓存内存 · 推理优化从少算开始',
     subtitle: '训练关注参数和激活, 推理服务还要把每个请求的 KV cache 当成可分配资源管理。',
     tldr: 'KV cache 避免重复算旧 token; PagedAttention 把 KV 切成 block; prefix/radix cache 复用请求之间的公共前缀。',
@@ -848,6 +895,7 @@ return picked, Stage.DECODE`,
     run: 'python -m llm_infer.m03_continuous_batching.demo',
   },
   'infer-decode-control': {
+    widgets: ['SoftmaxTempLab'],
     title: '解码加速与约束 · 更少 target calls, 更可控输出',
     subtitle: 'decode 阶段每步只出少量 token, 所以减少 target 前向次数和控制 logits 都很重要。',
     tldr: 'Speculative decoding 用 draft 猜多个 token, target 批量验证; sampling/structured output 在 logits 层控制分布和合法性。',
@@ -1004,6 +1052,7 @@ return mode_fallback(call)   # plan/default/auto/dont_ask`,
     run: 'python -m llm_agent.m03_permissions.demo',
   },
   'agent-context-memory': {
+    widgets: ['RetrievalLab'],
     title: '上下文与记忆 · 模型到底看见什么',
     subtitle: 'Agent 的长期表现常常取决于上下文工程: 哪些信息进窗口, 什么时候压缩, 哪些状态留在文件里。',
     tldr: 'FileMemory 用 Markdown 文件做透明记忆; compact_messages 保留头尾, 摘要中间; Agent 在每轮前组装 system/memory/history。',
@@ -1134,6 +1183,114 @@ agent = Agent(tools=tools, permissions=permissions,
 agent.run("排查 agent loop，并写入笔记")`,
     run: 'python -m llm_agent.full_loop.demo',
   },
+
+  'models-mtp': {
+    widgets: ['AttnMaskLab', 'MtpLab'],
+    title: 'SWA · MTP · 混合线性 — 三种降本增效的改法',
+    subtitle: 'Mistral 把注意力裁成带状; MTP 让每个位置一次预测多个 token; Qwen3-Next 干脆用固定大小状态替掉 75% 的 KV cache。',
+    tldr: 'SWA 只是换一张 mask (注意力本体不变), KV cache 从 O(T) 封顶到 O(W); MTP 用共享 head 的级联模块把监督信号加密 K+1 倍, 推理时还白送投机解码草稿。',
+    question: '局部注意力会不会掐断长程信息? 一次预测多个 token 为什么不破坏因果性?',
+    code: 'llm_models/models/language_models/{mistral.py,mtp.py,qwen3_next.py} · llm_models/layers/sparse/linear_attention.py',
+    points: [
+      { title: '深度替代宽度', body: 'SWA 单层只看 W 个位置, 但信息跨层接力: L 层理论感受野 ≈ L·W (Mistral: 32×4096 ≈ 131K)。' },
+      { title: 'mask 即架构', body: '全因果=LLaMA, 带状=Mistral, 带状+sink=GPT-OSS, top-k=DSA。QKV 投影一行不改, 谁可见谁全由 mask 决定。' },
+      { title: '级联保因果', body: 'MTP-k 在位置 i 拼接真实 t_{i+k} 的 embedding 再过一个 Block — 每深一级多看一个 token, 因果链完整。' },
+      { title: '状态替代缓存', body: 'Gated DeltaNet 用 Dh×Dh 状态矩阵替代逐 token 的 KV: delta rule 精准覆写 + α 门整体衰减, O(1) "cache"; 混 25% 全注意力兜底召回。' },
+    ],
+    links: [
+      { from: 'build_sliding_window_mask', to: 'Mistral.forward', body: '与 LLaMA 唯一的结构性差异就是这张带状 mask。' },
+      { from: 'MTPModule', to: 'lm_head (共享)', body: '每级只新增拼接投影 + 1 个 Block, embedding 与输出头全部共享。' },
+      { from: 'mtp_logits', to: 'speculative decoding', body: 'MTP 对 t+2 的预测可直接当 draft, 对应 llm_infer/m07。' },
+    ],
+    sourceRows: [
+      { concept: '带状掩码', code: 'masks.py:build_sliding_window_mask', takeaway: '(j <= i) 且 (j > i-W), 可选保留开头 S 个 sink。' },
+      { concept: 'KV 上限', code: 'mistral.py:kv_cache_entries', takeaway: 'rolling buffer: min(T, W), 与流长度无关。' },
+      { concept: '级联输入', code: 'mtp.py:MTPModule.forward', takeaway: '各自 RMSNorm 后拼接 [h; emb], 投影回 d 再过 Block。' },
+      { concept: '标签对齐', code: 'mtp.py:MTPLoss.compute', takeaway: '第 k 级目标 = labels 左移 k 位, 末尾 -100 屏蔽。' },
+      { concept: 'delta rule', code: 'layers/sparse/linear_attention.py', takeaway: 'S ← α(S - βk(kᵀS)) + βkvᵀ: 先擦 k 方向旧值再写新值。' },
+      { concept: '混合排布', code: 'qwen3_next.py:layer_types', takeaway: '[Δ,Δ,Δ,A,...] 周期排布, mask/rope 对 Δ 层是 no-op。' },
+    ],
+    snippetTitle: 'SWA 与 MTP 的核心差异行',
+    snippet: `# Mistral = LLaMA + 一张带状 mask
+visible = (j <= i) & (j > i - window_size)      # 谁能看见谁
+
+# MTP 级联: 位置 i 的第 k 级多看一个真实 token
+shifted[:, :-k] = idx[:, k:]                     # teacher forcing
+h = mtp_block(cat([norm(h), norm(emb(shifted))]))
+loss = ce_main + lam * mean(ce_mtp_k)            # 联合训练`,
+    run: 'python -m llm_models.run_models.language_models.mistral.infer_mistral',
+  },
+
+  'train-moe-seq': {
+    widgets: ['MoeRouteLab', 'RingAttnLab'],
+    title: 'EP 与序列并行 · 切专家, 切序列',
+    subtitle: '模型并行切的是"层和矩阵"; MoE 时代还要切专家 (EP), 长上下文时代还要切序列本身 (CP)。',
+    tldr: 'EP 把专家分卡, token 经两次 all-to-all 找专家再回家, 路由均衡是生死线; 序列并行把一条超长序列切给多张卡, KV 块沿环传递, online softmax 增量合并保证数值精确等价。',
+    question: 'all-to-all 的通信量为什么取决于数据 (路由结果) 而不是模型结构? Ring Attention 为什么能做到数值上与完整注意力完全一致?',
+    code: 'llm_train/m11_expert_parallel/demo.py · llm_train/m12_sequence_parallel/demo.py',
+    points: [
+      { title: '路由决定通信', body: 'DDP 的 all-reduce 通信量固定; EP 的 all-to-all 由 gating 结果决定 — 倾斜路由 = 热点卡 + 容量溢出丢 token。' },
+      { title: '均衡是训练目标', body: 'Switch/Mixtral 用 aux loss, DeepSeek-V3 用 bias 调节 — 殊途同归: 把热门专家的路由概率压平。' },
+      { title: '同一个 online softmax', body: '分块算注意力再增量合并: 单卡内做是 FlashAttention, 跨卡传块就是 Ring Attention。' },
+    ],
+    links: [
+      { from: 'gating top-k', to: 'all-to-all dispatch', body: 'token 在哪张卡 ≠ 它的专家在哪张卡, 必须重排。' },
+      { from: 'capacity factor', to: 'token dropping', body: '每个专家最多收 capacity 个, 溢出 token 走残差。' },
+      { from: 'KV 环传递', to: 'online softmax (m, l, acc)', body: '收到新块就增量合并, 任何时刻只持有 1/D 的 KV。' },
+    ],
+    sourceRows: [
+      { concept: 'dispatch 矩阵', code: 'm11:moe_forward_ep', takeaway: '行=源卡 列=目标卡, 这张表就是 all-to-all 的发货单。' },
+      { concept: 'aux loss 梯度', code: 'm11:balance_router', takeaway: 'L = E·Σ f_e·P_e, f 视为常数, 对 P 求导推平路由。' },
+      { concept: '环上一步', code: 'm12:ring_attention', takeaway: '卡 r 在 step s 处理来自卡 (r-s)%D 的 KV 块。' },
+      { concept: '增量合并', code: 'm12: m_new / scale', takeaway: '修正旧累计量的指数缩放, 数值与一次性 softmax 等价 (~1e-16)。' },
+    ],
+    snippetTitle: 'EP 与 Ring Attention 的控制流',
+    snippet: `# EP: 两次 all-to-all 夹一段本地专家计算
+recv = all_to_all(tokens_by_dst)      # dispatch
+out_local = expert(recv)              # 只算自己持有的专家
+out = all_to_all(out_local)           # combine 回原卡
+
+# Ring: D 步之后每张卡都见过完整序列
+for step in range(D):
+    src = (rank - step) % D           # 本步处理谁的 KV 块
+    m, l, acc = online_merge(Q_local @ K[src].T, V[src])
+    send_to_next(K[src], V[src])      # 环传, 可与计算重叠`,
+    run: 'python -m llm_train.m11_expert_parallel.demo',
+  },
+
+  'finetune-rlhf': {
+    widgets: ['GrpoLab', 'SoftmaxTempLab'],
+    title: 'RM · GRPO · 蒸馏 — 从偏好到能力迁移',
+    subtitle: 'DPO 之外的另一半对齐版图: 显式奖励模型、在线 RL (R1 配方)、以及把能力压进小模型的蒸馏。',
+    tldr: 'RM 把"A 比 B 好"的序关系学成标量分; GRPO 用组内相对优势替代 critic, 配合可验证奖励 (RLVR) 连 RM 都能省; 蒸馏用温度软化的 teacher 分布给 student 提供比硬标签密得多的监督。',
+    question: 'GRPO 砍掉 critic 之后, baseline 从哪里来? 为什么蒸馏的 KL 项要乘 T²?',
+    code: 'llm_finetune/methods/{reward_model.py,grpo.py,distill.py}',
+    points: [
+      { title: '序关系 → 标量', body: 'Bradley-Terry: L = -log σ(r_chosen - r_rejected)。RM 的分数只有序意义, 没有量纲 — 它是 RL 阶段的罗盘。' },
+      { title: '组内排名替代 critic', body: '同 prompt 采 G 条, Â = (r-μ)/σ。比组里平均好就强化 — PPO 的 value 网络整个省掉 (R1 配方)。' },
+      { title: '暗知识在分布里', body: '硬标签只有 1 个 token 的信息; teacher 软化分布把相似 token 的相对排序全部交给 student。' },
+    ],
+    links: [
+      { from: 'PreferenceDataGenerator', to: 'RewardModel', body: '与 DPO 同源的数据, 不同用法: RM 学打分, DPO 直接学策略。' },
+      { from: 'policy.generate', to: 'reward_fn (RLVR)', body: '在线采样 + 规则验证, 数据分布随 policy 漂移 (on-policy)。' },
+      { from: 'teacher logits / T', to: 'student KL', body: 'T 放大暗知识, T² 补偿 softmax 梯度的 1/T² 缩放。' },
+    ],
+    sourceRows: [
+      { concept: 'value head', code: 'reward_model.py:RewardModel', takeaway: '复用 LLaMA 骨架, lm_head 换成 [D]→[1], 取最后位置。' },
+      { concept: '组内优势', code: 'grpo.py:GRPOTrainer.step', takeaway: 'adv = (r - mean) / (std + 1e-4), GRPO 的全部精髓。' },
+      { concept: 'KL k3 估计', code: 'grpo.py: log_ratio', takeaway: 'exp(q-p)-(q-p)-1 ≥ 0, 逐 token, 方差小。' },
+      { concept: '采样多样性', code: 'run grpo: init std=0.02', takeaway: '初始 logits 太尖 → 组内零方差 → RL 没有梯度。' },
+      { concept: '蒸馏损失', code: 'distill.py:DistillLoss', takeaway: 'α·CE + (1-α)·T²·KL(p_t^T ‖ p_s^T)。' },
+    ],
+    snippetTitle: 'GRPO 单步的完整控制流',
+    snippet: `seqs = policy.generate(prompts × G)        # 1. 组内采样
+rewards = reward_fn(seqs)                  # 2. 规则验证打分 (RLVR)
+adv = (r - r.mean(group)) / r.std(group)   # 3. 组内相对优势
+loss = -(adv * logp.mean(-1)).mean()       # 4. 策略梯度
+     + beta * kl(policy, ref)              #    + KL 锚定
+loss.backward(); opt.step()                # 5. 一次更新`,
+    run: 'python -m llm_finetune.run_finetune.grpo.train_grpo',
+  },
 }
 
 // 时间线数据, year 用于排序与定位
@@ -1168,6 +1325,11 @@ export const timeline = [
     parts: { attn: 'GQA', ffn: 'SwiGLU', norm: 'RMSNorm', pos: 'RoPE' },
     blurb: '现代开源 LLM 的事实模板: GQA + SwiGLU + RMSNorm + RoPE',
     file: 'models/language_models/llama.py' },
+  { id: 'mistral', year: 2023, track: 'left', name: 'Mistral',
+    kind: 'Decoder-only (SWA)',
+    parts: { attn: 'GQA + 滑动窗口 mask', ffn: 'SwiGLU', norm: 'RMSNorm', pos: 'RoPE' },
+    blurb: 'LLaMA + 带状因果 mask: 计算 O(T·W), KV cache 封顶 O(W)',
+    file: 'models/language_models/mistral.py' },
   { id: 'mamba', year: 2023, track: 'left', name: 'Mamba',
     kind: '非注意力 SSM',
     parts: { attn: 'SelectiveSSM', ffn: '融合进 SSM 层', norm: 'RMSNorm', pos: '无 (时序 scan)' },
@@ -1193,6 +1355,11 @@ export const timeline = [
     parts: { attn: 'MLA', ffn: 'DeepSeekMoE (sigmoid + shared)', norm: 'RMSNorm', pos: 'RoPE (decoupled)' },
     blurb: 'KV cache -93% + aux-loss-free bias + 共享专家, 671B/37B 激活',
     file: 'models/moe/deepseekV3.py' },
+  { id: 'qwen3_next', year: 2025, track: 'left', name: 'Qwen3-Next',
+    kind: '混合线性注意力',
+    parts: { attn: 'GatedDeltaNet 3:1 GQA', ffn: 'SwiGLU', norm: 'RMSNorm', pos: 'RoPE (仅注意力层)' },
+    blurb: '75% 层用 O(1) 状态的线性注意力, 25% 全注意力兜底长程检索',
+    file: 'models/language_models/qwen3_next.py' },
   { id: 'qwen2_vl', year: 2024, track: 'eye', name: 'Qwen2-VL',
     kind: '早融合 VLM',
     parts: { attn: 'GQA', ffn: 'SwiGLU', norm: 'RMSNorm', pos: 'M-RoPE (三轴)' },

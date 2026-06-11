@@ -133,7 +133,7 @@
       </div>
     </section>
 
-    <!-- ── 阶段 2 时间轴 (llm_models 17 模型) ─────────────────────── -->
+    <!-- ── 阶段 2 时间轴 (llm_models 20 模型) ─────────────────────── -->
     <section class="section">
       <h2>阶段 2 内部 · llm_models 演进时间轴</h2>
       <p class="lead">

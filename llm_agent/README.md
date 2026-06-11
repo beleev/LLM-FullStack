@@ -26,6 +26,8 @@ m06 Persistence         append-only JSONL / resume
         ↓
 m07 Subagents           隔离上下文 / summary-only return
         ↓
+m08 Retrieval           TF-IDF 向量检索 / RAG-lite 长期记忆
+        ↓
 full_loop               组合成一个 mini agent harness
 ```
 
@@ -40,6 +42,7 @@ full_loop               组合成一个 mini agent harness
 | 05 | [Extensibility](m05_extensibility/) | Hook、Skill 注入、MCP-like 外部工具 |
 | 06 | [Persistence](m06_persistence_resume/) | JSONL 仅追加日志、恢复会话 |
 | 07 | [Subagents](m07_subagents/) | 子智能体隔离、只回传摘要 |
+| 08 | [Retrieval](m08_retrieval/) | TF-IDF 向量检索、关键词 vs 余弦分级、RAG-lite |
 | ★ | [Full Loop](full_loop/) | 多机制组合的最小 Agent 系统 |
 
 ## 运行
@@ -73,6 +76,7 @@ python -m llm_agent.full_loop.demo
 | Session persistence | yes | `m06`, JSONL transcript |
 | Resume | yes | `m06`, `load_history=True` |
 | Subagents | yes | `m07`, summary-only return |
+| Retrieval / RAG | yes | `m08`, TF-IDF 余弦检索, 工具热替换 |
 | Sandbox / real shell isolation | no | 为教学安全只模拟 shell |
 | Real LLM API / streaming | no | 重点是 harness 原理 |
 

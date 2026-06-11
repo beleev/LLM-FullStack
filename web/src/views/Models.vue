@@ -69,7 +69,7 @@
 
     <section class="section">
       <h2>模型族谱</h2>
-      <p class="lead">阶段 2 的 17 个模型共享同一套元数据，源码列已全部跳转到 GitHub。</p>
+      <p class="lead">阶段 2 的 20 个模型共享同一套元数据，源码列已全部跳转到 GitHub。</p>
       <div class="card" style="padding: 0; overflow-x: auto;">
         <table class="models-table">
           <thead>

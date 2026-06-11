@@ -33,6 +33,12 @@ m09 Collectives            all-reduce / reduce-scatter / all-gather / all-to-all
         ↓
 m10 Stability              warmup、cosine、grad clip、NaN 检测
         ↓
+m11 Expert Parallel        MoE 专家切卡 + 两次 all-to-all + 路由均衡
+        ↓
+m12 Sequence Parallel      序列切卡 + Ring Attention (online softmax 跨卡合并)
+        ↓
+m13 FP8 Training           E4M3/E5M2 + block-wise scaling + FP32 master
+        ↓
 full_loop                  组合成一个最小分布式训练闭环
 ```
 
@@ -50,6 +56,9 @@ full_loop                  组合成一个最小分布式训练闭环
 | 08 | [Checkpoint / Resume](m08_checkpoint_resume/) | optimizer state、data cursor、RNG state |
 | 09 | [Collectives](m09_collectives/) | all-reduce、reduce-scatter、all-gather、all-to-all |
 | 10 | [Training Stability](m10_training_stability/) | warmup cosine、global grad clip、NaN/Inf 检测 |
+| 11 | [Expert Parallel](m11_expert_parallel/) | MoE dispatch/combine all-to-all、capacity factor、load-balancing aux loss |
+| 12 | [Sequence Parallel](m12_sequence_parallel/) | Ring Attention、context parallel、online softmax 跨卡合并 |
+| 13 | [FP8 Training](m13_fp8_training/) | E4M3/E5M2 取舍、subnormal 下溢、block-wise scaling、FP32 master |
 | ★ | [Full Loop](full_loop/) | 多技术组合的训练主循环 |
 
 ## 运行
@@ -81,7 +90,9 @@ python -m llm_train.full_loop.demo
 | Distributed checkpoint | partial | `m08` 演示状态完整性, 未做多文件 shard |
 | Communication collectives | yes | `m09` |
 | Warmup / cosine / clipping / NaN guard | yes | `m10` |
-| Expert parallel / MoE all-to-all | partial | `m09` 展示 all-to-all, MoE 模型见 `llm_models` |
+| Expert parallel / MoE all-to-all | yes | `m11` dispatch/combine、容量溢出、aux loss 均衡 |
+| Sequence / context parallel (Ring Attention) | yes | `m12` 环传 KV + online softmax |
+| FP8 training (DeepSeek-V3 配方) | yes | `m13` E4M3/E5M2 + block scaling + master weights |
 | Real NCCL / multi-process launch | no | 教学模拟, 不依赖 GPU |
 
 读完本目录后, 再看真实框架时可以把名词映射成几条主线:

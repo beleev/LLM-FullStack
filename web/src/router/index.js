@@ -73,6 +73,12 @@ const routes = [
     meta: { title: 'MoE 路由', stage: 'models', chapter: '阶段 2 · llm_models' },
   },
   {
+    path: '/models/swa-mtp',
+    name: 'models-mtp',
+    component: () => import('@/views/StageTopic.vue'),
+    meta: { title: 'SWA 与 MTP', stage: 'models', chapter: '阶段 2 · llm_models' },
+  },
+  {
     path: '/diffusion',
     name: 'diffusion',
     component: () => import('@/views/Diffusion.vue'),
@@ -111,6 +117,12 @@ const routes = [
     meta: { title: '精度与稳定性', stage: 'train', chapter: '阶段 3 · llm_train' },
   },
   {
+    path: '/train/moe-seq-parallel',
+    name: 'train-moe-seq',
+    component: () => import('@/views/StageTopic.vue'),
+    meta: { title: 'EP 与序列并行', stage: 'train', chapter: '阶段 3 · llm_train' },
+  },
+  {
     path: '/train/collectives-loop',
     name: 'train-collectives-loop',
     component: () => import('@/views/StageTopic.vue'),
@@ -141,6 +153,12 @@ const routes = [
     name: 'finetune-dpo',
     component: () => import('@/views/StageTopic.vue'),
     meta: { title: 'DPO 偏好对齐', stage: 'finetune', chapter: '阶段 4 · llm_finetune' },
+  },
+  {
+    path: '/finetune/rlhf-grpo-distill',
+    name: 'finetune-rlhf',
+    component: () => import('@/views/StageTopic.vue'),
+    meta: { title: 'RM · GRPO · 蒸馏', stage: 'finetune', chapter: '阶段 4 · llm_finetune' },
   },
   {
     path: '/finetune/runs',

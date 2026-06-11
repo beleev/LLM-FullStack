@@ -8,6 +8,9 @@
 - BERT: Encoder-only, MLM (Devlin et al., 2018)
 - GPT-3: Decoder-only, 自回归 LM (Brown et al., 2020)
 - LLaMA: 现代 Decoder-only (Touvron et al., 2023)
+- Mistral: LLaMA + 滑动窗口注意力 SWA (Jiang et al., 2023)
+- MTP: LLaMA + 多 token 预测级联 (DeepSeek-V3, 2024)
+- Qwen3-Next: Gated DeltaNet 3:1 全注意力混合架构 (2025)
 - Mamba: Selective SSM, O(T) (Gu & Dao, 2023)
 
 MoE 模型 (Mixture of Experts)
@@ -37,6 +40,9 @@ from llm_models.models.foundation.transformer import (
 from llm_models.models.language_models.bert import BERT, BERTEmbeddings
 from llm_models.models.language_models.gpt3 import GPT3, GPTBlock
 from llm_models.models.language_models.llama import LLaMA, LlamaBlock
+from llm_models.models.language_models.mistral import Mistral, MistralBlock
+from llm_models.models.language_models.mtp import MTPLLaMA, MTPModule, MTPLoss
+from llm_models.models.language_models.qwen3_next import Qwen3Next
 from llm_models.models.language_models.mamba import Mamba, MambaBlock, MambaLayer
 
 # --- MoE ---
@@ -97,6 +103,9 @@ __all__ = [
     "BERT", "BERTEmbeddings",
     "GPT3", "GPTBlock",
     "LLaMA", "LlamaBlock",
+    "Mistral", "MistralBlock",
+    "MTPLLaMA", "MTPModule", "MTPLoss",
+    "Qwen3Next",
     "Mamba", "MambaBlock", "MambaLayer",
     # MoE
     "Mixtral", "MixtralBlock",

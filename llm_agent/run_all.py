@@ -13,6 +13,7 @@ DEMOS = [
     "llm_agent.m05_extensibility.demo",
     "llm_agent.m06_persistence_resume.demo",
     "llm_agent.m07_subagents.demo",
+    "llm_agent.m08_retrieval.demo",
     "llm_agent.full_loop.demo",
 ]
 

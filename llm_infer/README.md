@@ -47,7 +47,11 @@
             │       │                          │
             │       ├─ m14 Structured Output ─┤
             │       │                          │
-            │       └─ m15 P/D Disaggregation ┘
+            │       ├─ m15 P/D Disaggregation ┤
+            │       │                          │
+            │       ├─ m16 Attention Sinks ───┤   <-- 流式长上下文
+            │       │                          │
+            │       └─ m17 EAGLE Speculative ─┘   <-- 特征级 draft
             │
             ▼
     full_engine/   把以上模块组装成 mini-vLLM
@@ -74,6 +78,8 @@
 | 13 | [Multi-LoRA Serving](m13_lora_serving/) | `demo.py` | batched LoRA、SGMV 思路 |
 | 14 | [Structured Output](m14_structured_output/) | `demo.py` | JSON/grammar 约束 logits mask |
 | 15 | [P/D Disaggregation](m15_pd_disaggregation/) | `demo.py` | prefill/decode 跨节点解耦 |
+| 16 | [Attention Sinks](m16_attention_sinks/) | `demo.py` | StreamingLLM、sink+窗口有界 KV、流式无限输入 |
+| 17 | [EAGLE Speculative](m17_eagle_speculative/) | `demo.py` | 特征级 draft、共享 lm_head、接受率 vs token-only 对照 |
 | ★  | [Full Engine](full_engine/) | `engine.py` | 集成 m01+m02+m03+m04+m10 的 mini-vLLM |
 
 ---
@@ -96,10 +102,12 @@
 | Multi-LoRA serving | ✅ m13 | batched LoRA |
 | Structured output | ✅ m14 | logits mask |
 | P/D disaggregation | ✅ m15 | KV transfer 概念 |
+| Attention sinks / StreamingLLM | ✅ m16 | sink + 滑动窗口, 有界 KV |
+| EAGLE / 特征级投机解码 | ✅ m17 | draft 吃 target hidden state, 共享输出头 |
 | Pipeline parallelism | ❌ | 训练为主，推理少用 |
-| Expert parallelism | ❌ | 见 `llm_models/layers/sparse/` |
+| Expert parallelism | ❌ | 见 `llm_train/m11` 与 `llm_models/layers/sparse/` |
 | MLA / KV 压缩 | ❌ | 见 `llm_models/` DeepSeek-V3 |
-| Lookahead/Medusa | 部分 ✅ | m07 投机思想可外推 |
+| Lookahead/Medusa | 部分 ✅ | m07/m17 投机思想可外推; MTP draft 见 `llm_models` mtp |
 
 ---
 

@@ -80,9 +80,15 @@ from llm_models.models import (
     BERTEmbeddings,
     GPT3,
     GPTBlock,
-    # LLaMA / Mixtral / Mamba
+    # LLaMA / Mistral / MTP / Mixtral / Mamba
     LLaMA,
     LlamaBlock,
+    Mistral,
+    MistralBlock,
+    MTPLLaMA,
+    MTPModule,
+    MTPLoss,
+    Qwen3Next,
     Mixtral,
     MixtralBlock,
     Mamba,
@@ -136,6 +142,7 @@ from llm_models.utils import (
     get_pad_mask,
     get_subsequent_mask,
     build_causal_mask,
+    build_sliding_window_mask,
     combine_causal_and_padding_mask,
     combine_masks,
 )
@@ -193,6 +200,9 @@ __all__ = [
     "BERT", "BERTEmbeddings",
     "GPT3", "GPTBlock",
     "LLaMA", "LlamaBlock",
+    "Mistral", "MistralBlock",
+    "MTPLLaMA", "MTPModule", "MTPLoss",
+    "Qwen3Next",
     "Mixtral", "MixtralBlock",
     "Mamba", "MambaBlock", "MambaLayer",
     "DeepSeekV3", "DeepSeekBlock", "DeepSeekMoE",
@@ -215,6 +225,7 @@ __all__ = [
     "ImageTokenizer", "VARModel",
     # ---- Utils ----
     "get_pad_mask", "get_subsequent_mask", "build_causal_mask",
+    "build_sliding_window_mask",
     "combine_causal_and_padding_mask", "combine_masks",
     # ---- Training ----
     "Trainer", "TrainingConfig",

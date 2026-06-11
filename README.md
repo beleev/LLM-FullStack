@@ -7,17 +7,17 @@
 ## 六阶段总览
 
 ```
-阶段 1 · llm_basic       用 numpy 手写 forward/backward/采样，看清数学怎么流过模型
+阶段 1 · llm_basic       用 numpy 手写 forward/backward/采样/BPE，看清数学怎么流过模型
     ↓
-阶段 2 · llm_models      PyTorch 实现 17 个模型架构 (2017 Transformer → 2025 DeepSeek-V3.2)
+阶段 2 · llm_models      PyTorch 实现 20 个模型架构 (2017 Transformer → 2025 Qwen3-Next)
     ↓
-阶段 3 · llm_train        纯 numpy 模拟分布式训练：DDP / TP / PP / ZeRO / 混合精度 / checkpoint
+阶段 3 · llm_train        纯 numpy 模拟分布式训练：DDP / TP / PP / ZeRO / EP / Ring Attention / FP8
     ↓
-阶段 4 · llm_finetune    SFT / LoRA / DPO 三大微调范式，复用 llm_models 的 LLaMA + Trainer
+阶段 4 · llm_finetune    SFT / LoRA / QLoRA / DPO / RM / GRPO / 蒸馏 七大微调范式，复用 llm_models 的 LLaMA + Trainer
     ↓
-阶段 5 · llm_infer        15 个推理优化模块 + mini-vLLM 引擎，覆盖业界 80% 推理技术
+阶段 5 · llm_infer        17 个推理优化模块 + mini-vLLM 引擎，覆盖业界 80% 推理技术
     ↓
-阶段 6 · llm_agent        Agent 循环 / 工具 / 权限 / 记忆 / Hook / 持久化 / 子智能体
+阶段 6 · llm_agent        Agent 循环 / 工具 / 权限 / 记忆 / Hook / 持久化 / 子智能体 / 检索
 ```
 
 ## 安装
@@ -41,37 +41,41 @@ llm/
 │   ├── model.py           forward/backward 成对实现，每条链式法则都看得见
 │   ├── gradcheck.py       数值梯度 vs 解析梯度验证
 │   ├── train.py           训练循环 (2000 步，loss 4.17 → ~1.9)
-│   └── sample.py          自回归采样 (temperature + top-k)
+│   ├── sample.py          自回归采样 (temperature + top-k)
+│   └── bpe.py             手写 byte-level BPE (GPT-2 同款思想)
 │
 ├── llm_models/            阶段 2 · 架构家族 (PyTorch)
 │   ├── layers/            可复用零件：attention / ffn / norm / pos / moe / ssm / adaln / vq
-│   ├── models/            17 个模型：Transformer → BERT → GPT-3 → LLaMA → Mixtral → Mamba
-│   │                      → DeepSeek-V3/V3.2 → CLIP → Whisper → Qwen2-VL → Qwen2.5-Omni
+│   ├── models/            20 个模型：Transformer → BERT → GPT-3 → LLaMA → Mistral(SWA)
+│   │                      → MTP → Qwen3-Next(混合线性) → Mixtral → Mamba → DeepSeek-V3/V3.2
+│   │                      → CLIP → Whisper → Qwen2-VL → Qwen2.5-Omni
 │   │                      → ImageVAE → DiT → MM-DiT → Video DiT → VAR
 │   ├── training/          通用训练框架 (策略模式)：Trainer / Loss / Data / Diffusion
-│   └── run_models/        前向 + 训练示例 (共 24 组)
+│   └── run_models/        前向 + 训练示例 (共 28 组)
 │
 ├── llm_train/             阶段 3 · 规模化训练 (纯 numpy 模拟)
-│   ├── m01–m10/           梯度累积 → DDP → TP → PP → ZeRO → 混合精度
+│   ├── m01–m13/           梯度累积 → DDP → TP → PP → ZeRO → 混合精度
 │   │                      → 激活检查点 → checkpoint → 通信原语 → 训练稳定性
+│   │                      → 专家并行 (EP) → 序列并行 (Ring Attention) → FP8 训练
 │   └── full_loop/         多技术组合的训练主循环
 │
 ├── llm_finetune/          阶段 4 · 微调对齐
-│   ├── methods/           SFT / LoRA / DPO 核心算法
-│   ├── data/              指令数据 + 偏好对数据生成器
-│   └── run_finetune/      端到端训练脚本 (CPU 30 秒跑完)
+│   ├── methods/           SFT / LoRA / QLoRA(NF4) / DPO / RewardModel / GRPO / 蒸馏 核心算法
+│   ├── data/              指令数据 + 偏好对 + prompt 数据生成器
+│   └── run_finetune/      端到端训练脚本 (CPU 一分钟内跑完)
 │
 ├── llm_infer/             阶段 5 · 推理与部署优化 (纯 numpy)
-│   ├── m01–m15/           KV Cache → PagedAttention → Continuous Batching
+│   ├── m01–m17/           KV Cache → PagedAttention → Continuous Batching
 │   │                      → Prefix Cache → Radix Cache → Chunked Prefill
 │   │                      → Speculative Decoding → Quantization → Tensor Parallel
 │   │                      → Sampling → FlashAttention → CUDA Graph
 │   │                      → Multi-LoRA → Structured Output → P/D Disaggregation
+│   │                      → Attention Sinks (StreamingLLM) → EAGLE 投机解码
 │   └── full_engine/       集成 mini-vLLM 引擎
 │
 ├── llm_agent/             阶段 6 · Agent 应用层 (纯 Python stdlib)
-│   ├── m01–m07/           Agent 循环 → 工具调用 → 权限门 → 上下文与记忆
-│   │                      → Hook/Skill/MCP → 持久化 → 子智能体
+│   ├── m01–m08/           Agent 循环 → 工具调用 → 权限门 → 上下文与记忆
+│   │                      → Hook/Skill/MCP → 持久化 → 子智能体 → 向量检索 (RAG-lite)
 │   └── full_loop/         多机制组合的 mini Agent harness
 │
 ├── web/                   Vue 3 交互式教程 (Vite + vue-router)
@@ -92,20 +96,24 @@ python prepare.py                                   # 下载 Tiny Shakespeare (~
 python gradcheck.py                                  # 验证 backward 正确性
 python train.py                                      # 训练 2000 步 (~2 min)
 python sample.py "ROMEO:" --max-new 300 --temperature 0.8
+python bpe.py --merges 300                           # 手写 BPE：看词表怎么长出来
 ```
 
 ### 阶段 2 · llm_models — 架构家族
 
 ```bash
 # 前向示例
-python -m llm_models.run_models.language_models.run_gpt3
-python -m llm_models.run_models.language_models.run_llama
-python -m llm_models.run_models.moe.run_deepseek
+python -m llm_models.run_models.language_models.gpt3.infer_gpt3
+python -m llm_models.run_models.language_models.llama.infer_llama
+python -m llm_models.run_models.language_models.mistral.infer_mistral   # SWA 滑动窗口
+python -m llm_models.run_models.language_models.mtp.infer_mtp           # 多 token 预测
+python -m llm_models.run_models.language_models.qwen3_next.infer_qwen3_next  # 混合线性注意力
+python -m llm_models.run_models.moe.deepseek.infer_deepseek
 
 # 合成数据训练
-python -m llm_models.run_models.language_models.train_llama
-python -m llm_models.run_models.generative.train_dit
-python -m llm_models.run_models.multimodal.train_clip
+python -m llm_models.run_models.language_models.llama.train_llama
+python -m llm_models.run_models.generative.dit.train_dit
+python -m llm_models.run_models.multimodal.clip.train_clip
 ```
 
 ### 阶段 3 · llm_train — 规模化训练
@@ -114,6 +122,9 @@ python -m llm_models.run_models.multimodal.train_clip
 python -m llm_train.m01_gradient_accumulation.demo
 python -m llm_train.m02_data_parallel.demo
 python -m llm_train.m05_zero_fsdp.demo
+python -m llm_train.m11_expert_parallel.demo          # MoE all-to-all + 路由均衡
+python -m llm_train.m12_sequence_parallel.demo        # Ring Attention
+python -m llm_train.m13_fp8_training.demo             # FP8 + block scaling
 python -m llm_train.full_loop.demo                   # 组合闭环
 python -m llm_train.run_all                           # 全部跑一遍
 ```
@@ -123,7 +134,11 @@ python -m llm_train.run_all                           # 全部跑一遍
 ```bash
 python -m llm_finetune.run_finetune.sft.train_sft    # 全参 SFT
 python -m llm_finetune.run_finetune.lora.train_lora   # LoRA (PEFT, <1% 参数)
+python -m llm_finetune.run_finetune.qlora.train_qlora  # QLoRA (NF4 4-bit 基座 + LoRA)
 python -m llm_finetune.run_finetune.dpo.train_dpo     # DPO 偏好对齐
+python -m llm_finetune.run_finetune.rm.train_rm       # Reward Model (RLHF 第二阶段)
+python -m llm_finetune.run_finetune.grpo.train_grpo   # GRPO (R1 式 RLVR 在线 RL)
+python -m llm_finetune.run_finetune.distill.train_distill  # 知识蒸馏
 ```
 
 ### 阶段 5 · llm_infer — 推理优化
@@ -133,6 +148,8 @@ python -m llm_infer.m01_kv_cache.demo
 python -m llm_infer.m02_paged_attention.demo
 python -m llm_infer.m03_continuous_batching.demo
 python -m llm_infer.m11_flash_attention.demo
+python -m llm_infer.m16_attention_sinks.demo          # StreamingLLM 有界 KV
+python -m llm_infer.m17_eagle_speculative.demo        # EAGLE 特征级投机解码
 python -m llm_infer.full_engine.demo                  # mini-vLLM 引擎
 ```
 
@@ -142,6 +159,7 @@ python -m llm_infer.full_engine.demo                  # mini-vLLM 引擎
 python -m llm_agent.m01_agent_loop.demo
 python -m llm_agent.m03_permissions.demo
 python -m llm_agent.m07_subagents.demo
+python -m llm_agent.m08_retrieval.demo                # TF-IDF 向量检索 (RAG-lite)
 python -m llm_agent.full_loop.demo                    # mini Agent harness
 python -m llm_agent.run_all                           # 全部跑一遍
 ```
@@ -156,7 +174,10 @@ python -m llm_agent.run_all                           # 全部跑一遍
 | 2018 | BERT | 双向注意力 + `BERTEmbeddings` + MLM head |
 | 2020 | GPT-3 | `MultiHeadAttention` + `GeLUFeedForward` + Weight Tying |
 | 2023 | LLaMA | `GroupedQueryAttention` + `SwiGLUFeedForward` + `RMSNorm` + `RotaryPositionalEncoding` |
+| 2023 | Mistral | LLaMA 骨架 + `build_sliding_window_mask` (SWA，KV cache 封顶 O(W)) |
 | 2024 | Mixtral | LLaMA 骨架 + `MixtralMoE` (softmax top-k) |
+| 2024 | MTP | LLaMA 骨架 + `MTPModule` 级联 (多 token 预测，DeepSeek-V3 训练目标) |
+| 2025 | Qwen3-Next | `GatedDeltaNet` (线性注意力 + delta rule) 3:1 混合 `GroupedQueryAttention` |
 | 2023 | Mamba | `SelectiveSSM` + 1D conv + gate，线性复杂度 O(T) |
 | 2024 | DeepSeek-V3 | `MultiHeadLatentAttention` + `DeepSeekMoE` (sigmoid + shared experts + aux-loss-free) |
 | 2025 | DeepSeek-V3.2 | V3 + `MultiHeadLatentSparseAttention` (MLA + `LightningIndexer`) |
@@ -196,6 +217,9 @@ python -m llm_agent.run_all                           # 全部跑一遍
 | Checkpoint / Resume | yes | m08 |
 | Communication Collectives | yes | m09 |
 | Warmup / Cosine / Grad Clip / NaN Guard | yes | m10 |
+| Expert Parallel / MoE all-to-all | yes | m11 |
+| Sequence Parallel / Ring Attention | yes | m12 |
+| FP8 Training (E4M3/E5M2 + block scaling) | yes | m13 |
 
 ### 推理技术 (llm_infer)
 
@@ -216,6 +240,8 @@ python -m llm_agent.run_all                           # 全部跑一遍
 | Multi-LoRA Serving | yes | m13 |
 | Structured Output (JSON/Grammar) | yes | m14 |
 | P/D Disaggregation | yes | m15 |
+| Attention Sinks / StreamingLLM | yes | m16 |
+| EAGLE 特征级投机解码 | yes | m17 |
 
 ### 微调技术 (llm_finetune)
 
@@ -223,7 +249,11 @@ python -m llm_agent.run_all                           # 全部跑一遍
 |------|:---:|------|
 | SFT (Supervised Fine-Tuning) | yes | 全参微调，prompt masking |
 | LoRA (Low-Rank Adaptation) | yes | <1% 参数，极快收敛 |
+| QLoRA (NF4 4-bit 基座 + LoRA) | yes | 真 4bit 打包，基座 ~7x 压缩 |
 | DPO (Direct Preference Optimization) | yes | 双前向 + KL 约束，跳过 reward model |
+| Reward Model (RLHF 第二阶段) | yes | value head + Bradley-Terry 偏好损失 |
+| GRPO (R1 式在线 RL) | yes | 组内相对优势替代 critic + RLVR 可验证奖励 |
+| Knowledge Distillation | yes | 软标签 + 温度 T² 补偿，teacher→student |
 
 ### Agent 技术 (llm_agent)
 
@@ -236,6 +266,7 @@ python -m llm_agent.run_all                           # 全部跑一遍
 | Hooks / Skills / MCP | yes | m05 |
 | Session Persistence & Resume | yes | m06 |
 | Subagents (隔离 + summary return) | yes | m07 |
+| Retrieval / RAG-lite (TF-IDF 余弦) | yes | m08 |
 
 ## 设计取舍速查表
 
@@ -245,8 +276,11 @@ python -m llm_agent.run_all                           # 全部跑一遍
 | FFN 激活 | ReLU | GELU → SwiGLU | `layers/core/feedforward.py` |
 | 位置编码 | Sin/Learned 绝对 | RoPE → M-RoPE | `layers/core/position_encoding.py` |
 | KV Cache | MHA (最大) | MQA → GQA → MLA → MLA+DSA | `layers/core/attention.py` |
+| 注意力范围 | 全因果 O(T²) | SWA 带状 O(T·W) + sink | `utils/masks.py`, `models/.../mistral.py` |
+| 训练目标 | next-token CE | + MTP 多 token 预测 | `models/language_models/mtp.py` |
+| 偏好对齐 | RLHF (RM+PPO) | DPO (离线) / GRPO (在线, 无 critic) | `llm_finetune/methods/` |
 | FFN 结构 | 单 FFN | Mixtral MoE → DeepSeekMoE | `layers/sparse/moe.py` |
-| 序列建模 | Attention O(T^2) | Mamba SSM O(T) | `layers/sparse/ssm.py` |
+| 序列建模 | Attention O(T^2) | Mamba SSM / DeltaNet+Attn 混合 | `layers/sparse/ssm.py`, `linear_attention.py` |
 | 扩散骨架 | UNet (SD 1.5) | DiT + adaLN-Zero | `layers/diffusion/adaln.py` |
 | 扩散目标 | ε-prediction | Rectified Flow v-prediction | `training/diffusion.py` |
 
@@ -260,8 +294,10 @@ python -m llm_agent.run_all                           # 全部跑一遍
 - *BERT* — Devlin et al., 2019 ([arXiv:1810.04805](https://arxiv.org/abs/1810.04805))
 - *GPT-3* — Brown et al., 2020 ([arXiv:2005.14165](https://arxiv.org/abs/2005.14165))
 - *LLaMA / LLaMA 2 / Llama 3* — Touvron et al. / Meta AI, 2023-2024
+- *Mistral 7B* — Jiang et al., 2023 ([arXiv:2310.06825](https://arxiv.org/abs/2310.06825))
 - *Mixtral of Experts* — Jiang et al., 2024 ([arXiv:2401.04088](https://arxiv.org/abs/2401.04088))
 - *Mamba* — Gu & Dao, 2023 ([arXiv:2312.00752](https://arxiv.org/abs/2312.00752))
+- *Gated Delta Networks* — Yang et al., 2024 ([arXiv:2412.06464](https://arxiv.org/abs/2412.06464))
 - *DeepSeek-V2 / V3 / V3.2 Technical Reports* — DeepSeek-AI, 2024-2025
 
 ### 组件层面
@@ -270,6 +306,8 @@ python -m llm_agent.run_all                           # 全部跑一遍
 - *GLU Variants* — Shazeer, 2020 ([arXiv:2002.05202](https://arxiv.org/abs/2002.05202))
 - *GQA* — Ainslie et al., 2023 ([arXiv:2305.13245](https://arxiv.org/abs/2305.13245))
 - *Switch Transformer* — Fedus et al., 2021 ([arXiv:2101.03961](https://arxiv.org/abs/2101.03961))
+- *Multi-token Prediction* — Gloeckle et al., 2024 ([arXiv:2404.19737](https://arxiv.org/abs/2404.19737))
+- *Ring Attention* — Liu et al., 2023 ([arXiv:2310.01889](https://arxiv.org/abs/2310.01889))
 
 ### 多模态
 - *CLIP* — Radford et al., 2021 ([arXiv:2103.00020](https://arxiv.org/abs/2103.00020))
@@ -295,12 +333,18 @@ python -m llm_agent.run_all                           # 全部跑一遍
 - *vLLM / PagedAttention* — Kwon et al., 2023 ([arXiv:2309.06180](https://arxiv.org/abs/2309.06180))
 - *FlashAttention* — Dao et al., 2022 ([arXiv:2205.14135](https://arxiv.org/abs/2205.14135))
 - *Speculative Decoding* — Leviathan et al., 2023 ([arXiv:2211.17192](https://arxiv.org/abs/2211.17192))
+- *EAGLE* — Li et al., 2024 ([arXiv:2401.15077](https://arxiv.org/abs/2401.15077))
 - *SGLang / RadixAttention* — Zheng et al., 2024 ([arXiv:2312.07104](https://arxiv.org/abs/2312.07104))
+- *StreamingLLM / Attention Sinks* — Xiao et al., 2023 ([arXiv:2309.17453](https://arxiv.org/abs/2309.17453))
 
 ### 微调 / 对齐
 - *LoRA* — Hu et al., 2021 ([arXiv:2106.09685](https://arxiv.org/abs/2106.09685))
+- *QLoRA* — Dettmers et al., 2023 ([arXiv:2305.14314](https://arxiv.org/abs/2305.14314))
 - *DPO* — Rafailov et al., 2023 ([arXiv:2305.18290](https://arxiv.org/abs/2305.18290))
 - *InstructGPT* — Ouyang et al., 2022 ([arXiv:2203.02155](https://arxiv.org/abs/2203.02155))
+- *GRPO / DeepSeekMath* — Shao et al., 2024 ([arXiv:2402.03300](https://arxiv.org/abs/2402.03300))
+- *DeepSeek-R1* — DeepSeek-AI, 2025 ([arXiv:2501.12948](https://arxiv.org/abs/2501.12948))
+- *Knowledge Distillation* — Hinton et al., 2015 ([arXiv:1503.02531](https://arxiv.org/abs/1503.02531))
 
 </details>
 

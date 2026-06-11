@@ -45,7 +45,7 @@ from llm_models.layers.core import (
     PreLNCrossBlock,
 )
 
-from llm_models.layers.sparse import MixtralMoE, SelectiveSSM
+from llm_models.layers.sparse import MixtralMoE, SelectiveSSM, GatedDeltaNet
 
 from llm_models.layers.diffusion import (
     AdaLNZeroBlock,
@@ -90,6 +90,7 @@ __all__ = [
     # sparse
     "MixtralMoE",
     "SelectiveSSM",
+    "GatedDeltaNet",
     # diffusion
     "AdaLNZeroBlock",
     "FinalLayer",

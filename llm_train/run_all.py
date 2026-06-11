@@ -15,6 +15,9 @@ DEMOS = [
     "llm_train.m08_checkpoint_resume.demo",
     "llm_train.m09_collectives.demo",
     "llm_train.m10_training_stability.demo",
+    "llm_train.m11_expert_parallel.demo",
+    "llm_train.m12_sequence_parallel.demo",
+    "llm_train.m13_fp8_training.demo",
     "llm_train.full_loop.demo",
 ]
 
