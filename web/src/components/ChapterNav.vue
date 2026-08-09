@@ -42,7 +42,7 @@ defineProps({
   border-radius: var(--radius-sm);
   color: inherit;
   text-decoration: none;
-  transition: all 0.15s;
+  transition: background-color 150ms ease-out, border-color 150ms ease-out, transform 150ms ease-out;
 }
 .nav-side:hover {
   border-color: var(--accent);

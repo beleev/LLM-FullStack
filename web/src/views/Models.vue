@@ -25,6 +25,8 @@
       :next-step="{ name: 'attention', label: '阶段 2.1 · 注意力演进' }"
     />
 
+    <ModelArchitectureLab />
+
     <section class="section">
       <h2>阶段 2 的阅读顺序</h2>
       <p class="lead">
@@ -103,6 +105,7 @@
 import { computed } from 'vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
+import ModelArchitectureLab from '@/components/labs/ModelArchitectureLab.vue'
 import RepoLink from '@/components/RepoLink.vue'
 import { modelChapters, timeline } from '@/data/models.js'
 
@@ -124,7 +127,7 @@ const sortedTimeline = computed(() =>
   position: relative;
   color: inherit;
   text-decoration: none;
-  transition: all 0.15s;
+  transition: border-color 150ms ease-out, transform 150ms ease-out, box-shadow 150ms ease-out;
 }
 .chapter-card:hover {
   border-color: var(--accent);

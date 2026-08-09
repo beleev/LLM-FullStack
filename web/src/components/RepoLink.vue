@@ -55,7 +55,7 @@ const icon = computed(() => {
   padding: 2px 8px;
   border-radius: 4px;
   text-decoration: none;
-  transition: all 0.12s;
+  transition: background-color 120ms ease-out, border-color 120ms ease-out, color 120ms ease-out;
   line-height: 1.5;
   vertical-align: middle;
   max-width: 100%;
@@ -94,7 +94,7 @@ const icon = computed(() => {
   font-size: 10px;
   color: var(--text-dim);
   opacity: 0.55;
-  transition: all 0.12s;
+  transition: opacity 120ms ease-out, transform 120ms ease-out;
 }
 .repo-ref.glob {
   color: var(--text-muted);

@@ -172,8 +172,8 @@ const toggleTheme = () => { theme.value = theme.value === 'dark' ? 'light' : 'da
   gap: 8px;
 }
 .theme-toggle {
-  width: 28px;
-  height: 28px;
+  width: 40px;
+  height: 40px;
   padding: 0;
   display: grid;
   place-items: center;
@@ -227,7 +227,7 @@ const toggleTheme = () => { theme.value = theme.value === 'dark' ? 'light' : 'da
 }
 .stage-toggle {
   width: 100%;
-  min-height: 38px;
+  min-height: 40px;
   padding: 8px 24px;
   display: flex;
   align-items: center;

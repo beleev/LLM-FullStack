@@ -342,7 +342,7 @@ table.compare-table .row-label { color: var(--text-muted); }
   text-decoration: none;
   color: inherit;
   position: relative;
-  transition: all 0.15s;
+  transition: border-color 150ms ease-out, transform 150ms ease-out, box-shadow 150ms ease-out;
 }
 .chapter-card:hover {
   border-color: var(--accent);

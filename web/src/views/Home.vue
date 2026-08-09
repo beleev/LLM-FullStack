@@ -428,7 +428,7 @@ const toFor = (s) => {
   gap: 8px;
   text-decoration: none;
   color: inherit;
-  transition: all 0.15s;
+  transition: background-color 150ms ease-out, border-color 150ms ease-out, transform 150ms ease-out;
 }
 .stage-card.ready:hover {
   border-color: var(--accent);
@@ -544,7 +544,7 @@ const toFor = (s) => {
   display: block;
   min-width: 960px;
 }
-.node { cursor: pointer; transition: all 0.15s; }
+.node { cursor: pointer; transition: opacity 150ms ease-out; }
 
 .hover-card {
   position: absolute;
