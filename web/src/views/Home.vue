@@ -26,6 +26,21 @@
       :next-step="{ name: 'basic', label: '阶段 1 — 用 numpy 跑通整个 Transformer' }"
     />
 
+    <!-- ── 接着上次学: 进度存在本机 localStorage, 回访时一步回到断点 ─────── -->
+    <section v-if="resume" class="section">
+      <div class="card resume">
+        <div>
+          <p class="resume-k">接着上次学</p>
+          <p class="resume-t">{{ resume.label }}</p>
+          <p class="desc">已读 {{ readCount }} / {{ learningPath.length }} 章 · 自测全对 {{ masteredCount }} 章</p>
+        </div>
+        <div class="btn-group">
+          <router-link :to="{ name: resume.route }"><button type="button" class="active">回到这一章 →</button></router-link>
+          <router-link v-if="nextUnread" :to="{ name: nextUnread.route }"><button type="button">下一个没读的: {{ nextUnread.label }}</button></router-link>
+        </div>
+      </div>
+    </section>
+
     <!-- ── 新手 30 秒导览 ─────────────────────────────────────── -->
     <section class="section onboarding">
       <h2>新手 30 秒导览 <span class="lead-inline">第一次来? 先看这里</span></h2>
@@ -173,8 +188,10 @@
           </g>
 
           <g v-for="m in timeline" :key="m.id"
-             @click="goto(m.id)"
+             @click="goto(m.id)" @keydown.enter="goto(m.id)" @keydown.space.prevent="goto(m.id)"
              @mouseenter="hover = m.id" @mouseleave="hover = null"
+             @focus="hover = m.id" @blur="hover = null"
+             tabindex="0" role="link" :aria-label="`${m.year} ${m.name}: ${m.blurb}`"
              class="node">
             <circle :cx="nodeX(m)" :cy="trackY(m.track)"
                     :r="hover === m.id ? 10 : 7"
@@ -238,17 +255,35 @@
       </div>
     </section>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav :next="{ name: 'basic', label: '阶段 1 · llm_basic', hint: '用 numpy 把 forward / backward / 采样 全部手写一遍' }" />
   </div>
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { tracks, timeline, years, findModel, stages } from '@/data/models.js'
+import { tracks, timeline, years, findModel, stages, learningPath } from '@/data/models.js'
+import { useProgress } from '@/composables/useProgress.js'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import RepoLink from '@/components/RepoLink.vue'
+
+// ── 学习进度 ─────────────────────────────────────────────────────
+const progress = useProgress()
+const chapters = learningPath.filter((p) => p.route !== 'home')
+const resume = computed(() => chapters.find((p) => p.route === progress.state.last) || null)
+const nextUnread = computed(() => chapters.find((p) => !progress.isVisited(p.route)) || null)
+const readCount = computed(() => learningPath.filter((p) => progress.isVisited(p.route)).length)
+const masteredCount = computed(() => learningPath.filter((p) => progress.isMastered(p.route)).length)
 
 const router = useRouter()
 const hover = ref(null)
@@ -303,11 +338,13 @@ const pathRows = [
 const goto = (id) => {
   const map = {
     transformer: 'blocks', bert: 'blocks',
-    gpt3: 'attention', llama: 'attention', mamba: 'blocks',
-    mixtral: 'moe', deepseek_v3: 'moe', deepseek_v32: 'attention',
+    gpt3: 'attention', llama: 'attention', mamba: 'models-mamba',
+    mistral: 'models-mtp', qwen3_next: 'models-mtp', mtp: 'models-mtp',
+    gpt_oss: 'models-gptoss', llada: 'models-llada',
+    mixtral: 'moe', deepseek_v3: 'models-moe-balance', deepseek_v32: 'models-dsa',
     clip: 'compare', whisper: 'compare', qwen2_vl: 'position', omni: 'position',
     vae: 'diffusion', dit: 'diffusion', mmdit: 'diffusion',
-    video_dit: 'diffusion', var: 'diffusion',
+    video_dit: 'diffusion', vae3d: 'diffusion', var: 'models-var',
   }
   router.push({ name: map[id] || 'compare', query: { focus: id } })
 }
@@ -321,6 +358,9 @@ const toFor = (s) => {
 </script>
 
 <style scoped>
+.resume { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; border-left: 3px solid var(--left); }
+.resume-k { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.8px; }
+.resume-t { font-size: 16px; font-weight: 600; margin: 2px 0 4px; }
 .lead-inline {
   font-size: 12px;
   color: var(--text-dim);

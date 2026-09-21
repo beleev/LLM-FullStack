@@ -20,8 +20,8 @@
         { path: 'llm_infer/m01_kv_cache/' },
         { path: 'llm_infer/m03_continuous_batching/' },
       ]"
-      :prereq="{ name: 'finetune-runs', label: '阶段 4.4 · 训练脚本与落盘' }"
-      :next-step="{ name: 'infer-kv-memory', label: '阶段 5.1 · KV 与缓存内存' }"
+      :prereq="prevChapter"
+      :next-step="{ name: 'infer-kv-memory', label: '下一章 · KV 与缓存内存' }"
     />
 
     <section class="section">
@@ -96,7 +96,7 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="m in inferModules" :key="m.id">
+            <tr v-for="m in allModules" :key="m.id">
               <td class="axis">{{ m.name }}</td>
               <td>{{ m.concept }}</td>
               <td>{{ m.link }}</td>
@@ -111,22 +111,23 @@
       <h2>5. full_engine · 把模块接成服务主循环</h2>
       <p class="lead">
         <RepoLink path="llm_infer/full_engine/engine.py" label="full_engine/engine.py" tiny /> 是最值得对照原始代码读的一页:
-        它不追求完整 vLLM, 但把 add_request、prefill、decode、block manager、prefix cache 和 sampling 串在同一条控制流里。
+        它不追求完整 vLLM, 但把调度 (m03)、真分页 KV pool (m02)、前缀复用 (m04)、分块 prefill (m06)、抢占和采样 (m10) 串在同一条控制流里,
+        并断言 greedy 输出与朴素生成逐 token 相同 —— 即使 9 个 block 的小 pool 触发了 4 次抢占。
       </p>
       <div class="grid grid-2" style="gap: 16px;">
         <div class="card">
-          <h3>Engine.step <span class="tag">阶段切换</span></h3>
+          <h3>Engine.step <span class="tag">混合 batch</span></h3>
           <pre class="code">{{ engineStepCode }}</pre>
           <p class="hint">
-            prefill 优先保证新请求尽快拿到首 token; waiting 清空后, running 请求进入 decode continuous batching。
+            没有"prefill 步"和"decode 步"之分: 一个 batch 里 n&gt;1 的 prefill chunk 和 n=1 的 decode 混跑, 序列追平了才采样。
           </p>
         </div>
         <div class="card">
-          <h3>prefill 中发生什么 <span class="tag">资源账本</span></h3>
+          <h3>接纳新请求时发生什么 <span class="tag">资源账本</span></h3>
           <pre class="code">{{ prefillCode }}</pre>
           <p class="hint">
-            这段代码把"命中前缀、分配新 block、注册 cache、采样首 token"放在一起,
-            是理解 mini-vLLM 的入口。
+            命中前缀的 token 真的跳过前向 (KV 在全局分页 pool 里, 经页表读回);
+            demo 里 305 个待算 token = 233 个真前向 + 72 个前缀命中, 账必须对得上。
           </p>
         </div>
       </div>
@@ -150,20 +151,35 @@
       </div>
     </section>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav
-      :prev="{ name: 'finetune-runs', label: '阶段 4.4 · 训练脚本与落盘', hint: 'SFT / LoRA / DPO 产出要部署的模型或适配器' }"
-      :next="{ name: 'infer-kv-memory', label: '阶段 5.1 · KV 与缓存内存', hint: '从少算旧 token 开始拆推理优化' }"
+      :prev="{ ...prevChapter, hint: '微调 / 对齐产出要部署的模型或适配器' }"
+      :next="{ name: 'infer-kv-memory', label: '下一章 · KV 与缓存内存', hint: '从少算旧 token 开始拆推理优化' }"
     />
   </div>
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import EvolutionChain from '@/components/EvolutionChain.vue'
 import CodeRef from '@/components/CodeRef.vue'
 import RepoLink from '@/components/RepoLink.vue'
-import { inferModules } from '@/data/models.js'
+import { inferModules, learningPath } from '@/data/models.js'
+
+// 上一章从 learningPath 取, 不手写编号 (别的阶段加章后手写的 "4.4" 会过期)
+const prevItem = learningPath[learningPath.findIndex((x) => x.route === 'infer') - 1]
+const prevChapter = { name: prevItem.route, label: `上一章 · ${prevItem.label}` }
+
+const allModules = inferModules
 
 const inferChain = [
   {
@@ -191,7 +207,7 @@ const inferChain = [
     name: 'Scheduler',
     year: 'm03',
     pain: '请求随时进出, 静态 batch 会浪费大量空槽。',
-    fix: 'waiting / running 队列分开, prefill 和 decode 动态组批。',
+    fix: '每步重组 batch, prefill chunk 与 decode 混批, block 不够就抢占。',
     color: 'var(--eye)',
   },
   {
@@ -231,59 +247,62 @@ const servingPrimitives = [
     tag: 'PagedAttention',
     desc: '把 KV pool 切成固定 block, 每条序列持有一张 block table。',
     file: 'llm_infer/m02_paged_attention/block_manager.py',
-    code: `table = []
-for _ in range(n_blocks):
-    blk = free_list.popleft()
-    ref_count[blk] = 1
-    table.append(blk)
+    code: `for blk in shared:          # 前缀命中的 block
+    share_block(blk)        # ref_count += 1
+n_new = blocks_needed(n_tokens) - len(shared)
+table = list(shared) + [pop_free() for _ in range(n_new)]
 block_tables[seq_id] = table`,
   },
   {
     name: 'Scheduler',
     tag: 'continuous',
-    desc: 'waiting 请求先 prefill, running 请求 decode, 显存不够时 preempt。',
+    desc: '每步重组 batch = [(seq, n)]: running 先各拿 1 个 token, 剩余预算切给 prefill chunk; block 不够就抢占。',
     file: 'llm_infer/m03_continuous_batching/scheduler.py',
-    code: `if waiting:
-    picked = pick_prefill_batch(token_budget)
-    return picked, Stage.PREFILL
-
-return list(running), Stage.DECODE`,
+    code: `budget = max_batch_tokens
+batch = schedule_running(budget)   # decode: n = 1
+budget -= sum(n for _, n in batch)
+if not just_preempted:
+    batch += admit(budget)         # prefill chunk
+return batch                       # [(seq, n)]`,
   },
   {
     name: 'PrefixCache',
     tag: 'reuse',
     desc: '完整 block 的 token 和父 hash 形成链式 hash, 命中后共享物理 block。',
     file: 'llm_infer/m04_prefix_cache/prefix_cache.py',
-    code: `h = SHA1(parent_hash || token_block)
-blk = hash_to_block.get(h)
-if blk is not None:
-    hits.append(blk)
-    parent_hash = h`,
+    code: `for i in range((len(ids) - 1) // bs):   # 至少留 1 个 token 真算
+    parent = sha1(parent + block_i)     # 链式 hash
+    blk = hash_to_block.get(parent)
+    if blk is None: break
+    hits.append(blk)`,
   },
 ]
 
 const engineStepCode = `def step(self):
-    self.stats_step += 1
-    if self.waiting:
-        return self._step_prefill()
-    return self._step_decode()`
+    batch = self.scheduler.schedule()   # [(seq, n)]
+    tokens = []
+    for seq, n in batch:
+        end = seq.num_computed + n
+        logits = self.runner.run(
+            seq.all_ids[:end], table(seq), seq.num_computed)
+        done = end == seq.num_tokens    # 追平了才采样
+        tokens.append(sample(logits) if done else None)
+    return self.scheduler.postprocess(batch, tokens)`
 
-const prefillCode = `hits, n_hit_tokens = prefix_cache.match_prefix(seq.prompt_ids)
-new_blocks_needed = n_blocks_needed - len(hits)
-
-for blk in hits:
-    bm.share_block(blk)
-for _ in range(new_blocks_needed):
-    allocate_new_block()
-
-logits, kv_cache = lm.prefill(ids_arr)
-tok_id = sample(logits[-1], params, history=seq.prompt_ids)`
+const prefillCode = `# Scheduler._admit: 接纳新请求
+hits, n_hit = prefix_cache.match_prefix(ids)
+n = min(len(ids) - n_hit, budget)   # 只吃一个 chunk
+if not bm.can_allocate(len(ids), hits):
+    break
+bm.allocate(seq_id, len(ids), hits) # 命中块直接进页表
+seq.num_computed = n_hit            # 命中的不用前向
+batch.append((seq, n))`
 
 const engineMap = [
   { concept: '请求入口', file: 'Engine.add_request', focus: 'prompt encode 后进入 waiting 队列, 每条请求绑定 SamplingParams' },
-  { concept: '首 token 延迟', file: 'Engine._step_prefill', focus: 'prefill 优先, 同时查询 prefix cache 和 block capacity' },
-  { concept: '吞吐', file: 'Engine._step_decode', focus: 'running 中每条序列每步 decode 一个 token, 完成后释放 block' },
-  { concept: '显存账本', file: 'BlockManager', focus: 'allocate / append / free / share_block 维护 block 引用计数' },
+  { concept: '每步组 batch', file: 'm03_continuous_batching/scheduler.py', focus: 'schedule() 返回 [(seq, n)]: decode 优先, 剩余 token 预算给 prefill chunk; block 不够时 recompute 式抢占' },
+  { concept: '真分页前向', file: 'full_engine/model_runner.py', focus: 'run() 只算 ids[start_pos:], 其余 KV 经 block_table 从全局 pool 读回' },
+  { concept: '显存账本', file: 'BlockManager', focus: 'allocate(shared=…) / ensure_capacity / free / share_block 维护引用计数; free_list 顺序即 LRU 顺序' },
   { concept: '重复前缀', file: 'PrefixCache', focus: '命中的完整 block 共享引用, 未命中部分继续分配并注册' },
   { concept: '采样策略', file: 'm10_sampling/samplers.py', focus: 'rep penalty、temperature、top-k/top-p/min-p 最后作用在 logits 上' },
 ]

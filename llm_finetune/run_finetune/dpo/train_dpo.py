@@ -1,97 +1,42 @@
 #!/usr/bin/env python
 """
-LLaMA DPO (Direct Preference Optimization) 对齐示例
-=====================================================
+DPO: SFT 过的 policy + 偏好对 (正确回复 vs 损坏回复)。用通用 Trainer 训练, 在**留出**偏好对上验收;
+同时如实展示 DPO 的著名副作用: 差值变大了, 但 chosen 自己的概率也掉了。
 
-教学目标:
-    - 演示 DPO 跳过 reward model 与 PPO, 仅用 (prompt, chosen, rejected) 三元组对齐
-    - 演示 policy / reference 双模型架构: ref 自动 deepcopy + 冻结 + eval()
-    - 跟踪 DPO 特有的监控指标: reward_chosen / reward_rejected / reward_margin / accuracy
-    - 验证: reward_margin 应当随训练扩大, accuracy 应当趋近 1.0
-
-约定 (与论文一致):
-    - policy 起点应是 SFT 终态; 这里为简化教学, 直接用未训练的 LLaMA 也能看到信号
-    - β = 0.1 是 DPO 论文常用值, 越大越保守贴近 ref
-
-运行:
     python -m llm_finetune.run_finetune.dpo.train_dpo
 """
 
 import torch
 
-from llm_models.models.language_models.llama import LLaMA
-from llm_models.training import TrainingConfig
+from llm_finetune import DPOLoss, PairwiseForward, PreferenceDataGenerator, SeqTask
+from llm_finetune.run_finetune.common import fit, make_model, preference_accuracy, sft_warmup
 
-from llm_finetune import (
-    DPOLoss,
-    DPOTrainer,
-    PreferenceDataGenerator,
-    print_trainable_parameters,
-)
+SFT_STEPS, DPO_STEPS, LR, BETA = 100, 200, 3e-4, 0.5
 
 
 def main() -> None:
-    cfg = TrainingConfig(
-        learning_rate=5e-5,   # DPO 通常用更小的 lr (论文 1e-6 ~ 5e-5),
-                              # 因为目标是"在 SFT 终态附近做小调整", 大 lr 会破坏 SFT 习得的能力
-        batch_size=2,
-        seq_len=32,
-        num_steps=80,         # DPO 信号比 SFT 弱 (二分类 logsigmoid), 多走几步
-        warmup_steps=10,
-        log_interval=10,
-        seed=42,
-    )
-    torch.manual_seed(cfg.seed)
+    torch.manual_seed(0)
+    task = SeqTask("sort")
+    policy = make_model(task)
+    em_sft = sft_warmup(policy, task, SFT_STEPS)              # 故意只热身到 "半会": 留出提升空间
+    before = preference_accuracy(policy, task)
 
-    # ---- 1) 构造 policy 模型 ----
-    vocab_size = 1000
-    policy = LLaMA(
-        vocab_size=vocab_size,
-        d_model=256,
-        n_heads=4,
-        num_kv_heads=2,
-        num_layers=2,
-        max_len=128,
-        dropout=0.0,
-    )
-    print_trainable_parameters(policy, name="DPO policy")
+    # ref = 此刻 policy 的冻结副本; PairwiseForward 把 policy×2 + ref×2 的前向包成一个 Module 交给通用 Trainer
+    hist = fit(PairwiseForward.with_frozen_copy(policy), PreferenceDataGenerator(task), DPOLoss(BETA),
+               DPO_STEPS, LR, log_interval=50)
+    after, em_dpo = preference_accuracy(policy, task), task.exact_match(policy)
 
-    # ---- 2) 数据: 偏好对 ----
-    data_gen = PreferenceDataGenerator(
-        vocab_size=vocab_size,
-        batch_size=cfg.batch_size,
-        seq_len=cfg.seq_len,
-        prompt_len=cfg.seq_len // 2,
-        seed=cfg.seed,
-    )
+    print(f"第 1 步 loss {hist[0]['total_loss']:.4f} (policy = ref ⇒ 恰为 ln 2 = 0.6931)")
+    print(f"{'留出集':<10}{'偏好准确率':>10}{'log π(chosen)':>16}{'log π(rejected)':>18}{'exact-match':>14}")
+    print(f"{'SFT 后':<10}{before['accuracy']:>14.3f}{before['logp_chosen']:>16.2f}{before['logp_rejected']:>18.2f}{em_sft:>14.3f}")
+    print(f"{'DPO 后':<10}{after['accuracy']:>14.3f}{after['logp_chosen']:>16.2f}{after['logp_rejected']:>18.2f}{em_dpo:>14.3f}")
 
-    # ---- 3) DPOLoss + DPOTrainer (后者会自动 deepcopy + 冻结 ref) ----
-    loss_fn = DPOLoss(beta=0.1)
-    trainer = DPOTrainer(
-        model=policy,
-        config=cfg,
-        data_generator=data_gen,
-        loss_computer=loss_fn,
-        ref_model=None,   # None → 自动用 deepcopy(policy) 作 ref
-    )
-
-    metrics = trainer.train()
-
-    # ---- 4) 验证: DPO 训练应当让 reward_margin 扩大 ----
-    first, last = metrics[0], metrics[-1]
-    margin_first = first["reward_margin"]
-    margin_last = last["reward_margin"]
-    acc_last = last["accuracy"]
-
-    print(
-        f"\nReward margin: {margin_first:+.4f} → {margin_last:+.4f}"
-        f"   accuracy: {acc_last:.2f}"
-    )
-    assert margin_last > margin_first, (
-        f"reward_margin 未扩大 (chosen 没被相对拉高): "
-        f"first={margin_first:.4f}  last={margin_last:.4f}"
-    )
-    print("DPO 训练通过: chosen 被相对 reference 拉高于 rejected")
+    gap = lambda m: m["logp_chosen"] - m["logp_rejected"]
+    assert abs(hist[0]["total_loss"] - 0.6931) < 1e-3
+    assert after["accuracy"] >= before["accuracy"] and after["accuracy"] > 0.97, "留出集偏好准确率应提升"
+    assert gap(after) > gap(before) + 2, "chosen 与 rejected 的 log-prob 差应被拉开"
+    # DPO 的 loss 只看差值: 两边一起降、rejected 降得更多, 也算 "优化成功" (likelihood displacement)
+    assert after["logp_chosen"] < before["logp_chosen"], "本配置下应能观察到 chosen 的 log-prob 下降"
 
 
 if __name__ == "__main__":

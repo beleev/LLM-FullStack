@@ -1,6 +1,8 @@
 // 模型元数据 — 与 llm_models/ 代码一一对应
 // 三条主线: left (语言), eye (多模态理解), right (生成)
 
+import { extraChapters, extraPages } from './topics/index.js'
+
 export const tracks = {
   left:  { label: '左脑 · 语言',      color: 'var(--left)',  cls: 'left'  },
   eye:   { label: '眼耳 · 多模态理解', color: 'var(--eye)',   cls: 'eye'   },
@@ -12,6 +14,7 @@ export const basicChapters = [
   { route: 'basic-forward', label: 'forward 与形状流', hint: 'embedding → block → logits → loss' },
   { route: 'basic-backward', label: '手写 backward', hint: 'cache、链式法则、gradcheck' },
   { route: 'basic-optim-sample', label: 'Adam 与采样', hint: '优化器状态与自回归生成' },
+  ...(extraChapters.basic || []),
 ]
 
 export const modelChapters = [
@@ -21,15 +24,17 @@ export const modelChapters = [
   { route: 'moe',       label: 'MoE 路由',       hint: 'Mixtral 与 DeepSeek 的两套哲学' },
   { route: 'models-mtp', label: 'SWA · MTP · 混合线性', hint: 'Mistral 滑动窗口 + 多 token 预测 + Qwen3-Next DeltaNet' },
   { route: 'diffusion', label: '扩散生成',       hint: 'DDPM ε-pred → Flow Matching v-pred' },
+  ...(extraChapters.models || []),
 ]
 
 export const trainChapters = [
   { route: 'train-batch-ddp', label: 'batch 与 DDP', hint: '梯度累积、数据并行、all-reduce' },
   { route: 'train-model-parallel', label: 'TP / PP 切模型', hint: '层内矩阵切分与层间流水线' },
   { route: 'train-memory', label: '状态与显存', hint: 'ZeRO/FSDP、activation checkpoint、resume' },
-  { route: 'train-precision-stability', label: '精度与稳定性', hint: 'AMP、loss scaling、FP8 block scaling、clip、warmup' },
+  { route: 'train-precision-stability', label: '精度与稳定性', hint: 'FP16 / BF16、loss scaling、FP8 消融、clip' },
   { route: 'train-moe-seq', label: 'EP 与序列并行', hint: 'MoE all-to-all 路由 + Ring Attention' },
-  { route: 'train-collectives-loop', label: '通信与 full_loop', hint: 'collectives 到完整训练主循环' },
+  ...(extraChapters.train || []),
+  { route: 'train-collectives-loop', label: '通信与 full_loop', hint: 'collectives 到完整训练主循环' },  // 压轴章: 把前面的机制组合起来, 始终排最后
 ]
 
 export const finetuneChapters = [
@@ -37,24 +42,27 @@ export const finetuneChapters = [
   { route: 'finetune-lora', label: 'LoRA 参数高效微调', hint: '低秩补丁、注入、merge、QLoRA NF4 量化基座' },
   { route: 'finetune-dpo', label: 'DPO 偏好对齐', hint: 'chosen/rejected 与 reference policy' },
   { route: 'finetune-rlhf', label: 'RM · GRPO · 蒸馏', hint: '奖励模型、组内相对优势、软标签蒸馏' },
-  { route: 'finetune-runs', label: '训练脚本与落盘', hint: 'run_finetune、adapter、state_dict' },
+  ...(extraChapters.finetune || []),
+  { route: 'finetune-runs', label: '训练脚本与落盘', hint: 'run_finetune、adapter、state_dict' },  // 压轴章: 把前面的机制组合起来, 始终排最后
 ]
 
 export const inferChapters = [
   { route: 'infer-kv-memory', label: 'KV 与缓存内存', hint: 'KV cache、paged attention、prefix/radix cache' },
   { route: 'infer-scheduler', label: '调度与 prefill', hint: 'continuous batching、chunked prefill、P/D 分离' },
-  { route: 'infer-decode-control', label: '解码加速与约束', hint: 'speculative/EAGLE、sampling、structured output' },
+  { route: 'infer-decode-control', label: '解码加速与约束', hint: 'speculative decoding、sampling 流水线' },
   { route: 'infer-compute', label: '算子与压缩', hint: 'quantization、FlashAttention、CUDA Graph、TP' },
-  { route: 'infer-engine', label: 'mini-vLLM 引擎', hint: 'full_engine 主循环与 Multi-LoRA serving' },
+  ...(extraChapters.infer || []),
+  { route: 'infer-engine', label: 'mini-vLLM 引擎', hint: 'full_engine 主循环与 Multi-LoRA serving' },  // 压轴章: 把前面的机制组合起来, 始终排最后
 ]
 
 export const agentChapters = [
   { route: 'agent-loop', label: 'Agent loop', hint: 'messages → model action → tool result → final' },
   { route: 'agent-tools-permissions', label: '工具与权限', hint: 'tool schema、execute、deny-first、auto approval' },
   { route: 'agent-context-memory', label: '上下文与记忆', hint: 'file memory、retrieval、compaction' },
-  { route: 'agent-extensibility', label: 'Hooks / Skills / MCP', hint: '三类扩展点与上下文成本' },
+  { route: 'agent-extensibility', label: 'Hooks / Skills', hint: '确定性扩展点与渐进式披露' },
   { route: 'agent-state-subagents', label: '持久化与子智能体', hint: 'JSONL resume、summary-only delegation' },
-  { route: 'agent-full-loop', label: 'mini Agent harness', hint: '组合成应用层最小闭环' },
+  ...(extraChapters.agent || []),
+  { route: 'agent-full-loop', label: 'mini Agent harness', hint: '组合成应用层最小闭环' },  // 压轴章: 把前面的机制组合起来, 始终排最后
 ]
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -78,7 +86,7 @@ export const stages = [
     idx: 2,
     code: 'llm_models/',
     title: '常见模型结构',
-    oneliner: '把零件 (attn / ffn / norm / pos) 装进 Pre-LN Block, 堆出 20 种主流模型。',
+    oneliner: '把零件 (attn / ffn / norm / pos) 装进 Pre-LN Block, 堆出二十多种主流模型。',
     status: 'ready',
     route: 'models',
     // 这一阶段拆成 5 个章节, 用 chapters 映射;  Compare 合到终章。
@@ -229,9 +237,30 @@ export const trainModules = [
   {
     id: 'm13',
     name: 'FP8 Training',
-    concept: 'E4M3 管精度 / E5M2 管范围, block-wise scaling 防 outlier',
-    link: '乘法省一半, 但 scaling 粒度 + FP32 master 一个都不能少',
+    concept: 'scaling + FP32 master 缺一不可; 粒度只在 outlier 超过约 1e5 倍时才起作用',
+    link: 'E4M3 前向 / E5M2 梯度是 Transformer Engine 配方; DeepSeek-V3 全程 E4M3 + 细粒度 scale',
     file: 'llm_train/m13_fp8_training/demo.py',
+  },
+  {
+    id: 'm14',
+    name: 'Muon Optimizer',
+    concept: 'Newton–Schulz 把动量矩阵的奇异值拉平, 只用于 2-D 权重',
+    link: '优化器状态只有 Adam 的一半; 病态方向沿坐标轴时 Adam 反而更好',
+    file: 'llm_train/m14_muon_optimizer/demo.py',
+  },
+  {
+    id: 'm15',
+    name: 'FP4 Microscaling',
+    concept: 'E2M1 只有 15 个值, 精度全靠小 block 的 scale: MXFP4 (E8M0) vs NVFP4 (E4M3)',
+    link: '每元素 4.25 / 4.5 bit; 高斯数据上 INT4 比 MXFP4 更准',
+    file: 'llm_train/m15_fp4_microscaling/demo.py',
+  },
+  {
+    id: 'm16',
+    name: 'Ulysses Sequence Parallel',
+    concept: 'all-to-all 把按序列切换成按头切, 通信量随卡数下降',
+    link: '卡数不能超过头数; 与 Ring (m12) 叠成二维并行',
+    file: 'llm_train/m16_ulysses_sequence_parallel/demo.py',
   },
   {
     id: 'full',
@@ -363,6 +392,41 @@ export const inferModules = [
     file: 'llm_infer/m17_eagle_speculative/demo.py',
   },
   {
+    id: 'm18',
+    name: 'KV Footprint / MLA Decode',
+    concept: 'MHA → MQA → GQA → MLA 只差 cache 里存什么',
+    link: '每 token: LLaMA-2-7B 512 KiB, LLaMA-3-8B 128 KiB, DeepSeek-V3 68.6 KiB',
+    file: 'llm_infer/m18_kv_attention_variants/attention_variants.py',
+  },
+  {
+    id: 'm19',
+    name: 'Tree Speculation',
+    concept: '祖先 mask 让一次 target 前向验完整棵草稿树',
+    link: 'tree [3,2,1] 每次调用产出 2.58 token, 链式 K=3 为 1.86',
+    file: 'llm_infer/m19_tree_speculation/tree_spec.py',
+  },
+  {
+    id: 'm20',
+    name: 'Hierarchical KV Offload',
+    concept: 'GPU → CPU → disk 分层: 驱逐即降级, 命中即提升',
+    link: '加载前先和重算比一比: 命中超过约 1.5 个 block 才划算',
+    file: 'llm_infer/m20_kv_offload/tiered_cache.py',
+  },
+  {
+    id: 'm21',
+    name: 'MoE Serving / EPLB',
+    concept: '一步的时间由最慢的卡决定 → 复制热点专家分流',
+    link: 'rank 负载 max/mean 2.95× → 1.02×',
+    file: 'llm_infer/m21_moe_serving/moe.py',
+  },
+  {
+    id: 'm22',
+    name: 'Sparse Attention Decode',
+    concept: '用 block 摘要打分, 只读 top-k 个 KV block',
+    link: '读 3.1% 的 KV, 召回 97.7% (植入 needle 的合成数据)',
+    file: 'llm_infer/m22_sparse_attention/sparse_attention.py',
+  },
+  {
     id: 'full',
     name: 'Full Engine',
     concept: 'mini-vLLM: 分页、连续批、前缀缓存、采样集成',
@@ -424,9 +488,58 @@ export const agentModules = [
   {
     id: 'm08',
     name: 'Retrieval',
-    concept: 'TF-IDF 向量检索: idf 压高频词, 余弦给连续分级',
+    concept: 'BM25 式 idf 让罕见词主导排序; 中文按字符 bigram 分词',
     link: '关键词 → TF-IDF → 神经 embedding, 工具接口不变',
     file: 'llm_agent/m08_retrieval/demo.py',
+  },
+  {
+    id: 'm09',
+    name: 'MCP',
+    concept: '工具由子进程通过 stdio JSON-RPC 2.0 提供',
+    link: '协议错误 (-32601) 与工具失败 (isError) 是两回事; 第三方工具默认高风险',
+    file: 'llm_agent/m09_mcp/demo.py',
+  },
+  {
+    id: 'm10',
+    name: 'Planning',
+    concept: 'todo 工具 + plan 模式: 计划获批前只读',
+    link: '只读由权限门强制, 不靠模型自觉',
+    file: 'llm_agent/m10_planning/demo.py',
+  },
+  {
+    id: 'm11',
+    name: 'Orchestrator–Workers',
+    concept: 'lead 并行扇出子智能体, 只收摘要',
+    link: '不省 token (770 > 413), 换来并行和干净的主上下文 (247 < 375)',
+    file: 'llm_agent/m11_orchestrator/demo.py',
+  },
+  {
+    id: 'm12',
+    name: 'Guardrails',
+    concept: '工具输出是不可信数据: 污点规则 + 路径围栏 + 密钥脱敏',
+    link: '标记靠模型配合, 污点/围栏/脱敏不靠模型',
+    file: 'llm_agent/m12_guardrails/demo.py',
+  },
+  {
+    id: 'm13',
+    name: 'Agent Evals',
+    concept: '按环境终态判分; pass@k 看能力, pass^k 看可靠性',
+    link: '单次 0.65 → pass@3 0.97, pass^3 0.25',
+    file: 'llm_agent/m13_evals/demo.py',
+  },
+  {
+    id: 'm14',
+    name: 'Context Engineering',
+    concept: '先清旧工具结果, 再让模型写摘要; 即时检索代替预加载',
+    link: 'JSONL 不变小, 恢复出的视图变小',
+    file: 'llm_agent/m14_context_engineering/demo.py',
+  },
+  {
+    id: 'm15',
+    name: 'Claude API Adapter',
+    concept: '同一个 LLM 协议接真实模型 (opt-in, 默认不联网)',
+    link: '把 toy LLM 换成真模型, harness 一行不用改',
+    file: 'llm_agent/m15_claude_api/demo.py',
   },
   {
     id: 'full',
@@ -437,7 +550,7 @@ export const agentModules = [
   },
 ]
 
-export const topicPages = {
+const baseTopicPages = {
   'basic-data': {
     widgets: ['BpeLab'],
     title: '数据与 tokenizer · 把文本变成可训练张量',
@@ -532,6 +645,7 @@ assert close(g_analytic, g_numeric)`,
     run: 'python llm_basic/gradcheck.py',
   },
   'basic-optim-sample': {
+    source: ['llm_basic/optim.py:adam_step'],
     title: 'Adam 与采样 · 训练后如何生成文本',
     subtitle: 'forward/backward 给出梯度, Adam 决定怎么走一步; sample.py 则把模型放回自回归使用方式。',
     tldr: 'Adam 用一阶/二阶矩自适应缩放梯度; 采样阶段不再算 loss, 而是循环取最后位置 logits 生成下一个 token。',
@@ -1052,7 +1166,6 @@ return mode_fallback(call)   # plan/default/auto/dont_ask`,
     run: 'python -m llm_agent.m03_permissions.demo',
   },
   'agent-context-memory': {
-    widgets: ['RetrievalLab'],
     title: '上下文与记忆 · 模型到底看见什么',
     subtitle: 'Agent 的长期表现常常取决于上下文工程: 哪些信息进窗口, 什么时候压缩, 哪些状态留在文件里。',
     tldr: 'FileMemory 用 Markdown 文件做透明记忆; compact_messages 保留头尾, 摘要中间; Agent 在每轮前组装 system/memory/history。',
@@ -1272,14 +1385,14 @@ for step in range(D):
     ],
     links: [
       { from: 'PreferenceDataGenerator', to: 'RewardModel', body: '与 DPO 同源的数据, 不同用法: RM 学打分, DPO 直接学策略。' },
-      { from: 'policy.generate', to: 'reward_fn (RLVR)', body: '在线采样 + 规则验证, 数据分布随 policy 漂移 (on-policy)。' },
+      { from: 'policy.generate', to: 'SeqTask verifier (RLVR)', body: '在线采样 + 依赖 prompt 的程序化验证, 数据分布随 policy 漂移 (on-policy)。' },
       { from: 'teacher logits / T', to: 'student KL', body: 'T 放大暗知识, T² 补偿 softmax 梯度的 1/T² 缩放。' },
     ],
     sourceRows: [
       { concept: 'value head', code: 'reward_model.py:RewardModel', takeaway: '复用 LLaMA 骨架, lm_head 换成 [D]→[1], 取最后位置。' },
-      { concept: '组内优势', code: 'grpo.py:GRPOTrainer.step', takeaway: 'adv = (r - mean) / (std + 1e-4), GRPO 的全部精髓。' },
+      { concept: '组内优势', code: 'grpo.py:group_advantages', takeaway: 'adv = (r - mean) / (std + eps); 一组全对或全错时 adv 全为 0, 这组样本不产生梯度。' },
       { concept: 'KL k3 估计', code: 'grpo.py: log_ratio', takeaway: 'exp(q-p)-(q-p)-1 ≥ 0, 逐 token, 方差小。' },
-      { concept: '采样多样性', code: 'run grpo: init std=0.02', takeaway: '初始 logits 太尖 → 组内零方差 → RL 没有梯度。' },
+      { concept: '重要性比率', code: 'grpo.py:GRPOConfig', takeaway: '一批 rollout 更新多次: 第 1 个 epoch ρ≡1, 之后才偏离, clip 才开始起作用。' },
       { concept: '蒸馏损失', code: 'distill.py:DistillLoss', takeaway: 'α·CE + (1-α)·T²·KL(p_t^T ‖ p_s^T)。' },
     ],
     snippetTitle: 'GRPO 单步的完整控制流',
@@ -1376,9 +1489,9 @@ export const timeline = [
     blurb: 'Spacetime patches + DiT, 视频作为世界模拟器',
     file: 'models/generative/video_dit.py' },
   { id: 'var', year: 2024, track: 'right', name: 'VAR',
-    kind: '自回归图像',
+    kind: '逐尺度自回归图像',
     parts: { attn: 'MHA', ffn: 'GELU', norm: 'LayerNorm', pos: 'RoPE' },
-    blurb: 'VQ 离散 token + next-token, 直接复用 GPT 框架',
+    blurb: '多尺度残差 VQ + next-scale: 每次预测一整张更细的 token 图, 级内并行',
     file: 'models/generative/var.py' },
   { id: 'deepseek_v32', year: 2025, track: 'left', name: 'DeepSeek-V3.2',
     kind: 'DSA 长上下文',
@@ -1390,10 +1503,36 @@ export const timeline = [
     parts: { attn: 'GQA', ffn: 'SwiGLU', norm: 'RMSNorm', pos: 'M-RoPE (时间对齐)' },
     blurb: '双脑: Thinker 理解, Talker cross-attn 流式语音生成',
     file: 'models/multimodal/qwen2_5_omni.py' },
+  { id: 'mtp', year: 2024, track: 'left', name: 'MTP',
+    kind: '多 token 预测',
+    parts: { attn: 'GQA', ffn: 'SwiGLU', norm: 'RMSNorm', pos: 'RoPE' },
+    blurb: 'LLaMA 骨架 + 级联 MTP 模块, 一次前向多监督几个未来 token',
+    file: 'models/language_models/mtp.py' },
+  { id: 'vae3d', year: 2024, track: 'right', name: 'Causal Video VAE',
+    kind: '因果 3D VAE',
+    parts: { attn: '—', ffn: 'Conv3D', norm: 'GroupNorm (逐帧)', pos: '—' },
+    blurb: '卷积 / 归一化 / 上采样都不看未来帧, 视频 latent 才能流式编解码',
+    file: 'models/generative/vae3d.py' },
+  { id: 'gpt_oss', year: 2025, track: 'left', name: 'GPT-OSS-mini',
+    kind: 'SWA/全局交替 + MoE',
+    parts: { attn: 'GQA + 滑窗/全局交替 + 可学 sink', ffn: 'MoE', norm: 'RMSNorm', pos: 'RoPE' },
+    blurb: '滑窗层 KV 封顶 W, 全局层保长程通路; sink logit 给 softmax 一个"垃圾桶"',
+    file: 'models/moe/gpt_oss.py' },
+  { id: 'llada', year: 2025, track: 'left', name: 'LLaDA',
+    kind: '掩码扩散语言模型',
+    parts: { attn: 'MHA (双向)', ffn: 'SwiGLU', norm: 'RMSNorm', pos: 'RoPE' },
+    blurb: '去掉因果 mask, 随机比例遮盖训练, 多步去噪 + 低置信度重遮采样',
+    file: 'models/language_models/llada.py' },
 ]
 
 export const years = Array.from(new Set(timeline.map(m => m.year))).sort()
 
 export function findModel(id) {
   return timeline.find(m => m.id === id)
+}
+
+// 合并按阶段拆分的扩展页 (data/topics/*.js): 新章节直接加入, 已有章节按字段覆盖
+export const topicPages = { ...baseTopicPages }
+for (const [route, page] of Object.entries(extraPages)) {
+  topicPages[route] = { ...(topicPages[route] || {}), ...page }
 }

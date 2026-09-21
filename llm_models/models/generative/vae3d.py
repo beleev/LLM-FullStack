@@ -1,20 +1,15 @@
 """
-Causal 3D VAE — 视频生成的时空压缩器
+Causal 3D VAE — 视频 DiT 的时空压缩器 (Sora / HunyuanVideo / CogVideoX / Wan 的共同前置)
 
-背景:
-    Sora / HunyuanVideo / CogVideoX / Wan 等 SOTA 视频 DiT 的共同前置:
-    一个把 [B, 3, T, H, W] 视频压到 [B, C_latent, T', H', W'] 的 3D VAE。
+解决的问题: 视频 token 数 = T·H·W, 直接喂 DiT 注意力 O(N²) 吃不消;
+3D VAE 把 [B, 3, T, H, W] 压到 [B, C, T/2^a, H/2^b, W/2^b], token 数降 2^(a+2b) 倍。
 
-为什么视频需要 **Causal** 3D VAE?
-    1) 时间维下采样 (典型 4×): 让 DiT 的序列长度下降, 算力下降 O(T²) 倍
-    2) 因果时间卷积: 每个时间步只看过去帧, 保证推理时"边生成边 decode",
-       无需等待整段视频, 支持流式
-    3) 空间 2D + 时间 1D 解耦卷积: 比 full 3D conv 便宜, 但捕捉时空结构足够
+"Causal" = 时间维只向过去 padding: 卷积核 k_t=3 时第 t 帧输出只依赖 [t-2, t-1, t]。
+好处: 第一帧可单独当图像编码 (图像/视频联合训练), 长视频可分块流式编解码。
+要整条链因果, 三处都不能偷看未来: 卷积 (左 padding)、归一化 (逐帧 GroupNorm)、
+上采样 (nearest, 第 i 帧 → 第 2i, 2i+1 帧)。
 
-本文件提供最小教学版:
-    - 空间 2× 下采样 (方向数可配) + 时间 2× 下采样 (因果)
-    - Encoder/Decoder 对称
-    - 采用 "Conv3d + GroupNorm + SiLU" 基本块; 教学优先保留可读性
+读代码时盯住: _causal_pad 的 pad 顺序, 以及 CausalConv3dBlock 里 norm 前后的 reshape。
 """
 
 from typing import Dict, Tuple
@@ -25,20 +20,16 @@ import torch.nn.functional as F
 
 
 def _causal_pad(x: torch.Tensor, pad_t: int) -> torch.Tensor:
-    """
-    时间维因果 padding: 只在 "过去" 侧补零, 不看未来帧。
-    x: [B, C, T, H, W];  pad_t 个 0 补在 T 维左侧。
-    """
-    return F.pad(x, (0, 0, 0, 0, pad_t, 0))  # pad order: (W_left, W_right, H_..., T_left, T_right)
+    """x: [B, C, T, H, W], 只在时间维左侧 (过去) 补 pad_t 帧 0。"""
+    return F.pad(x, (0, 0, 0, 0, pad_t, 0))  # F.pad 从最后一维往前数: (W左, W右, H左, H右, T左, T右)
 
 
 class CausalConv3dBlock(nn.Module):
     """
-    因果 3D 卷积块:
-        causal_pad(time) -> Conv3d (无时间 padding) -> GroupNorm -> SiLU
+    causal_pad(time) → Conv3d (时间维不再 padding) → 逐帧 GroupNorm → SiLU
 
-    kernel_time=3 → 卷积窗口 [t-2, t-1, t], 天然因果。
-    kernel_space=3, padding=1 让空间维保持长度 (下采样独立用 stride)。
+    kernel_time=3 → 窗口 [t-2, t-1, t]。GroupNorm 若直接作用在 5D 张量上, 均值/方差会跨
+    全部 T 帧统计, 未来帧就经统计量泄漏到过去; 所以把 T 并进 batch 维逐帧归一化。
     """
 
     def __init__(
@@ -61,8 +52,11 @@ class CausalConv3dBlock(nn.Module):
         self.norm = nn.GroupNorm(num_groups=min(32, out_ch), num_channels=out_ch)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = _causal_pad(x, self.kernel_time - 1)
-        return F.silu(self.norm(self.conv(x)))
+        x = self.conv(_causal_pad(x, self.kernel_time - 1))           # [B, C', T', H', W']
+        B, C, T, H, W = x.shape
+        x = self.norm(x.transpose(1, 2).reshape(B * T, C, H, W))      # 逐帧统计, 不跨时间
+        x = x.view(B, T, C, H, W).transpose(1, 2)                     # [B, C', T', H', W']
+        return F.silu(x)
 
 
 class CausalVAE3DEncoder(nn.Module):
@@ -139,12 +133,12 @@ class CausalVAE3DDecoder(nn.Module):
                 ch //= 2
                 s -= 1
 
-        # 出口: 回到图像通道, tanh 限幅到 [-1, 1]
-        layers.append(nn.Conv3d(ch, out_channels, kernel_size=3, padding=1))
         self.trunk = nn.Sequential(*layers)
+        # 出口卷积同样要因果: 时间维 padding 交给 _causal_pad (对称 padding=1 会偷看 t+1)
+        self.out_conv = nn.Conv3d(ch, out_channels, kernel_size=3, padding=(0, 1, 1))
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.trunk(z))
+        return torch.tanh(self.out_conv(_causal_pad(self.trunk(z), 2)))  # tanh → [-1, 1]
 
 
 class CausalVideoVAE(nn.Module):

@@ -85,6 +85,7 @@ class GatedDeltaNet(nn.Module):
         mask: Optional[torch.Tensor] = None,        # 接受但忽略: 递推天然因果
         rope: Optional[nn.Module] = None,            # 接受但忽略: 衰减门隐式编码位置
         position_ids: Optional[torch.Tensor] = None,
+        cache: Optional[dict] = None,                # 解码用: cache["state"] 就是全部 "KV cache"
     ) -> torch.Tensor:
         x = q                                        # PreLNBlock 传 q=k=v=h
         B, T, D = x.shape
@@ -103,7 +104,8 @@ class GatedDeltaNet(nn.Module):
         beta = torch.sigmoid(self.gate_beta(x)).transpose(1, 2)     # [B, H, T]
 
         # 状态矩阵: 每个 (batch, head) 一个 Dh×Dh —— 这就是全部"KV cache"
-        state = x.new_zeros(B, H, Dh, Dh)
+        # 有 cache 时从上一步的状态接着递推 (大小与已读过多少 token 无关 → O(1))
+        state = cache["state"] if cache and "state" in cache else x.new_zeros(B, H, Dh, Dh)
         outs = []
         for t in range(T):
             k_t = kh[:, :, t]                        # [B, H, Dh]
@@ -119,6 +121,9 @@ class GatedDeltaNet(nn.Module):
 
             # 读取: o_t = S^T q_t
             outs.append(torch.einsum("bhd,bhde->bhe", qh[:, :, t], state))
+
+        if cache is not None:
+            cache["state"] = state
 
         o = torch.stack(outs, dim=2)                 # [B, H, T, Dh]
         o = o.transpose(1, 2).reshape(B, T, D)

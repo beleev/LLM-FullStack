@@ -1,27 +1,14 @@
 """
-Qwen3-Next 模型模块 (混合线性注意力架构, 教学版)
+Qwen3-Next (Alibaba, 2025) — 混合线性注意力架构 (教学版)
 
-论文/技术报告出处:
-    Qwen3-Next (Alibaba, 2025) — 80B-A3B, 混合架构 + 超稀疏 MoE
-    Gated DeltaNet: Yang et al., 2024 (NeurIPS)
-
-历史意义:
-    2025 年的共识雏形: **不是所有层都需要完整注意力**。
-        - Gated DeltaNet 层 (75%): O(1) 状态, O(T) 计算, 管"流畅的局部建模"
-        - 全注意力层 (25%):        O(T) cache, O(T^2) 计算, 管"精准的长程检索"
-    MiniMax-Text (Lightning Attention 7:1)、Jamba (Mamba+Attn) 走的同一条路。
-    长上下文的成本被砍掉大半, 而召回精度由少量全注意力层兜底。
-
-在本库的演进地图里的位置:
-    Mamba (2023, 纯 SSM, O(T))            —— 线性序列建模的极端
-        ↓  纯线性召回弱, 混一点全注意力
-    Qwen3-Next (2025, DeltaNet 3 : 1 Attn) —— 混合架构
-        ↑  另一个极端: LLaMA/Mistral 全层注意力
-
-实现说明 (教学简化):
-    - 真实 Qwen3-Next 还有超稀疏 MoE (本库见 DeepSeekMoE)、MTP (见 mtp.py)、
-      zero-centered RMSNorm 等; 此处只保留"混合层"这一核心创新
-    - 全注意力层用库内 GQA + RoPE; DeltaNet 层不需要 mask 和 RoPE
+是什么: 75% 的层用 Gated DeltaNet (线性注意力, 状态 O(1)), 25% 用全注意力 (GQA, cache O(T))。
+        层排布 (linear_ratio=3): [Δ, Δ, Δ, A, Δ, Δ, Δ, A, ...]
+解决什么: 全层注意力的长上下文成本 O(T²)/O(T); 纯线性模型 (Mamba) 又召回弱。
+          混合 = 线性层管 "流畅的局部建模", 少量全注意力层兜底 "精准的长程检索"。
+          同路线: Jamba (Mamba+Attn), MiniMax-Text (Lightning Attention 7:1)。
+关键数字: 推理缓存 = n_attn × T × 2·Hkv·Dh  +  n_delta × H·Dh² (后一项与 T 无关)。
+简化: 真实模型还有超稀疏 MoE (见 DeepSeekMoE)、MTP (见 mtp.py)、zero-centered RMSNorm, 此处只留 "混合层"。
+读代码时盯住: `layer_types` 和每层 cache dict 里存的东西 —— attn 层是 k/v (随 T 增长), delta 层是 state (恒定)。
 """
 
 import math
@@ -29,7 +16,6 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from llm_models.layers.core.attention import GroupedQueryAttention
 from llm_models.layers.core.blocks import PreLNBlock
@@ -37,10 +23,12 @@ from llm_models.layers.core.feedforward import SwiGLUFeedForward
 from llm_models.layers.core.normalization import RMSNorm
 from llm_models.layers.core.position_encoding import RotaryPositionalEncoding
 from llm_models.layers.sparse.linear_attention import GatedDeltaNet
+from llm_models.utils.generation import GenerationMixin, KVCache
+from llm_models.utils.init import init_weights
 from llm_models.utils.masks import build_causal_mask, combine_causal_and_padding_mask
 
 
-class Qwen3Next(nn.Module):
+class Qwen3Next(GenerationMixin, nn.Module):
     """
     混合架构 decoder-only LM: Gated DeltaNet 与全注意力按比例交替。
 
@@ -114,6 +102,12 @@ class Qwen3Next(nn.Module):
         causal = build_causal_mask(max_len, torch.device("cpu"))
         self.register_buffer("causal_mask", causal, persistent=False)
 
+        init_weights(self)   # weight tying 之后; 初始 CE ≈ ln V
+        # init_weights 会把所有 Linear bias 清零, 而 α 门需要 bias=+2 (sigmoid≈0.88, 初期偏向 "记住")
+        for m in self.modules():
+            if isinstance(m, GatedDeltaNet):
+                nn.init.constant_(m.gate_alpha.bias, 2.0)
+
     def _causal_mask(self, seq_len: int) -> torch.Tensor:
         if seq_len <= self.causal_mask.size(-1):
             return self.causal_mask[:, :seq_len, :seq_len]
@@ -132,50 +126,28 @@ class Qwen3Next(nn.Module):
 
     def forward(
         self,
-        idx: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            idx: [B, T] token IDs
-        Returns:
-            logits: [B, T, vocab_size]
-        """
+        idx: torch.Tensor,                              # [B, T]
+        attention_mask: Optional[torch.Tensor] = None,  # [B, past+T]; 只作用于 attn 层
+        cache: Optional[KVCache] = None,
+    ) -> torch.Tensor:                                  # [B, T, V]
         B, T = idx.shape
-        if T > self.max_len:
-            raise ValueError(f"序列长度 {T} 超过 max_len={self.max_len}")
+        past = cache.pos if cache is not None else 0
+        if past + T > self.max_len:
+            raise ValueError(f"序列长度 {past + T} 超过 max_len={self.max_len}")
 
-        x = self.token_embedding(idx) * math.sqrt(self.d_model)
-
-        causal = self._causal_mask(T)
+        x = self.token_embedding(idx) * math.sqrt(self.d_model)          # [B, T, D]
+        position_ids = torch.arange(past, past + T, device=idx.device)
+        causal = self._causal_mask(past + T)[:, past:]                   # [1, T, past+T]
         mask = combine_causal_and_padding_mask(causal, attention_mask)
 
-        # mask/rope 对 DeltaNet 层是 no-op (递推天然因果, 衰减门隐式编码位置),
-        # PreLNBlock 统一转发, 层类型对主干循环完全透明
-        for layer in self.layers:
-            x = layer(x, mask=mask, rope=self.rope)
+        # mask / rope 对 DeltaNet 层是 no-op (递推天然因果, 衰减门隐式编码位置);
+        # 同一个 cache dict 协议: attn 层往里放 k/v, delta 层往里放 state —— 主干循环不区分层类型
+        for i, layer in enumerate(self.layers):
+            x = layer(
+                x, mask=mask, rope=self.rope, position_ids=position_ids,
+                cache=cache.layers[i] if cache is not None else None,
+            )
+        if cache is not None:
+            cache.pos += T
 
-        x = self.ln_f(x)
-        return self.lm_head(x)
-
-    @torch.inference_mode()
-    def generate(
-        self,
-        idx: torch.Tensor,
-        max_new_tokens: int,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-    ) -> torch.Tensor:
-        """朴素自回归生成 (教学实现, 同 LLaMA.generate)。"""
-        self.eval()
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.max_len else idx[:, -self.max_len :]
-            logits = self(idx_cond)
-            logits = logits[:, -1, :] / temperature
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, idx_next], dim=1)
-        return idx
+        return self.lm_head(self.ln_f(x))

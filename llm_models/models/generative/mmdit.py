@@ -1,28 +1,16 @@
 """
-MM-DiT (Multimodal Diffusion Transformer) — SD3 / FLUX 核心
+MM-DiT — SD3 / FLUX 的双流扩散 Transformer (Esser et al., 2024)
 
-论文出处:
-    "Scaling Rectified Flow Transformers for High-Resolution Image Synthesis"
-    (Esser et al., Stability AI, 2024, Stable Diffusion 3 技术报告)
-    "FLUX.1" (Black Forest Labs, 2024) 同门路线
+解决的问题: DiT 只能经 adaLN 注入一个 **全局** 条件向量, 文本被压成一个向量, 细粒度图文对齐弱。
+MM-DiT 让文本 token 与图像 patch token 拼成一个序列做 **联合注意力**, 但两种模态分布差异大,
+所以 QKV / FFN / adaLN 参数每模态各一套 —— "参数分, 注意力合":
 
-与原 DiT 的核心差异:
-    - 原 DiT: 文本/类别通过 **adaLN 的全局调制** 注入 (见 layers/adaln.py),
-             文本没有独立 token, 细粒度对齐能力弱
-    - MM-DiT: 文本 tokens 与图像 patch tokens **拼到同一个序列**,
-             经 **同一层 attention** 做交互 (类似 LLM 里拼 prompt + image);
-             但 Q/K/V 投影与 FFN 参数是 **每模态独立** (两套权重,
-             只在 attention 阶段聚在一起)
-             => "dual-stream" 架构
+    q,k,v_img = W_img(adaLN(img));  q,k,v_txt = W_txt(adaLN(txt))
+    Attn(cat[q_img, q_txt], cat[k_img, k_txt], cat[v_img, v_txt]) → 再切回两条流各走各的 FFN
 
-为什么要 dual-stream?
-    两模态分布差异大 (文本离散 token vs 图像连续 latent), 共享 QKV/FFN 参数会
-    让模型顾此失彼; 但完全分开又失去跨模态对齐能力。
-    "参数分, 注意力合" 在 SD3/FLUX 实证下收益最佳。
-
-本文件实现教学版 MMDiT Block:
-    两个独立的 QKV / FFN 投影 → 拼接 → 共享缩放点积 attention → 切回各自流 → 各自 FFN。
-    条件 (timestep + text pooler) 仍走 adaLN-Zero, 调制 image 流 (文本流可选).
+全局条件 c = TimestepEmbedding(t) + Linear(text_pooled) 仍走 adaLN-Zero。
+t 的量纲是 [0, 1000) (Flow Matching 的 t∈[0,1] 由 scheduler ×1000, 见 training/diffusion.py)。
+读代码时盯住: MMDiTBlock.forward 里 torch.cat(dim=2) 与之后的切分。
 """
 
 from typing import Optional, Tuple
@@ -37,13 +25,7 @@ from llm_models.layers.core.feedforward import GeLUFeedForward
 
 class MMDiTBlock(nn.Module):
     """
-    MM-DiT dual-stream block
-
-    数据流:
-        img_tokens, txt_tokens 经 adaLN 调制 →
-        各自 qkv_img / qkv_txt 投影 → 拼接 → 共享 SDPA →
-        切回各自流 → Linear out → gate 残差 →
-        各自 FFN + adaLN 调制 → gate 残差
+    双流 block: 各自 adaLN + QKV 投影 → 序列维拼接做一次注意力 → 切回 → 各自 out_proj / FFN, 均带 gate 残差。
 
     参数:
         d_model: 两模态共用的隐藏维度 (SD3 原版也设相同)
@@ -154,21 +136,8 @@ class MMDiTBlock(nn.Module):
 
 class MMDiT(nn.Module):
     """
-    MM-DiT (SD3 / FLUX 风格) — 图像 + 文本联合扩散 Transformer
-
-    输入:
-        x (含噪 latent): [B, C, H, W]
-        t (timestep):    [B]
-        text_embeds:     [B, T_txt, d_model]  已被文本 encoder 处理过的 token 序列
-                         (教学场景可外部喂随机张量或真实 text encoder 输出)
-        text_pooled:     [B, c_dim] 句子级文本向量, 与 timestep 相加做全局调制
-
-    架构:
-        image stream: PatchifyConv + learnable 2D pos
-        text stream:  直接用 text_embeds 作为序列
-        dual-stream blocks: 见 MMDiTBlock
-        FinalLayer: 在 image 流上做 adaLN + Linear, unpatchify 回像素
-        (文本流不需要输出 prediction, 因为我们只生成图像)
+    图像流: patchify + 可学习位置; 文本流: 外部 encoder 的 token 序列经 Linear 投到 d_model。
+    只有图像流接 FinalLayer (只生成图像); 最后一层的文本流输出被丢弃。
 
     Args:
         latent_channels, image_size, patch_size, d_model, n_heads, num_layers: 与 DiT 同
@@ -236,7 +205,7 @@ class MMDiT(nn.Module):
         p = self.patch_size
         H_grid = self.grid_size
         x = x.view(B, H_grid, H_grid, p, p, C)
-        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()      # [B, C, H/p, p, W/p, p]
         return x.view(B, C, H_grid * p, H_grid * p)
 
     def forward(
@@ -249,7 +218,7 @@ class MMDiT(nn.Module):
         """
         Args:
             x:           [B, C, H, W] 含噪 latent
-            t:           [B] timestep
+            t:           [B] timestep, [0, 1000) 量纲 (AddNoiseResult.t_norm)
             text_embeds: [B, T_txt, text_dim] 文本 token 序列 (外部 encoder 产出)
             text_pooled: [B, text_dim] 句子级文本向量; 与 t 相加做全局调制
         Returns:
@@ -268,7 +237,7 @@ class MMDiT(nn.Module):
             T_txt = self.text_seq_len
         txt = self.text_proj(text_embeds) + self.text_pos[:, :T_txt]     # [B, T_txt, D]
 
-        # 条件
+        # 全局条件 [B, c_dim]
         c = self.t_embed(t)
         if text_pooled is not None:
             c = c + self.text_pool_proj(text_pooled)

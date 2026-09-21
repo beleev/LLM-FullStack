@@ -1,60 +1,28 @@
 """
-Whisper 模型模块
+Whisper — 语音识别版的 Encoder-Decoder Transformer (Radford et al., OpenAI, 2022)
 
-论文出处:
-    "Robust Speech Recognition via Large-Scale Weak Supervision"
-    (Radford et al., OpenAI, 2022)
-
-在本库中的位置:
-    与原始 Encoder-Decoder Transformer (2017) 同架构家族, 但:
-        - Encoder 输入不是 token 而是 **log-mel spectrogram** (80 维频谱)
-        - 前置 2 层 1D conv stem: 把 spectrogram 压到适合 Transformer 的长度
-        - 任务: 语音识别 / 翻译 / 语言识别, 通过 task token 切换
-    与 Qwen2.5-Omni 的音频路径对比:
-        Omni: mel → PatchEmbed2D → PatchTransformerEncoder → Resampler → LLM 前缀
-        Whisper: mel → Conv stem → 6-32 层 encoder → 交叉注意力喂给 decoder
-
-教学重点:
-    - 语音建模 **复用 Transformer 全部机器** 的同时, 只替换了 "token 化" 步骤:
-        Conv1d(kernel=3, stride=2) ×2 把时间维压到约 50 Hz 即可做 Attention
-    - Decoder 与经典 Transformer decoder 完全相同, 用交叉注意力读 encoder 输出
-    - 用 sinusoidal 绝对位置 (encoder 侧) + learned 位置 (decoder 侧), Whisper 官方做法
+是什么: 和 2017 原版 Transformer 同构, 只把 Encoder 的输入从 token 换成 log-mel 声谱图。
+解决了什么: 传统 ASR 是声学模型 + 语言模型 + 对齐的多级流水线; Whisper 用一个 seq2seq 模型端到端完成,
+           并用 decoder 开头的 task token (语言 / 转写 / 翻译 / 时间戳) 切换任务。
+关键数字: mel [B, 80, 3000] (30 s, 每 10 ms 一帧) → 2 层 Conv1d (第二层 stride=2) → 1500 帧 (50 Hz) → Transformer。
+         Encoder 用固定 sin 位置编码, Decoder 用可学习位置 embedding, lm_head 与 token embedding 共享权重。
+读代码时盯住: encoder_hidden [B, T_mel/2, D] —— 音频进入 decoder 的唯一通道 (cross-attn 的 K/V)。
 """
-
-import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from llm_models.layers.core.attention import MultiHeadAttention
 from llm_models.layers.core.blocks import PreLNBlock, PreLNCrossBlock
 from llm_models.layers.core.feedforward import GeLUFeedForward
 from llm_models.layers.core.position_encoding import SinPositionalEncoding
+from llm_models.utils.init import init_weights
 from llm_models.utils.masks import build_causal_mask
 
 
 class WhisperAudioEncoder(nn.Module):
-    """
-    Whisper 音频 encoder
-
-    数据流:
-        mel [B, n_mels, T_mel]
-           -> Conv1d(n_mels → d_model, kernel=3, stride=1, padding=1) + GELU
-           -> Conv1d(d_model → d_model, kernel=3, stride=2, padding=1) + GELU
-           (时间维缩 2×, 对 Whisper 输入 30s / 16kHz / hop=10ms 即 3000 帧 → 1500 帧)
-           -> 加 Sinusoidal 位置编码
-           -> N x PreLNBlock(MHA + GELU-FFN + LayerNorm)
-           -> LayerNorm
-        output: [B, T_enc, d_model]
-
-    Args:
-        n_mels:       mel 滤波器组数 (Whisper 用 80)
-        d_model:      隐藏维度 (Whisper-base 512, large 1280)
-        n_heads:      注意力头数
-        num_layers:   encoder 层数
-        max_source_len: 预构建位置编码的最长帧数 (1500 对应 30s@50Hz)
-    """
+    """mel [B, n_mels, T_mel] -> Conv stem (时间维 ÷2) -> + sin PE -> N × PreLNBlock (双向) -> LN -> [B, T_mel/2, D]"""
 
     def __init__(
         self,
@@ -66,22 +34,16 @@ class WhisperAudioEncoder(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
-
-        # 2 层 1D conv stem: 把 mel-spectrogram 变成 token 序列
-        # stride=2 仅在第二层, 整体时间维 2× 下采样
+        # Conv stem 就是语音的 "tokenizer": 把频率维当通道, 沿时间卷积
         self.conv1 = nn.Conv1d(n_mels, d_model, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(d_model, d_model, kernel_size=3, stride=2, padding=1)
-
-        # 正弦位置编码覆盖整个 encoder 长度
         self.pos_encoding = SinPositionalEncoding(d_model, max_len=max_source_len)
-
-        d_ff = 4 * d_model
         self.layers = nn.ModuleList(
             [
                 PreLNBlock(
                     d_model=d_model,
                     attn=MultiHeadAttention(d_model, n_heads),
-                    ffn=GeLUFeedForward(d_model, d_ff),
+                    ffn=GeLUFeedForward(d_model, 4 * d_model),
                     dropout=dropout,
                 )
                 for _ in range(num_layers)
@@ -90,29 +52,16 @@ class WhisperAudioEncoder(nn.Module):
         self.ln_f = nn.LayerNorm(d_model)
 
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            mel: [B, n_mels, T_mel]  log-mel 声谱图
-        Returns:
-            [B, T_enc, d_model]  encoder 输出, 供 decoder 交叉注意力查询
-        """
-        x = torch.nn.functional.gelu(self.conv1(mel))
-        x = torch.nn.functional.gelu(self.conv2(x))                    # [B, d_model, T/2]
-        x = x.transpose(1, 2)                                           # [B, T/2, d_model]
-
-        x = self.pos_encoding(x)
-
+        x = F.gelu(self.conv1(mel))                                    # [B, D, T_mel]
+        x = F.gelu(self.conv2(x))                                      # [B, D, T_mel/2]
+        x = self.pos_encoding(x.transpose(1, 2))                       # [B, T_enc, D]
         for layer in self.layers:
-            x = layer(x)                                                # encoder 双向 attn
+            x = layer(x)                                               # 无 mask: 整段音频互相可见
         return self.ln_f(x)
 
 
 class WhisperTextDecoder(nn.Module):
-    """
-    Whisper 文本 decoder: 标准因果 self-attn + cross-attn(encoder) + FFN
-
-    与原始 Transformer decoder 完全同构, 这里直接复用 PreLNCrossBlock。
-    """
+    """标准 Transformer decoder: 因果 self-attn + cross-attn(encoder_hidden) + GELU-FFN。"""
 
     def __init__(
         self,
@@ -124,77 +73,47 @@ class WhisperTextDecoder(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
-
         self.d_model = d_model
         self.max_target_len = max_target_len
 
-        # Whisper decoder 用 learned 位置嵌入 (而非 encoder 的 sinusoidal)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.position_embedding = nn.Embedding(max_target_len, d_model)
-
-        d_ff = 4 * d_model
         self.layers = nn.ModuleList(
             [
                 PreLNCrossBlock(
                     d_model=d_model,
                     self_attn=MultiHeadAttention(d_model, n_heads),
                     cross_attn=MultiHeadAttention(d_model, n_heads),
-                    ffn=GeLUFeedForward(d_model, d_ff),
+                    ffn=GeLUFeedForward(d_model, 4 * d_model),
                     dropout=dropout,
                 )
                 for _ in range(num_layers)
             ]
         )
         self.ln_f = nn.LayerNorm(d_model)
-        # lm_head 与 embedding 共享权重
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-        self.lm_head.weight = self.token_embedding.weight
+        self.lm_head.weight = self.token_embedding.weight              # weight tying
 
-        causal = build_causal_mask(max_target_len, torch.device("cpu"))
-        self.register_buffer("causal_mask", causal, persistent=False)
+        self.register_buffer("causal_mask", build_causal_mask(max_target_len, torch.device("cpu")), persistent=False)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        encoder_hidden: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            input_ids:      [B, T_tgt] decoder 输入 token (含 task prompt)
-            encoder_hidden: [B, T_enc, d_model] encoder 输出
-        Returns:
-            logits: [B, T_tgt, vocab_size]
-        """
-        B, T = input_ids.shape
+    def forward(self, input_ids: torch.Tensor, encoder_hidden: torch.Tensor) -> torch.Tensor:
+        """input_ids [B, T] (含 task prompt), encoder_hidden [B, T_enc, D] -> logits [B, T, V]"""
+        T = input_ids.size(1)
         if T > self.max_target_len:
             raise ValueError(f"target 长度 {T} 超过 max_target_len={self.max_target_len}")
 
-        pos = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
-        x = self.token_embedding(input_ids) + self.position_embedding(pos)
-
-        self_mask = self.causal_mask[:, :T, :T]
+        pos = torch.arange(T, device=input_ids.device)
+        x = self.token_embedding(input_ids) + self.position_embedding(pos)   # [B, T, D]
+        self_mask = self.causal_mask[:, :T, :T]                        # [1, T, T]
 
         for layer in self.layers:
-            x = layer(
-                x,
-                context=encoder_hidden,
-                self_mask=self_mask,
-                context_mask=None,
-            )
-        x = self.ln_f(x)
-        return self.lm_head(x)
+            # cross-attn 不设 mask: 每个文本位置都能看整段音频
+            x = layer(x, context=encoder_hidden, self_mask=self_mask, context_mask=None)
+        return self.lm_head(self.ln_f(x))                              # [B, T, V]
 
 
 class Whisper(nn.Module):
-    """
-    Whisper 完整模型 (教学版)
-
-    架构:
-        mel  -> WhisperAudioEncoder   -> hidden_enc
-        tgt  -> WhisperTextDecoder(cross-attend hidden_enc) -> logits
-
-    Args 见 encoder / decoder 的 docstring。
-    """
+    """mel -> WhisperAudioEncoder -> encoder_hidden;  tokens -> WhisperTextDecoder(cross-attn) -> logits"""
 
     def __init__(
         self,
@@ -209,7 +128,6 @@ class Whisper(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
-
         self.encoder = WhisperAudioEncoder(
             n_mels=n_mels, d_model=d_model, n_heads=n_heads,
             num_layers=encoder_layers, max_source_len=max_source_len, dropout=dropout,
@@ -218,18 +136,9 @@ class Whisper(nn.Module):
             vocab_size=vocab_size, d_model=d_model, n_heads=n_heads,
             num_layers=decoder_layers, max_target_len=max_target_len, dropout=dropout,
         )
+        # 默认 N(0,1) embedding + weight tying ⇒ 初始 CE ≈ 80; N(0, 0.02²) 后 ≈ ln V。Conv stem 保持 PyTorch 默认初始化
+        init_weights(self)
 
-    def forward(
-        self,
-        mel: torch.Tensor,
-        decoder_input_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            mel: [B, n_mels, T_mel]
-            decoder_input_ids: [B, T_tgt]
-        Returns:
-            logits: [B, T_tgt, vocab_size]
-        """
-        enc = self.encoder(mel)
-        return self.decoder(decoder_input_ids, encoder_hidden=enc)
+    def forward(self, mel: torch.Tensor, decoder_input_ids: torch.Tensor) -> torch.Tensor:
+        """mel [B, n_mels, T_mel], decoder_input_ids [B, T] -> logits [B, T, V]"""
+        return self.decoder(decoder_input_ids, encoder_hidden=self.encoder(mel))

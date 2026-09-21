@@ -1,0 +1,30 @@
+// 阶段 2 · llm_models 术语。number 取自对应 demo 的实际输出或论文公式。
+const t = (term, aka, oneliner, number, route) => ({ term, aka, stage: 'models', oneliner, number, route })
+
+export default [
+  t('MHA', 'Multi-Head Attention', '每个头各有一套 Q/K/V, 表达力最强, KV cache 也最大', '每 token 每层 2·H·d_h', 'attention'),
+  t('GQA', 'Grouped-Query Attention', '多个 Q 头共享一组 K/V, 几乎不掉点地缩小 KV cache', 'cache ÷ (H / H_kv)', 'attention'),
+  t('MLA', 'Multi-head Latent Attention', '只缓存低秩 latent 和共享 k_rope, K/V 每步现场升维', 'MHA 1024 / GQA 256 / MLA 96', 'attention'),
+  t('RoPE', '旋转位置编码', '按位置旋转 Q/K 的成对维度, 点积只依赖相对距离 m − n', 'θ_i = base^(−2i/d)', 'position'),
+  t('Pre-LN Block', '预归一化块', 'norm 在子层之前, 残差主干无 norm, 深层稳定', 'x + f(norm(x))', 'blocks'),
+  t('SwiGLU', '门控 FFN', '一路做开关一路做内容, 三个线性层, 中间维缩到 8d/3 保持参数量', '3·d·(8d/3) = 8d²', 'blocks'),
+  t('MoE', 'Mixture of Experts', '每个 token 只过 top-k 个专家: 用显存换算力', '激活参数 ≪ 总参数', 'moe'),
+  t('SWA', 'Sliding Window Attention', '每层只看最近 W 个 token, 远处信息跨层接力', 'KV 上限 W; 感受野 ≈ L·W', 'models-mtp'),
+  t('MTP', 'Multi-Token Prediction', '级联小模块在每个位置多预测几步, 监督更密, 还白送投机草稿', '第 k 级目标 = 标签左移 k', 'models-mtp'),
+  t('Gated DeltaNet', '门控 delta 规则', '固定大小状态矩阵: 先擦掉 key 方向旧值再写新值, α 门整体衰减', 'S ← α(S − βk·kᵀS) + βk·vᵀ', 'models-mtp'),
+  t('Flow Matching', '流匹配 / rectified flow', '噪声与数据之间走直线, 网络预测恒定速度, 几步就能采样', 'x_t = (1−t)x₀ + tε, v = ε − x₀', 'diffusion'),
+  t('KV cache', '键值缓存', '旧 token 的 K/V 不会变, 存起来每步只算 1 个新 token', 'O(N²) → O(N) 次 token 前向', 'models-generation'),
+  t('prefill / decode', '预填充 / 解码', 'prefill 一次算完 prompt, decode 每步 1 个 token', 'LLaMA 加速 5.3–5.7×', 'models-generation'),
+  t('QK-Norm', 'Query-Key 归一化', 'RoPE 之前对 q、k 各做 RMSNorm, logit 不再随范数二次增长', '|logit| ≤ g²·√d_head', 'models-qknorm-yarn'),
+  t('YaRN', 'NTK-by-parts + mscale', '按训练期圈数分段: 高频外推、低频 ÷s 内插, 再补温度', 'mscale = 0.1·ln s + 1', 'models-qknorm-yarn'),
+  t('选择性 SSM', 'Selective SSM / Mamba', 'Δ、B、C 由输入决定: Δ 大则忘旧记新, Δ≈0 则跳过该 token', 'h = exp(ΔA)·h + ΔB·x', 'models-mamba'),
+  t('Aux-loss-free 均衡', 'routing bias', '不收梯度的偏置只影响 top-k 选谁, 按负载用 sign 更新', 'b += γ·sign(mean − load)', 'models-moe-balance'),
+  t('aux loss', '负载均衡辅助损失', '惩罚 “被选频率 × 路由概率”, 梯度直接改路由分数', 'E·Σf·P: 均衡 = K, 坍缩 = E', 'models-moe-balance'),
+  t('DSA', 'DeepSeek Sparse Attention', '便宜的 indexer 给所有 key 打分, 昂贵的 MLA 只算 top-k', 'O(T²) → O(T·k), cache 不省', 'models-dsa'),
+  t('LightningIndexer', 'DSA 选择器', 'top-k 不可导, 靠 KL 对齐主注意力分布来单独训练', 'KL 0.114 → 0.005, 召回 0.45 → 0.92', 'models-dsa'),
+  t('attention sink', '注意力汇', 'softmax 被迫分完 1; GPT-OSS 用可学 logit 当弃权出口', '3 个 0 分 key + sink=ln3 → 0.5', 'models-gptoss'),
+  t('滑窗/全注意力交替', 'alternating SWA', '一半层 KV 封顶 W, 另一半保留全局直达通路', '各层 cache [8,40,8,40], 省 40%', 'models-gptoss'),
+  t('LLaDA', '掩码扩散语言模型', '随机比例遮盖训练 + 迭代去遮采样, 生成顺序由置信度决定', 'loss = CE·mask / t', 'models-llada'),
+  t('低置信度重遮', 'low-confidence remasking', '每步全部预测, 只留最有把握的, 其余遮回去下一步再想', '准确率 1.00 vs 随机 0.91', 'models-llada'),
+  t('VAR', 'next-scale prediction', '逐分辨率自回归 1×1→2×2→4×4, 级内并行, 块状因果 mask', '3 次前向 vs 光栅 16 次', 'models-var'),
+]

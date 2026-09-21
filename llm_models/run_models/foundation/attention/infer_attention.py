@@ -1,59 +1,56 @@
 #!/usr/bin/env python
 """
-注意力机制示例
+Attention 的四个性质, 每个都用断言验证
 
-演示 MultiHeadAttention 的最小用法：
-- 构造一个随机 [B, T, D] 输入
-- 让多头注意力做一次自注意力（Self-Attention）前向
-- 验证输出形状与输入一致（这是 Attention 层"残差兼容"的关键性质，
-  因为 Transformer block 会用 residual connection 把输入加回输出）
-
-对应论文：Attention Is All You Need (Vaswani et al., 2017)
+1) 为什么除以 √d_k   2) 权重每行和为 1, 被 mask 的列为 0   3) 因果 mask 下过去不受未来影响
+4) 没有位置编码的 self-attention 是置换等变的 (打乱输入 = 打乱输出) —— 所以 Transformer 必须另加位置信息
 """
 
+import math
+
 import torch
-from llm_models.layers import MultiHeadAttention
+
+from llm_models.layers.core.attention import MultiHeadAttention, ScaledDotProductAttention
+from llm_models.utils.masks import build_causal_mask
 
 
 def main():
-    # 固定随机种子，保证演示可复现
     torch.manual_seed(42)
+    B, T, D, H = 2, 16, 128, 4
 
-    # ================= 配置参数 =================
-    # 这些值都很小，纯粹为了 CPU 上秒级跑通
-    batch_size = 2     # 一个 batch 中的句子数
-    n_heads = 4        # 注意力头数；d_model 必须能被它整除
-    seq_len = 16       # 序列长度（token 数）
-    d_model = 128      # 每个 token 的特征维度；每个 head 维度 = 128/4 = 32
-    # ===========================================
+    # 1) q·k 的方差 ≈ d_k ⇒ 不缩放时 softmax 饱和
+    d_k = 64
+    Q, K = torch.randn(1000, d_k), torch.randn(1000, d_k)
+    raw = (Q * K).sum(-1)
+    p_raw = torch.softmax(torch.randn(T, d_k) @ torch.randn(T, d_k).T, dim=-1).max(-1).values.mean().item()
+    p_scaled = torch.softmax(torch.randn(T, d_k) @ torch.randn(T, d_k).T / math.sqrt(d_k), dim=-1).max(-1).values.mean().item()
+    print(f"1) var(q·k) = {raw.var().item():.1f} (d_k={d_k}), 缩放后 {(raw / math.sqrt(d_k)).var().item():.2f}; "
+          f"softmax 最大权重: 不缩放 {p_raw:.2f} vs 缩放 {p_scaled:.2f}")
+    assert abs(raw.var().item() / d_k - 1) < 0.2 and p_raw > 2 * p_scaled
 
-    print(f"--- 模拟场景: Attention 处理 {batch_size} 个句子 ---")
-    print(f"    Head 数量: {n_heads}")
-    print(f"    序列长度: {seq_len}")
-    print(f"    模型维度: {d_model}")
+    # 2) 权重是概率分布; 被 mask 的列权重为 0
+    x = torch.randn(B, T, D)
+    causal = build_causal_mask(T, x.device)                            # [1, T, T]
+    _, w = ScaledDotProductAttention()(x, x, x, mask=causal)           # w: [B, T, T]
+    assert torch.allclose(w.sum(-1), torch.ones(B, T), atol=1e-5)
+    assert (w.masked_select(~causal.bool().expand_as(w)) == 0).all()
+    print(f"2) 权重行和 = 1; 因果 mask 下第 0 行只看自己: w[0,0,:3] = {[round(v, 2) for v in w[0, 0, :3].tolist()]}")
 
-    # 1. 创建随机输入数据（这里用 randn 模拟"已经过 embedding"的特征）
-    input_tensor = torch.randn(batch_size, seq_len, d_model)
-    print(f"\n1. 输入形状 (Input): {input_tensor.shape}")
-    print("   (Batch_Size, Seq_Len, D_Model)")
-
-    # 2. 实例化模型
-    self_attn_layer = MultiHeadAttention(d_model, n_heads)
-    self_attn_layer.eval()  # Demo 只做推理：关闭 dropout
-
-    # 3. 前向传播 (Forward)
-    # inference_mode 比 no_grad 更激进：跳过 autograd 版本计数，速度更快
+    mha = MultiHeadAttention(D, H).eval()
     with torch.inference_mode():
-        # 单参数调用 = self-attention：Q=K=V=input_tensor
-        output_tensor = self_attn_layer(input_tensor)
+        y = mha(x, mask=causal)
+        assert y.shape == x.shape                                      # 形状不变 ⇒ 可以接残差
 
-    # 4. 查看结果
-    print(f"\n2. 输出形状 (Output): {output_tensor.shape}")
-    print("   (注意：输出形状与输入完全一致，方便堆叠多层)")
+        # 3) 因果: 改最后一个 token, 前 T-1 个输出不变
+        x2 = x.clone(); x2[:, -1] += 1.0
+        d_past = (mha(x2, mask=causal)[:, :-1] - y[:, :-1]).abs().max().item()
+        assert d_past < 1e-6
 
-    # 5. 验证：形状不变是 Attention 层最基本的契约
-    assert output_tensor.shape == input_tensor.shape
-    print("\n✅ MultiHeadAttention 测试通过！")
+        # 4) 置换等变 (无 mask、无位置编码)
+        perm = torch.randperm(T)
+        d_perm = (mha(x[:, perm]) - mha(x)[:, perm]).abs().max().item()
+        assert d_perm < 1e-5
+    print(f"3) 改未来 → 过去输出变化 {d_past:.1e}   4) attn(打乱 x) 与 打乱 attn(x) 的差 {d_perm:.1e}")
 
 
 if __name__ == "__main__":

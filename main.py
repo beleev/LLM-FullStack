@@ -7,10 +7,14 @@ LLM Models - 主入口文件
 2. 列出可直接运行的示例脚本
 3. 用几个最小前向做 "冒烟测试", 确保依赖 & 模块导入都正确
 
-并非真正的训练入口; 具体训练/推理示例见 llm_models.examples。
+并非训练入口; 可运行示例在 llm_models/run_models/<category>/<model>/{infer_X,train_X}.py。
 """
 
+import math
+from pathlib import Path
+
 import torch
+import torch.nn.functional as F
 
 from llm_models import (
     MultiHeadAttention,
@@ -26,6 +30,21 @@ from llm_models import (
     DDPMScheduler,
 )
 
+def _check_lm(name: str, m, vocab: int = 100) -> None:
+    """LM 冒烟断言: 初始 CE ≈ ln V (初始化健康) + 有/无 KV cache 贪心生成逐 token 相同。"""
+    torch.manual_seed(0)
+    m.eval()
+    idx = torch.randint(1, vocab, (2, 9))
+    with torch.inference_mode():
+        out = m(idx[:, :-1])
+        logits = out[0] if isinstance(out, tuple) else out          # MoE 返回 (logits, routing)
+        ce = F.cross_entropy(logits.reshape(-1, vocab), idx[:, 1:].reshape(-1)).item()
+    assert abs(ce - math.log(vocab)) < 0.5, f"{name}: 初始 CE {ce:.2f} 偏离 ln V {math.log(vocab):.2f}"
+    a = m.generate(idx[:, :4], max_new_tokens=8, temperature=0, use_cache=True)
+    b = m.generate(idx[:, :4], max_new_tokens=8, temperature=0, use_cache=False)
+    assert torch.equal(a, b), f"{name}: KV cache 与无 cache 输出不一致"
+    print(f"  {name:<8} 初始 CE {ce:.2f} ≈ ln V {math.log(vocab):.2f} | KV cache 一致  ✓")
+
 
 def _smoke_attention(n_params_fn) -> None:
     torch.manual_seed(42)
@@ -36,26 +55,20 @@ def _smoke_attention(n_params_fn) -> None:
 
 
 def _smoke_gpt() -> None:
-    m = GPT3(vocab_size=100, d_model=64, n_heads=4, num_layers=2, max_len=32).eval()
-    with torch.inference_mode():
-        logits = m(torch.randint(0, 100, (1, 8)))
-    print(f"  GPT-3:   logits {tuple(logits.shape)}  ✓")
+    m = GPT3(vocab_size=100, d_model=64, n_heads=4, num_layers=2, max_len=32)
+    _check_lm("GPT-3", m)
 
 
 def _smoke_llama() -> None:
     m = LLaMA(vocab_size=100, d_model=64, n_heads=4, num_kv_heads=2,
-              num_layers=2, max_len=32).eval()
-    with torch.inference_mode():
-        logits = m(torch.randint(0, 100, (1, 8)))
-    print(f"  LLaMA:   logits {tuple(logits.shape)}  ✓")
+              num_layers=2, max_len=32)
+    _check_lm("LLaMA", m)
 
 
 def _smoke_mixtral() -> None:
     m = Mixtral(vocab_size=100, d_model=64, n_heads=4, num_kv_heads=2,
-                num_layers=2, num_experts=4, top_k=2, max_len=32).eval()
-    with torch.inference_mode():
-        logits, routing = m(torch.randint(0, 100, (1, 8)))
-    print(f"  Mixtral: logits {tuple(logits.shape)}, routing 层数 {len(routing)}  ✓")
+                num_layers=2, num_experts=4, top_k=2, max_len=32)
+    _check_lm("Mixtral", m)
 
 
 def _smoke_mamba() -> None:
@@ -120,7 +133,7 @@ def main():
 
     print("\n[左脑] 语言理解 / 文本生成:")
     print("  Transformer | BERT | GPT-3 | LLaMA | Mixtral | Mamba | "
-          "DeepSeek-V3 / V3.2")
+          "DeepSeek-V3 / V3.2 | GPT-OSS-mini | LLaDA")
 
     print("\n[眼耳] 多模态理解:")
     print("  CLIP | Whisper | Qwen2-VL | Qwen2.5-Omni")
@@ -128,14 +141,11 @@ def main():
     print("\n[右脑] 生成模型:")
     print("  ImageVAE | CausalVideoVAE | DiT | MM-DiT (SD3) | Video DiT (Sora) | VAR")
 
-    print("\n示例脚本 (examples/):")
-    print("  run_attention / run_bert / run_transformer / run_gpt3")
-    print("  run_llama / run_mixtral / run_mamba")
-    print("  run_deepseek / run_deepseek_v3_2")
-    print("  run_clip / run_whisper")
-    print("  run_qwen2_vl_demo / run_qwen2_5_omni_demo")
-    print("  run_vae / run_dit / run_video_dit / run_mmdit / run_var")
-    print("  train_* 对应上述所有模型的合成数据训练验证")
+    print("\n示例脚本 (python -m llm_models.run_models.<category>.<model>.<script>):")
+    root = Path(__file__).parent / "llm_models" / "run_models"
+    for cat in sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith("_")):
+        models = sorted(p.name for p in cat.iterdir() if p.is_dir() and not p.name.startswith("_"))
+        print(f"  {cat.name}: " + " | ".join(models))
 
     print("\n冒烟测试 (每个核心模型跑一次最小前向):")
     _smoke_attention(lambda m: sum(p.numel() for p in m.parameters()))

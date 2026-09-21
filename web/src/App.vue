@@ -1,6 +1,13 @@
 <template>
-  <div class="app">
-    <aside class="sidebar">
+  <div class="app" :class="{ 'nav-open': navOpen }">
+    <!-- 窄屏: 顶栏 + 抽屉式侧栏 -->
+    <header class="topbar">
+      <button type="button" class="hamburger" :aria-expanded="navOpen" aria-controls="sidebar" aria-label="打开章节导航" @click="navOpen = !navOpen">☰</button>
+      <span class="topbar-title">{{ route.meta.title || 'LLM 全栈教程' }}</span>
+    </header>
+    <div class="backdrop" @click="navOpen = false" />
+
+    <aside id="sidebar" class="sidebar">
       <div class="brand">
         <div class="brand-row">
           <h1>LLM 全栈教程</h1>
@@ -16,6 +23,10 @@
           </button>
         </div>
         <p>原理、架构、训练、微调、推理、Agent 六段闭环</p>
+        <div class="progress" :title="`已读 ${readCount} / ${learningPath.length} 章`">
+          <div class="progress-bar"><span :style="{ width: `${(readCount / learningPath.length) * 100}%` }" /></div>
+          <span class="mono">{{ readCount }}/{{ learningPath.length }}</span>
+        </div>
         <a class="repo-link" :href="repoUrl()" target="_blank" rel="noopener">
           <span class="gh-icon" aria-hidden="true">↗</span>
           GitHub · 仓库源码
@@ -70,6 +81,8 @@
               >
                 <span class="idx">{{ s.idx }}.{{ subIdx(s, c.route) }}</span>
                 <span>{{ c.label }}</span>
+                <span v-if="progress.isMastered(c.route)" class="mark done" title="自测全对">✓</span>
+                <span v-else-if="progress.isVisited(c.route)" class="mark" title="已读">•</span>
               </router-link>
 
               <!-- planned: 灰显, 不可点击 -->
@@ -87,11 +100,16 @@
           <span class="idx">∎</span>
           <span>总览对照表</span>
         </router-link>
+        <router-link :to="{ name: 'glossary' }" class="nav-link">
+          <span class="idx">?</span>
+          <span>术语速查</span>
+        </router-link>
 
         <div class="section-label">关于</div>
         <div class="footer">
           <p class="mono">v0.4.0</p>
           <p>六个目录已接入 Web 教程, 每章都对照原始代码阅读。</p>
+          <p>键盘 ← / → 翻章。进度只存在本机浏览器。</p>
         </div>
       </nav>
     </aside>
@@ -110,19 +128,31 @@
 </template>
 
 <script setup>
-import { ref, onMounted, watch } from 'vue'
+import { computed, ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { stages } from '@/data/models.js'
+import { learningPath, stages } from '@/data/models.js'
 import { repoUrl } from '@/utils/repo.js'
+import { useProgress } from '@/composables/useProgress.js'
 
 const router = useRouter()
 const route = useRoute()
-const allRoutes = router.getRoutes()
 
-const chapterTitle = (name) => {
-  const r = allRoutes.find(r => r.name === name)
-  return r?.meta?.title || name
+// ── 学习进度 + 窄屏抽屉 ─────────────────────────────────────────────
+const progress = useProgress()
+const navOpen = ref(false)
+const readCount = computed(() => learningPath.filter((p) => progress.isVisited(p.route)).length)
+watch(() => route.name, (name) => { progress.visit(name); navOpen.value = false }, { immediate: true })
+
+// ── 键盘 ← / → 翻章 (焦点在输入控件里时不抢键, 否则滑杆没法用方向键) ────
+const onKey = (e) => {
+  if (e.altKey || e.ctrlKey || e.metaKey) return
+  if (/^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(e.target.tagName)) return
+  const i = learningPath.findIndex((p) => p.route === route.name)
+  const to = e.key === 'ArrowRight' ? learningPath[i + 1] : e.key === 'ArrowLeft' ? learningPath[i - 1] : null
+  if (i >= 0 && to) router.push({ name: to.route })
 }
+onMounted(() => window.addEventListener('keydown', onKey))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 
 const subIdx = (stage, route) =>
   (stage.chapters || []).findIndex(c => c.route === route) + 1
@@ -188,6 +218,11 @@ const toggleTheme = () => { theme.value = theme.value === 'dark' ? 'light' : 'da
   color: var(--accent);
   border-color: var(--accent);
 }
+.progress { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 10px; color: var(--text-dim); }
+.progress-bar { flex: 1; height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; }
+.progress-bar span { display: block; height: 100%; background: var(--left); transition: width 0.3s; }
+.mark { margin-left: auto; font-size: 11px; color: var(--text-dim); }
+.mark.done { color: var(--left); }
 .repo-link {
   display: inline-flex;
   align-items: center;

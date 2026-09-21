@@ -107,7 +107,7 @@ const rewards = computed(() => {
   return Array.from({ length: G.value }, () => clamp01(0.45 + (prng() - 0.5) * 0.7))
 })
 
-const mean = computed(() => rewards.value.reduce((s, r) => s + r, 0) / rewards.value.length)
+const mean = computed(() => rewards.value.reduce((s, r) => s + r, 0) / Math.max(1, rewards.value.length - 1)) // 无偏 (n-1), 与 torch.std 和 Python 实现一致
 const std = computed(() => {
   const m = mean.value
   return Math.sqrt(rewards.value.reduce((s, r) => s + (r - m) ** 2, 0) / rewards.value.length)

@@ -299,6 +299,13 @@
       <pre class="code" v-html="highlight(codeSnippet)"></pre>
     </section>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav
       :prev="{ name: 'home', label: '时间轴总览', hint: '回到 2017–2025 全景图' }"
       :next="{ name: 'position', label: '位置编码 & RoPE', hint: '看完 attention 后, 再看 RoPE 是怎么注入 Q/K 的' }"
@@ -307,6 +314,8 @@
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import { ref, reactive, computed, watch } from 'vue'
 import { variants } from '@/data/attention.js'
 import ChapterIntro from '@/components/ChapterIntro.vue'

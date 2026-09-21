@@ -1,20 +1,17 @@
 """
-位置编码模块 — 给无序 attention 注入 "顺序" 信息
+位置编码 — 给置换不变的 attention 注入 "顺序"
 
-包含:
-- SinPositionalEncoding:    正弦位置编码 (Vaswani et al., 2017 原始 Transformer)
-- RotaryPositionalEncoding: 旋转位置编码 RoPE (Su et al., 2021; GPT-NeoX/LLaMA/Qwen 标配)
-- MultimodalRotaryEmbedding: M-RoPE (Qwen2-VL, 2024) — 三轴 (时间/高/宽) 多模态扩展
-
-演进与动机:
-    Sinusoidal/Learnable (绝对位置, 加在 embedding 上)
-        → RoPE (相对位置, 旋转 Q/K, 长度外推性更好, 无需额外参数)
-            → M-RoPE (按维度切段, 各段独立 RoPE, 把 1D 顺序扩展到 (T,H,W) 三轴)
-
-为什么 RoPE 能编码相对位置:
-    把每两维当成复数 z = a + ib，按位置 m 旋转角 mθ → z·e^{imθ}。
-    Q_m 与 K_n 的内积 ⟨z_m, z_n⟩ = ⟨z, z⟩·e^{i(m-n)θ}，
-    实部仅依赖 (m - n)，因此天然编码了 **相对** 距离，且无需任何可学参数。
+是什么: SinPositionalEncoding (2017, 绝对位置, 加在 embedding 上)
+        → RotaryPositionalEncoding / RoPE (2021, 旋转 Q/K, 内积只依赖相对距离, 零参数)
+        → NTK / YaRN 缩放 (2023, 不重训或少量微调把上下文扩 4~32×)
+        → MultimodalRotaryEmbedding / M-RoPE (Qwen2-VL, head_dim 切三段分别编码 T/H/W)
+RoPE 核心: 每两维看成复数 z, 位置 m 处乘 e^{imθ_i}, θ_i = base^{-2i/d};
+           ⟨q_m, k_n⟩ 的实部只含 (m-n)θ_i → 天然相对位置。
+外推为什么坏: 低频维 (θ_i 小) 在训练长度 L 内转不满一圈, 位置 > L 时出现 **从未见过的角度**。
+    NTK:  base ← base·s^{d/(d-2)}, 最低频恰好 ÷s, 最高频不变
+    YaRN: 按 "训练长度内转了几圈 r_i" 分段: r<1 整个 ÷s (内插), r>32 不动 (外推), 中间线性过渡;
+          再把 logits 乘 (0.1·ln s + 1)² 补偿长序列 softmax 变平
+读代码时盯住: `inv_freq` —— 所有缩放方法都只是在改这一个向量。
 """
 
 import math
@@ -98,8 +95,9 @@ class SinPositionalEncoding(nn.Module):
         # persistent=False: 不写入 state_dict，避免下游 checkpoint 体积膨胀
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:, : x.size(1)]
+    def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
+        # offset: KV cache 解码时, 新 token 的绝对位置从 offset 开始
+        return x + self.pe[:, offset : offset + x.size(1)]    # [B, T, D] + [1, T, D]
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -132,28 +130,61 @@ def apply_rotary_pos_emb(
     return (x * cos) + (_rotate_half(x) * sin)
 
 
+def scaled_inv_freq(
+    d_head: int,
+    base: float = 10000.0,
+    scaling: Optional[str] = None,
+    factor: float = 1.0,
+    original_max_len: int = 2048,
+    beta_fast: float = 32.0,
+    beta_slow: float = 1.0,
+) -> Tuple[torch.Tensor, float]:
+    """
+    返回 (inv_freq [d_head/2], attention 温度补偿 mscale)。
+
+    scaling=None:   θ_i = base^{-2i/d}
+    scaling="ntk":  base' = base · s^{d/(d-2)}   → θ_0 不变, θ_last 恰好 ÷ s
+    scaling="yarn": r_i = L·θ_i / 2π (训练长度内转的圈数)
+                    γ_i = clip((r_i - β_slow) / (β_fast - β_slow), 0, 1)
+                    θ_i' = (1-γ_i)·θ_i/s + γ_i·θ_i;   mscale = 0.1·ln(s) + 1
+    """
+    exponent = torch.arange(0, d_head, 2).float() / d_head              # 2i/d  [d_head/2]
+    if scaling is None or factor == 1.0:
+        return 1.0 / base**exponent, 1.0
+    if scaling == "ntk":
+        return 1.0 / (base * factor ** (d_head / (d_head - 2))) ** exponent, 1.0
+    if scaling == "yarn":
+        inv_freq = 1.0 / base**exponent
+        rotations = original_max_len * inv_freq / (2 * math.pi)          # r_i
+        gamma = ((rotations - beta_slow) / (beta_fast - beta_slow)).clamp(0, 1)
+        # γ=1 (高频, 转了很多圈, 管局部顺序): 原样外推; γ=0 (低频, 没转满一圈): 内插 ÷s
+        return (1 - gamma) * inv_freq / factor + gamma * inv_freq, 0.1 * math.log(factor) + 1.0
+    raise ValueError(f"未知 RoPE scaling: {scaling!r} (可选 None / 'ntk' / 'yarn')")
+
+
 class RotaryPositionalEncoding(nn.Module):
     """
-    旋转位置编码 (Rotary Position Embedding, RoPE) — Su et al., 2021
+    RoPE (Su et al., 2021), 可选 NTK / YaRN 长度外推。
 
-    相对前代 (Sinusoidal/Learnable) 的关键优势:
-        - 编码的是 **相对** 距离 (Q·K 内积只依赖位置差)
-        - 不引入额外可学参数
-        - 长度外推性更好 (NTK / YaRN 等微调即可扩到 128k)
-        - 应用在 Q/K 而非 embedding 上，与 KV cache 兼容性好
-
-    使用场景:
-        - 输入既可是 [B, T, d_head] (旧接口)
-        - 也可是 [B, H, T, d_head] (多头 4D 张量)
-        - position_ids 可显式传入以支持 KV-cache / M-RoPE / 自定义位置
+    输入 [B, T, d_head] 或 [B, H, T, d_head]; position_ids 显式传入以支持 KV cache / M-RoPE。
 
     Args:
-        d_head: 单头维度 (注意不是 d_model；RoPE 作用在 per-head 维度上)
-        max_len: 预计算的最大位置 (上线后超长序列要么扩 max_len 要么用 NTK 缩放)
-        base: 频率基数 (默认 10000；扩长用 NTK-aware 时会调到 1e6 量级)
+        d_head:  单头维度 (不是 d_model)
+        max_len: 预计算 cos/sin 表的长度 (扩展后的目标长度)
+        base:    频率基数
+        scaling / factor / original_max_len: 见 scaled_inv_freq;
+                 original_max_len 默认 max_len / factor (即 "训练时的长度")
     """
 
-    def __init__(self, d_head: int, max_len: int = 5000, base: float = 10000.0):
+    def __init__(
+        self,
+        d_head: int,
+        max_len: int = 5000,
+        base: float = 10000.0,
+        scaling: Optional[str] = None,
+        factor: float = 1.0,
+        original_max_len: Optional[int] = None,
+    ):
         super().__init__()
 
         if d_head % 2 != 0:
@@ -162,16 +193,19 @@ class RotaryPositionalEncoding(nn.Module):
         self.d_head = d_head
         self.max_len = max_len
 
-        # 不同维度对有不同旋转频率: 低维快 (近距离敏感)，高维慢 (远距离敏感)
-        inv_freq = 1.0 / (base ** (torch.arange(0, d_head, 2).float() / d_head))
-        t = torch.arange(max_len).float()
-        freqs = torch.einsum("i,j->ij", t, inv_freq)  # [max_len, d_head//2]
-        # 把 freqs 复制一份拼接 → [max_len, d_head]，对应 _rotate_half 的前后两半排布
-        emb = torch.cat((freqs, freqs), dim=-1)
+        if original_max_len is None:
+            original_max_len = int(max_len / factor)
+        # 低维转得快 (近距离敏感), 高维转得慢 (远距离敏感)
+        inv_freq, self.mscale = scaled_inv_freq(
+            d_head, base, scaling, factor, original_max_len
+        )
+        freqs = torch.outer(torch.arange(max_len).float(), inv_freq)    # [max_len, d_head/2]
+        emb = torch.cat((freqs, freqs), dim=-1)                         # [max_len, d_head] 对应 _rotate_half 的前后两半
 
-        # 预计算 cos/sin 表，运行时直接索引；不进 state_dict (persistent=False)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        # cos/sin 同乘 mscale ⇒ q·k 乘 mscale² = YaRN 的 1/t; 不进 state_dict
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("cos_cached", emb.cos() * self.mscale, persistent=False)
+        self.register_buffer("sin_cached", emb.sin() * self.mscale, persistent=False)
 
     def _lookup(
         self, seq_len: int, position_ids: Optional[torch.Tensor]
@@ -234,8 +268,8 @@ class MultimodalRotaryEmbedding(nn.Module):
         会丢失空间结构。M-RoPE 让位置编码本身就有 (T, H, W) 三轴语义。
 
     核心思想:
-        把 head_dim 按比例切成 (temporal, height, width) 三段，
-        每段独立 RoPE，独立位置索引：
+        三轴共用同一条 RoPE 频率轴, 把 d_head/2 个频率按比例分给 (temporal, height, width),
+        每段用各自轴的位置索引去旋转：
             - 文本 token：三轴位置索引相同 (退化为普通 1D RoPE)
             - 视觉 patch：三轴分别填 (帧号, 行号, 列号)
         这样文本和视觉能在同一个 attention 里直接交互，又各自保留时空先验。
@@ -276,10 +310,14 @@ class MultimodalRotaryEmbedding(nn.Module):
         self.d_head = d_head
         self.section_dims = tuple(section_dims)
 
-        # 每段单独一个 RoPE，互不干扰
-        self.axis_ropes = nn.ModuleList(
-            [RotaryPositionalEncoding(d, max_len=max_len, base=base) for d in section_dims]
-        )
+        # 与 Qwen2-VL 原版一致: 三轴共用 **同一条** 频率轴, 只是把 d_head/2 个频率按段分给 T/H/W。
+        # 这样三轴位置相同时 (纯文本) 与 1D RoPE 逐位相等; 若每段各建一个 RoPE (各自从最高频起算) 则不等。
+        self.rope = RotaryPositionalEncoding(d_head, max_len=max_len, base=base)
+        freq_axis = torch.repeat_interleave(
+            torch.arange(3), torch.tensor([s // 2 for s in section_dims])
+        )  # [d_head/2] 第 j 个频率归哪个轴
+        # cos/sin 表是 cat(freqs, freqs) 排布, 轴归属同样复制一份 -> [d_head]
+        self.register_buffer("dim_axis", torch.cat([freq_axis, freq_axis]), persistent=False)
 
     def forward(
         self,
@@ -299,10 +337,26 @@ class MultimodalRotaryEmbedding(nn.Module):
                 f"M-RoPE 的 position_ids 必须是 [3, B, T]，当前 {tuple(position_ids.shape)}"
             )
 
-        # 把 head_dim 切成三段 (T/H/W)，每段用对应轴的 position_ids 独立 RoPE，再拼回
-        splits = torch.split(x, list(self.section_dims), dim=-1)
-        rotated = [
-            rope(seg, position_ids=position_ids[i])
-            for i, (seg, rope) in enumerate(zip(splits, self.axis_ropes))
-        ]
-        return torch.cat(rotated, dim=-1)
+        cos = self.rope.cos_cached[position_ids]  # [3, B, T, d_head] 三个轴各查一次表
+        sin = self.rope.sin_cached[position_ids]
+        # 每个维度只取 "自己所属轴" 的那份 cos/sin -> [B, T, d_head]
+        pick = self.dim_axis.view(1, 1, 1, -1).expand(1, *cos.shape[1:])
+        cos = cos.gather(0, pick).squeeze(0)
+        sin = sin.gather(0, pick).squeeze(0)
+        if x.dim() == 4:  # [B, H, T, d_head]: 在 head 维广播
+            cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+        return apply_rotary_pos_emb(x, cos, sin)
+
+
+if __name__ == "__main__":
+    # 自检: 三轴位置相同时 M-RoPE 必须与 1D RoPE 逐位相等; 只改 H 轴只应影响 H 段的维度
+    torch.manual_seed(0)
+    m = MultimodalRotaryEmbedding(16, (4, 6, 6), max_len=64)
+    x = torch.randn(2, 3, 5, 16)
+    pos = torch.arange(5).expand(2, 5)
+    same = pos.expand(3, 2, 5)
+    assert torch.equal(m(x, same), m.rope(x, position_ids=pos))
+    moved = same.clone(); moved[1] += 7
+    changed = (m(x, moved) != m(x, same)).any(dim=0).any(dim=0).any(dim=0)  # [d_head]
+    assert torch.equal(changed, m.dim_axis == 1), changed
+    print("M-RoPE 自检通过: 文本退化为 1D RoPE; H 轴位移只动", int(changed.sum()), "个维度")

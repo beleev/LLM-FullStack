@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "llm-models"
-version = "0.1.0"
-description = "大语言模型实现库 - 包含 Transformer, GPT-3, DeepSeek-V3 等模型的 PyTorch 实现"
+name = "llm-fullstack"
+version = "0.5.0"
+description = "LLM 全栈教具库: 手写反向传播 → 模型架构 → 规模化训练 → 微调对齐 → 推理优化 → Agent"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -27,13 +27,11 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.20.0",
     "torch>=1.10.0",
@@ -54,18 +52,22 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/example/llm-models"
-Documentation = "https://github.com/example/llm-models#readme"
-Repository = "https://github.com/example/llm-models.git"
-Issues = "https://github.com/example/llm-models/issues"
+Homepage = "https://github.com/beleev/LLM-FullStack"
+Documentation = "https://beleev.github.io/LLM-FullStack/"
+Repository = "https://github.com/beleev/LLM-FullStack.git"
+Issues = "https://github.com/beleev/LLM-FullStack/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["llm_models*", "llm_finetune*", "llm_infer*", "llm_train*", "llm_agent*"]
 
+[tool.setuptools.package-data]
+# 教学用的非 .py 文件也要随包安装: SKILL.md (llm_agent/m05 的渐进式披露演示)、各模块 README
+"*" = ["*.md"]
+
 [tool.black]
 line-length = 100
-target-version = ['py38', 'py39', 'py310', 'py311']
+target-version = ['py310', 'py311', 'py312', 'py313']
 include = '\.pyi?$'
 
 [tool.isort]
@@ -73,7 +75,7 @@ profile = "black"
 line_length = 100
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
@@ -81,4 +83,5 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v --tb=short"
+addopts = "-q --tb=short -m 'not slow'"
+markers = ["slow: 训练脚本, 每个几秒到几十秒 (pytest -m slow)"]

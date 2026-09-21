@@ -1,36 +1,8 @@
 """
-微调方法子包
-================
+微调方法: 每个文件一种方法, 可以独立阅读。
 
-每个文件实现一种 finetune 范式, 设计上独立, 互不依赖, 便于横向对比阅读。
-
-    sft.py   全参监督微调 (Supervised Fine-Tuning)
-    lora.py  Low-Rank Adaptation (PEFT)
-    dpo.py   Direct Preference Optimization (alignment)
+    监督 / 参数高效:  sft · lora · dora · qlora
+    离线偏好:        dpo · simpo · orpo · reward_model
+    在线 RL:         grpo (含 DAPO / Dr.GRPO / GSPO 开关)
+    蒸馏:            distill (off-policy, forward KL) · on_policy_distill (on-policy, reverse KL)
 """
-
-from llm_finetune.methods.sft import SFTLoss
-from llm_finetune.methods.lora import (
-    LoRALinear,
-    apply_lora,
-    mark_only_lora_as_trainable,
-    merge_lora_weights,
-    get_lora_state_dict,
-)
-from llm_finetune.methods.dpo import (
-    DPOLoss,
-    DPOTrainer,
-    compute_sequence_logprobs,
-)
-
-__all__ = [
-    "SFTLoss",
-    "LoRALinear",
-    "apply_lora",
-    "mark_only_lora_as_trainable",
-    "merge_lora_weights",
-    "get_lora_state_dict",
-    "DPOLoss",
-    "DPOTrainer",
-    "compute_sequence_logprobs",
-]

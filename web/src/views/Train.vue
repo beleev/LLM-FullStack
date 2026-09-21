@@ -12,8 +12,8 @@
       question="什么时候该切 batch, 什么时候该切矩阵, 什么时候该切优化器状态?"
       :goals="[
         '看懂 DDP / TP / PP / ZeRO 各自切的是 batch / 矩阵 / 层 / 状态',
-        '知道为什么混合精度需要 loss scaling、grad clip',
-        '能把 m01..m10 的功能挂回 full_loop 里的对应阶段',
+        '知道为什么混合精度需要 loss scaling、fp32 master、grad clip',
+        '能把 m01..m16 的功能挂回 full_loop 里的对应阶段',
       ]"
       :codes="[
         { path: 'llm_train/core/' },
@@ -21,8 +21,8 @@
         { path: 'llm_train/m01_gradient_accumulation/' },
         { path: 'llm_train/m05_zero_fsdp/' },
       ]"
-      :prereq="{ name: 'diffusion', label: '阶段 2.5 · 架构家族收束' }"
-      :next-step="{ name: 'train-batch-ddp', label: '阶段 3.1 · batch 与 DDP' }"
+      :prereq="{ name: 'diffusion', label: '扩散生成 · 架构家族收束' }"
+      :next-step="{ name: 'train-batch-ddp', label: 'batch 与 DDP' }"
     />
 
     <section class="section">
@@ -147,14 +147,23 @@
       </div>
     </section>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav
-      :prev="{ name: 'diffusion', label: '阶段 2.5 · 扩散生成', hint: '模型结构已经看完, 下一步是把训练规模做上去' }"
-      :next="{ name: 'train-batch-ddp', label: '阶段 3.1 · batch 与 DDP', hint: '先拆 batch, 再同步多卡梯度' }"
+      :prev="{ name: 'diffusion', label: '扩散生成', hint: '模型结构已经看完, 下一步是把训练规模做上去' }"
+      :next="{ name: 'train-batch-ddp', label: 'batch 与 DDP', hint: '先拆 batch, 再同步多卡梯度' }"
     />
   </div>
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import EvolutionChain from '@/components/EvolutionChain.vue'

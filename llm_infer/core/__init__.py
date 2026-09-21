@@ -9,10 +9,13 @@ core — 各模块共享的极简 transformer + tokenizer。
 模块清单
     - tiny_model.py      4 层 1 头 d=32 的极简 LM (numpy, 仅前向)
     - tokenizer.py       字符级 tokenizer
-    - utils.py           softmax / RMSNorm / 计时器等小工具
+    - utils.py           softmax / RMSNorm / dense_attention (全库唯一的朴素 attention 基线) / 计时器
+    - sequence.py        Sequence / SeqStatus / Stage: 一条请求的状态 (调度器与引擎共用)
 """
-from llm_infer.core.tiny_model import TinyLM, ModelConfig
+from llm_infer.core.tiny_model import TinyLM, ModelConfig, truncate_kv
 from llm_infer.core.tokenizer import CharTokenizer
-from llm_infer.core.utils import softmax, rms_norm, Timer
+from llm_infer.core.utils import softmax, rms_norm, dense_attention, causal_mask, Timer
+from llm_infer.core.sequence import Sequence, SeqStatus, Stage
 
-__all__ = ["TinyLM", "ModelConfig", "CharTokenizer", "softmax", "rms_norm", "Timer"]
+__all__ = ["TinyLM", "ModelConfig", "truncate_kv", "CharTokenizer", "softmax", "rms_norm",
+           "dense_attention", "causal_mask", "Timer", "Sequence", "SeqStatus", "Stage"]

@@ -1,23 +1,15 @@
 """
-扩散 / 流匹配 调度器 + 采样器 + CFG 工具
+扩散 / 流匹配: 调度器 (正向加噪 + loss target) + 采样器 (反向去噪) + Loss + CFG
 
-本文件为 Image / Video DiT 与 MM-DiT 提供训练 & 采样所需的全部支持:
+DDPM:          x_t = sqrt(ᾱ_t)·x_0 + sqrt(1-ᾱ_t)·ε,  target = ε,       t ∈ {0..T-1}
+Flow Matching: x_t = (1-t)·x_0 + t·ε,                target = ε - x_0, t ∈ [0, 1]
+它解决的问题: Scheduler 与 Sampler 解耦 (diffusers 风格), 同一个 DiT 可换目标 / 换采样器。
 
-1) 噪声调度器 (Scheduler):
-    - DDPMScheduler           : 经典 ε-prediction, cosine / linear β 调度
-    - FlowMatchingScheduler   : Rectified Flow / SD3 路线, velocity-prediction
-2) 采样器 (Sampler, 推理时反向去噪):
-    - DDIMSampler             : Denoising Diffusion Implicit (少步确定性采样)
-    - EulerFlowSampler        : Rectified Flow 的 Euler ODE 求解
-3) Loss:
-    - DiffusionLoss           : 自动按 scheduler 的 target 类型 (ε 或 v) 算 MSE
-4) CFG 辅助:
-    - classifier_free_guidance: 给定 "有条件" 与 "无条件" 两套 pred, 做线性外插
+关键数字: 喂给模型的时间统一是 **[0, T=1000) 量纲**。sinusoidal 频率族为 max_period=10000
+的整数位置设计, 若把 t∈[0,1] 直接喂进去, t=0.1 与 t=0.9 的嵌入余弦相似度 0.98 (几乎不可分);
+×1000 后降到 0.17。所以 Flow Matching 的 t 在出本文件前一律 ×num_train_timesteps (SD3 同款)。
 
-设计要点:
-    - Scheduler 负责 "正向加噪 q(x_t | x_0)" 与 "损失目标 pred 的语义"
-    - Sampler   负责 "反向去噪" (从 x_T 走到 x_0)
-    - 二者解耦, 可自由组合; 这也是 HuggingFace diffusers 库的风格
+读代码时盯住: AddNoiseResult.t_norm (给模型看的 t) 与 add_noise 内部用的 t (插值系数) 的区别。
 """
 
 import math
@@ -41,12 +33,11 @@ from llm_models.training.loss import LossComputer
 class AddNoiseResult:
     """
     正向加噪 q(x_t | x_0) 的输出包:
-        noisy:  x_t = forward(x_0, ε, t)
-        noise:  ε (训练 ε-pred 时作为 target)
-        target: 真正用作 loss target 的量
-                - DDPM (ε-pred) 下 = noise
-                - Flow Matching (v-pred) 下 = velocity
-        t_norm: 与 model.forward 一致的时间步张量 (已归一化到 [0, 1] 或保持原始步数)
+        noisy:  x_t
+        noise:  ε
+        target: loss 的回归目标 (DDPM: ε; Flow Matching: velocity = ε - x_0)
+        t_norm: **喂给 model.forward 的时间**, 统一为 [0, T) 量纲
+                (DDPM: 原始整数步; Flow Matching: t·T)。名字是历史遗留, 不是 [0,1]。
     """
     noisy: torch.Tensor
     noise: torch.Tensor
@@ -126,7 +117,7 @@ class DDPMScheduler(NoiseScheduler):
         sqrt_ab = self._broadcast(self.sqrt_alphas_cumprod[t], x0)
         sqrt_1mab = self._broadcast(self.sqrt_one_minus_alphas_cumprod[t], x0)
         noisy = sqrt_ab * x0 + sqrt_1mab * noise
-        # DDPM 传给模型的 t 直接用原始离散步数 (float 化, TimestepEmbedding 可吃连续值)
+        # DDPM 的 t 本来就是 [0, T) 的整数步, 不需要再缩放
         return AddNoiseResult(noisy=noisy, noise=noise, target=noise, t_norm=t.float())
 
 
@@ -165,10 +156,12 @@ class FlowMatchingScheduler(NoiseScheduler):
 
     def add_noise(self, x0: torch.Tensor, t: torch.Tensor) -> AddNoiseResult:
         noise = torch.randn_like(x0)
-        t_b = self._broadcast(t, x0)
-        noisy = (1 - t_b) * x0 + t_b * noise
-        velocity = noise - x0  # dx_t/dt, 与 t 无关 (直线路径)
-        return AddNoiseResult(noisy=noisy, noise=noise, target=velocity, t_norm=t)
+        t_b = self._broadcast(t, x0)                # [B] → [B, 1, 1, ...]
+        noisy = (1 - t_b) * x0 + t_b * noise        # 插值系数用 t ∈ [0, 1]
+        velocity = noise - x0                       # dx_t/dt, 与 t 无关 (直线路径)
+        # 给模型看的 t 要 ×T: sinusoidal 嵌入在 [0,1] 上几乎不动 (见文件头)
+        return AddNoiseResult(noisy=noisy, noise=noise, target=velocity,
+                              t_norm=t * self.num_train_timesteps)
 
 
 # -----------------------------------------------------------------------------
@@ -178,17 +171,14 @@ class FlowMatchingScheduler(NoiseScheduler):
 
 class DiffusionLoss(LossComputer):
     """
-    按 scheduler 的 prediction_type 计算 MSE loss。
+    MSE(pred, target)。target 是 ε 还是 velocity 由 scheduler 在造数据时就定了
+    (labels = AddNoiseResult.target), 所以这里不需要按 prediction_type 分支。
 
-    训练约定 (与 Trainer 的接口对齐):
-        model_output: 模型输出的 pred (形状与 target 相同, e.g. [B, C, H, W])
-        labels:       scheduler 产生的 target (noise 或 velocity)
-        kwargs:       可传 "loss_mask" (同形 mask), 用于把部分位置排除
+    可选 kwargs["loss_mask"]: 可广播到 labels 形状, 1=计入 / 0=排除
+    (如 inpainting 只对被遮住的区域算 loss); 按有效元素数取平均。
 
-    为什么要独立的 DiffusionLoss?
-        Trainer 默认调 LossComputer.compute(out, labels), 扩散训练的 target 不是
-        "下一 token 分类", 而是 "MSE 回归". 在 training/data.py 的扩散生成器里,
-        我们已经让 labels = scheduler.target, 所以此处只做 MSE 即可。
+    sanity: FinalLayer 零初始化 → 初始 pred=0 → 初始 loss = E[target²]
+            (DDPM ≈ 1.0, Flow Matching ≈ Var(ε)+Var(x_0) ≈ 2.0)。
     """
 
     def compute(
@@ -197,7 +187,12 @@ class DiffusionLoss(LossComputer):
         labels: torch.Tensor,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        loss = F.mse_loss(model_output, labels)
+        loss_mask = kwargs.get("loss_mask")
+        if loss_mask is None:
+            loss = F.mse_loss(model_output, labels)
+        else:
+            m = loss_mask.expand_as(labels).to(labels.dtype)
+            loss = ((model_output - labels) ** 2 * m).sum() / m.sum().clamp(min=1)
         return {"total_loss": loss, "diffusion_loss": loss}
 
 
@@ -214,17 +209,20 @@ class DDIMSampler:
         x_0 = (x_t - sqrt(1-ᾱ_t) · ε) / sqrt(ᾱ_t)
         x_{t-1} = sqrt(ᾱ_{t-1}) · x_0 + sqrt(1 - ᾱ_{t-1}) · ε
 
-    若希望随机采样, 可在每步加入 noise (传统 DDPM 的 q(x_{t-1} | x_t, x_0));
-    本实现保持纯确定性 (η=0)。
+    本实现纯确定性 (η=0)。
 
-    用法:
-        sampler = DDIMSampler(scheduler, num_inference_steps=50)
-        x0 = sampler.sample(model, shape=(B, C, H, W), device=...)
+    clip_x0: cosine 调度下 ᾱ_999 ≈ 2.4e-9, 第一步除以 sqrt(ᾱ_t) 会把 ε 的任何误差放大 ~2 万倍;
+             把 x0_pred 截到 [-clip_x0, clip_x0] 是标准补救 (diffusers 的 clip_sample)。
+             像素空间用 1.0; 近似 N(0,1) 的 latent 用 3 左右; None = 不截断。
     """
 
-    def __init__(self, scheduler: DDPMScheduler, num_inference_steps: int = 50):
+    def __init__(
+        self, scheduler: DDPMScheduler, num_inference_steps: int = 50,
+        clip_x0: Optional[float] = None,
+    ):
         self.scheduler = scheduler
         self.num_inference_steps = num_inference_steps
+        self.clip_x0 = clip_x0
 
     @torch.inference_mode()
     def sample(
@@ -259,6 +257,8 @@ class DDIMSampler:
                 ab_prev = torch.tensor(1.0, device=device)
 
             x0_pred = (x - (1 - ab_t).sqrt() * pred) / ab_t.sqrt()
+            if self.clip_x0 is not None:
+                x0_pred = x0_pred.clamp(-self.clip_x0, self.clip_x0)
             x = ab_prev.sqrt() * x0_pred + (1 - ab_prev).sqrt() * pred
 
         return x
@@ -274,10 +274,14 @@ class EulerFlowSampler:
     直到 t → 0, 即得 x_0。
 
     少步即可收敛 (教学默认 20 步; SD3 推理 28 步左右).
+
+    time_scale 必须等于训练时 FlowMatchingScheduler.num_train_timesteps:
+    积分用 t ∈ [0,1], 但喂给模型的是 t·time_scale (与训练时的 t_norm 同量纲)。
     """
 
-    def __init__(self, num_inference_steps: int = 20):
+    def __init__(self, num_inference_steps: int = 20, time_scale: float = 1000.0):
         self.num_inference_steps = num_inference_steps
+        self.time_scale = time_scale
 
     @torch.inference_mode()
     def sample(
@@ -295,7 +299,7 @@ class EulerFlowSampler:
         for i in range(self.num_inference_steps):
             t = ts[i]
             dt = ts[i] - ts[i + 1]
-            t_batch = t.expand(shape[0])
+            t_batch = (t * self.time_scale).expand(shape[0])   # [B], 模型量纲
 
             v = _apply_cfg(model, x, t_batch, class_labels, guidance_scale, null_class_id)
             x = x - dt * v

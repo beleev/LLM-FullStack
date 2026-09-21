@@ -240,3 +240,24 @@ __all__ = [
     "NoiseScheduler", "DDPMScheduler", "FlowMatchingScheduler",
     "DDIMSampler", "EulerFlowSampler", "classifier_free_guidance",
 ]
+
+# --- 后加的导出: 按完整模块路径直接引入, 省得逐级改子包 __init__ ---
+from llm_models.layers.core.attention import LightningIndexer
+from llm_models.layers.core.position_encoding import sinusoidal_embedding, scaled_inv_freq
+from llm_models.layers.sparse.linear_attention import GatedDeltaNet
+from llm_models.layers.diffusion.vq import MultiScaleVQ
+from llm_models.utils.init import init_weights
+from llm_models.utils.generation import KVCache, GenerationMixin, benchmark_kv_cache
+from llm_models.models.language_models.llada import LLaDA, LLaDALoss, forward_process
+
+__all__ += [
+    "LightningIndexer", "sinusoidal_embedding", "scaled_inv_freq", "GatedDeltaNet",
+    "MultiScaleVQ", "init_weights", "KVCache", "GenerationMixin", "benchmark_kv_cache",
+    "LLaDA", "LLaDALoss", "forward_process",
+]
+from llm_models.models.moe.gpt_oss import GPTOSSMini, GPTOSSBlock
+
+__all__ += ["GPTOSSMini", "GPTOSSBlock"]
+from llm_models.models.multimodal.qwen2_vl import build_mrope_position_ids
+
+__all__ += ["build_mrope_position_ids"]

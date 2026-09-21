@@ -1,36 +1,16 @@
 """
-Mamba 模型模块
+Mamba — 不用 attention 的语言模型 (Gu & Dao, 2023)
 
-论文出处:
-    "Mamba: Linear-Time Sequence Modeling with Selective State Spaces"
-    (Gu & Dao, 2023)
-    "Transformers are SSMs / Mamba-2" (Dao & Gu, 2024)
-
-在本库演进地图中的位置:
-    - 与 Transformer 并列的 **另一条主线**: 非注意力 / 线性复杂度
-    - 用 Selective State Space Model (S6) 替代 self-attention
-    - 复杂度 O(T) (vs attention 的 O(T^2)), 长上下文推理 5× 快 (论文)
-
-Mamba block 设计 (与 Transformer block 的对照):
-    Transformer:  x -> LN -> Attn     -> Add ; x -> LN -> FFN -> Add
-    Mamba:        x -> LN -> MambaLayer -> Add    (融合 SSM + 门控, 一条路径搞定)
-
-MambaLayer 内部:
-    x -> Linear up (2D 分支: main + gate)
-       main: ─ Conv1D ─ SiLU ─ SelectiveSSM ─
-       gate: ─ SiLU   ─                       ⊙  ─ Linear down ─> out
-    为什么需要 Conv1D?
-        SelectiveSSM 是逐通道独立建模 (没有跨通道交互);
-        1D depth-wise conv (kernel_size=4) 引入局部跨通道混合, 增强表达力,
-        对应 Transformer 里 attention 的 "token 间交互"。
-    为什么需要 gate 分支?
-        借鉴 GLU/SwiGLU 门控思想, 让模型自动学"哪些通道的 SSM 输出该保留"。
-
-本文件实现教学版 Mamba LM, 每层 = MambaLayer; 不再追加 FFN
-(Mamba 论文实证 SSM + gate 已经足够, FFN 可省, 这也是 Mamba 参数效率高的原因)。
+是什么: 每层 = Pre-RMSNorm + MambaLayer + 残差; 没有 QKV、没有因果 mask、没有位置编码、没有 FFN。
+解决了什么: Transformer 训练 O(T²), 推理时 KV cache 随 T 线性增长;
+           Mamba 训练 O(T), 推理每步 O(1) —— 全部历史压在定长状态 (h, conv 窗口) 里。
+MambaLayer:  x ─ in_proj ─┬─ main: 因果 depthwise Conv1d → SiLU → SelectiveSSM ─┐
+                          └─ gate: SiLU ───────────────────────────────────────⊙─ out_proj
+    Conv 提供局部 token 混合 (SSM 前的"短程记忆"), gate 即 GLU 式门控, 顶替了 FFN。
+关键数字: d_inner = 2·D, d_state N = 16, d_conv = 4; 每层解码状态 = D_in·N + D_in·(d_conv-1) 个数, 与 T 无关。
+读代码时盯住: cache —— {"conv": 最近 d_conv-1 个输入, "h": SSM 状态}; 对照 Transformer 的 KV cache 会越长越大。
 """
 
-import math
 from typing import Optional
 
 import torch
@@ -39,26 +19,12 @@ import torch.nn.functional as F
 
 from llm_models.layers.core.normalization import RMSNorm
 from llm_models.layers.sparse.ssm import SelectiveSSM
+from llm_models.utils.generation import GenerationMixin, KVCache
+from llm_models.utils.init import init_weights
 
 
 class MambaLayer(nn.Module):
-    """
-    单个 Mamba 层 (教学版 selective SSM + depth-wise conv + gate)
-
-    数据流:
-        x:          [B, T, D]
-        x_and_gate: Linear_in(x) -> split → (x_main, x_gate) 各 [B, T, d_inner]
-        x_main:     Conv1d(x_main) -> SiLU -> SelectiveSSM(x_main)
-        y:          x_main ⊙ SiLU(x_gate)           (门控乘)
-        out:        Linear_out(y)  [B, T, D]
-
-    Args:
-        d_model:   输入输出维度
-        d_inner:   内部扩展维度, Mamba 默认 2*d_model
-        d_state:   SelectiveSSM 的隐状态维度
-        d_conv:    depth-wise conv kernel 大小
-        dt_rank:   Δ 的低秩维度
-    """
+    """conv + selective SSM + gate。d_inner 默认 2·d_model。"""
 
     def __init__(
         self,
@@ -69,104 +35,52 @@ class MambaLayer(nn.Module):
         dt_rank: Optional[int] = None,
     ):
         super().__init__()
+        d_inner = d_inner or 2 * d_model
+        self.d_inner, self.d_conv = d_inner, d_conv
 
-        if d_inner is None:
-            d_inner = 2 * d_model
-        self.d_inner = d_inner
-        self.d_conv = d_conv
-
-        # 同时产出 main 与 gate 两分支, 减少一次 matmul
-        self.in_proj = nn.Linear(d_model, 2 * d_inner, bias=False)
-
-        # depth-wise 1D conv: groups=d_inner 保证每通道独立卷, 开销极小
-        # padding=d_conv - 1 + 因果裁剪: 保持序列长度, 且只看过去的卷积窗口
-        self.conv1d = nn.Conv1d(
-            in_channels=d_inner,
-            out_channels=d_inner,
-            kernel_size=d_conv,
-            groups=d_inner,
-            padding=d_conv - 1,
-            bias=True,
-        )
-
+        self.in_proj = nn.Linear(d_model, 2 * d_inner, bias=False)     # main + gate 一次投出
+        # depthwise (groups=d_inner); padding=0, 因果性靠 forward 里手动左填充
+        self.conv1d = nn.Conv1d(d_inner, d_inner, kernel_size=d_conv, groups=d_inner, bias=True)
         self.ssm = SelectiveSSM(d_model=d_inner, d_state=d_state, dt_rank=dt_rank)
-
         self.out_proj = nn.Linear(d_inner, d_model, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, T, D]
-        Returns:
-            [B, T, D]
-        """
-        B, T, _ = x.shape
+    def forward(self, x: torch.Tensor, cache: Optional[dict] = None) -> torch.Tensor:
+        """x: [B, T, D] -> [B, T, D]"""
+        x_main, x_gate = self.in_proj(x).chunk(2, dim=-1)              # 各 [B, T, d_inner]
 
-        # 1) 一次投影出 main 与 gate
-        x_and_gate = self.in_proj(x)                                  # [B, T, 2*d_inner]
-        x_main, x_gate = x_and_gate.chunk(2, dim=-1)                  # each [B, T, d_inner]
+        x_main = x_main.transpose(1, 2)                                # [B, d_inner, T]
+        if cache and "conv" in cache:
+            x_main = torch.cat([cache["conv"], x_main], dim=2)         # 左边接上一步留下的窗口
+        else:
+            x_main = F.pad(x_main, (self.d_conv - 1, 0))               # 左填 0 ⇒ 只看过去
+        if cache is not None:
+            cache["conv"] = x_main[:, :, x_main.size(2) - (self.d_conv - 1):]  # [B, d_inner, d_conv-1]
+        # depthwise conv = 每通道对最近 d_conv 个输入加权求和。等价于 self.conv1d(x_main),
+        # 但 CPU 上 grouped conv 是逐组循环 (实测占前向 90% 时间), 所以直接用 unfold 写出来
+        win = x_main.unfold(2, self.d_conv, 1)                         # [B, d_inner, T, d_conv]
+        x_main = (win * self.conv1d.weight[:, 0, None, :]).sum(-1) + self.conv1d.bias[:, None]
+        x_main = F.silu(x_main.transpose(1, 2))                        # [B, T, d_inner]
 
-        # 2) Conv1d 需要 [B, C, T]; 卷积后做因果裁剪 (去掉右侧 padding)
-        x_main = x_main.transpose(1, 2)                               # [B, d_inner, T]
-        x_main = self.conv1d(x_main)[:, :, :T]                        # 因果: 只保留前 T 步
-        x_main = x_main.transpose(1, 2)                               # [B, T, d_inner]
-        x_main = F.silu(x_main)
-
-        # 3) Selective SSM 做时间建模
-        x_main = self.ssm(x_main)                                     # [B, T, d_inner]
-
-        # 4) gate 分支 + 门控乘
-        y = x_main * F.silu(x_gate)
-
-        # 5) 降回 d_model
-        return self.out_proj(y)
+        y = self.ssm(x_main, cache=cache) * F.silu(x_gate)             # [B, T, d_inner]
+        return self.out_proj(y)                                        # [B, T, D]
 
 
 class MambaBlock(nn.Module):
-    """
-    标准 Mamba block: Pre-RMSNorm + MambaLayer + 残差
+    """x + MambaLayer(RMSNorm(x))"""
 
-    数据流 (无 FFN, 无 attention):
-        x -> RMSNorm -> MambaLayer -> Add
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        d_inner: Optional[int] = None,
-        d_state: int = 16,
-        d_conv: int = 4,
-    ):
+    def __init__(self, d_model: int, d_inner: Optional[int] = None, d_state: int = 16, d_conv: int = 4):
         super().__init__()
         self.norm = RMSNorm(d_model)
-        self.layer = MambaLayer(
-            d_model=d_model, d_inner=d_inner, d_state=d_state, d_conv=d_conv,
-        )
+        self.layer = MambaLayer(d_model=d_model, d_inner=d_inner, d_state=d_state, d_conv=d_conv)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.layer(self.norm(x))
+    def forward(self, x: torch.Tensor, cache: Optional[dict] = None) -> torch.Tensor:
+        return x + self.layer(self.norm(x), cache=cache)
 
 
-class Mamba(nn.Module):
-    """
-    Mamba 语言模型 (教学版)
+class Mamba(GenerationMixin, nn.Module):
+    """idx -> Embedding -> N × MambaBlock -> RMSNorm -> lm_head (与 embedding 共享权重)"""
 
-    架构:
-        idx -> TokenEmbed
-            -> N x MambaBlock (Pre-RMSNorm + MambaLayer)
-            -> RMSNorm
-            -> lm_head (weight tied)
-
-    无需因果 mask: SelectiveSSM 本身按时间 scan, 每步只读过去的状态,
-    天然因果; 相比 Transformer 少了一个 O(T^2) 掩码大矩阵。
-
-    Args:
-        vocab_size: 词表大小
-        d_model:    主干维度
-        num_layers: Mamba 层数 (等参数量下通常比 Transformer 多 2-3×)
-        d_state:    SSM 隐状态维度, 经验 16
-        d_conv:     conv 窗口大小, 经验 4
-    """
+    max_len = 1 << 30   # 无位置编码, 无上下文上限 (GenerationMixin 用它裁剪前缀)
 
     def __init__(
         self,
@@ -178,69 +92,24 @@ class Mamba(nn.Module):
         d_inner: Optional[int] = None,
     ):
         super().__init__()
-
         self.d_model = d_model
         self.token_embedding = nn.Embedding(vocab_size, d_model)
-        # Mamba 原实现: trunc_normal(std=0.02), 且 **不做** sqrt(d_model) 缩放
-        # 避免 SSM scan 输入量级过大导致训练前期数值不稳
-        nn.init.trunc_normal_(self.token_embedding.weight, std=0.02)
-
         self.layers = nn.ModuleList(
-            [
-                MambaBlock(
-                    d_model=d_model, d_inner=d_inner,
-                    d_state=d_state, d_conv=d_conv,
-                )
-                for _ in range(num_layers)
-            ]
+            [MambaBlock(d_model, d_inner=d_inner, d_state=d_state, d_conv=d_conv) for _ in range(num_layers)]
         )
         self.ln_f = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-        # Weight tying
-        self.lm_head.weight = self.token_embedding.weight
+        self.lm_head.weight = self.token_embedding.weight              # weight tying
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            idx: [B, T] token IDs
-        Returns:
-            logits: [B, T, vocab_size]
-        """
-        # Mamba 不乘 sqrt(d_model): 原论文做法, SSM 对输入量级敏感, 保持小 std 更稳
-        x = self.token_embedding(idx)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.ln_f(x)
-        return self.lm_head(x)
+        init_weights(self)                       # Linear/Embedding -> N(0, 0.02²) ⇒ 初始 CE ≈ ln V
+        for blk in self.layers:                  # init_weights 会清零 dt_proj.bias, Δ 的专用初始化要补回来
+            blk.layer.ssm.reset_dt()
 
-    @torch.inference_mode()
-    def generate(
-        self,
-        idx: torch.Tensor,
-        max_new_tokens: int,
-        temperature: float = 1.0,
-        do_sample: bool = True,
-    ) -> torch.Tensor:
-        """朴素生成 (每步重算, 无 SSM 状态缓存); Mamba 真实部署会滚动缓存 h_t。
-
-        教学注意: 随机初始化 + 纯 Python scan 可能让早期训练前的 logits 出现 nan,
-        这里做 nan → 均匀分布的兜底, 让演示不至于崩。"""
-        self.eval()
-        for _ in range(max_new_tokens):
-            logits = self(idx)
-            logits = logits[:, -1, :] / max(temperature, 1e-6)
-
-            # 数值安全: 任何 nan / inf 用 0 替换 (softmax 会把它们摊到均匀采样)
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
-
-            if do_sample:
-                probs = F.softmax(logits, dim=-1)
-                # 若 softmax 仍全 0 (极端情形), 退化到 argmax
-                if probs.sum().item() == 0:
-                    idx_next = logits.argmax(dim=-1, keepdim=True)
-                else:
-                    idx_next = torch.multinomial(probs, num_samples=1)
-            else:
-                idx_next = logits.argmax(dim=-1, keepdim=True)
-            idx = torch.cat([idx, idx_next], dim=1)
-        return idx
+    def forward(self, idx: torch.Tensor, cache: Optional[KVCache] = None) -> torch.Tensor:
+        """idx: [B, T] -> logits [B, T, V]。cache 里存的是递推状态而不是 K/V, 大小与已读长度无关。"""
+        x = self.token_embedding(idx)            # [B, T, D]; 不乘 sqrt(D): 没有位置编码要与之平衡
+        for i, layer in enumerate(self.layers):
+            x = layer(x, cache=cache.layers[i] if cache else None)
+        if cache is not None:
+            cache.pos += idx.size(1)
+        return self.lm_head(self.ln_f(x))        # [B, T, V]

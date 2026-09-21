@@ -1,21 +1,15 @@
 """
-Video DiT — Sora-lite 教学版
+Video DiT — 把 DiT 从图像搬到视频 (Sora / HunyuanVideo / CogVideoX / Wan 的骨架), 教学版
 
-论文出处:
-    "Video generation models as world simulators" (OpenAI Sora, 2024)
-    "HunyuanVideo" / "CogVideoX" / "Wan 2.2" 等开源视频 DiT
+与 Image DiT 只有两处不同:
+  1) spacetime patch: Conv3d 把 [B, C, T, H, W] 切成 tubelet (p_t, p, p),
+     token 数 N = (T/p_t)·(H/p)·(W/p) —— 视频的算力瓶颈就在这个 N 上 (注意力 O(N²))
+  2) 位置嵌入要覆盖 3D 网格: 这里用 time_pos[T'] + space_pos[H'W'] 广播相加,
+     参数量 T'+H'W' 而不是 T'·H'W'
+adaLN-Zero / FinalLayer / CFG / 训练目标 与 Image DiT 完全相同。
 
-核心设计 (与 Image DiT 的差异):
-    1) 输入张量是 [B, C, T, H, W] 的 5D 视频 latent (来自 Causal 3D VAE)
-    2) **Spacetime Patches**: 用 3D patchify (同 PatchEmbed3D), 把时空体积切块:
-         tubelet = (p_t, p_h, p_w), token 数 = (T/p_t) * (H/p_h) * (W/p_w)
-    3) 位置嵌入需要覆盖 3D 网格 — 本实现用 (temporal × spatial) 可学习嵌入的外积和
-    4) 其余 (adaLN-Zero, 条件注入, FinalLayer) 完全复用 Image DiT 的机制
-
-本教学版简化:
-    - 用自注意力统一处理所有时空 token (O(N²)); Sora 实际会做 spatial/temporal 分离
-    - 不含文本条件, 仅支持 timestep + 可选类别 (概念等价)
-    - 训练目标与 Image DiT 一致 (ε-pred 或 velocity-pred)
+简化: 全时空 token 做一次完整自注意力 (真实系统常拆成 spatial + temporal 两次); 无文本条件。
+读代码时盯住: forward 里 pos 的广播形状, 以及 unpatchify 的 8 维 permute。
 """
 
 from typing import Optional, Tuple
@@ -29,11 +23,7 @@ from llm_models.layers.core.feedforward import GeLUFeedForward
 
 
 class Patchify3D(nn.Module):
-    """
-    [B, C, T, H, W] -> [B, N, D] via Conv3d(kernel=stride=(p_t, p_h, p_w))
-
-    与 PatchEmbed3D 几乎相同, 但 DiT 里不做形状校验, 允许任意 T/H/W 输入。
-    """
+    """[B, C, T, H, W] → Conv3d(kernel=stride=(p_t, p, p)) → [B, N, D], 同时返回网格 (T', H', W')。"""
 
     def __init__(
         self,
@@ -156,8 +146,7 @@ class VideoDiT(nn.Module):
         p_hw = self.patch_size_hw
 
         x = x.view(B, T_grid, H_grid, W_grid, p_t, p_hw, p_hw, C)
-        # 按 [B, C, T, H, W] 的顺序重排
-        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
+        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()   # [B, C, T', p_t, H', p, W', p]
         return x.view(B, C, T_grid * p_t, H_grid * p_hw, W_grid * p_hw)
 
     def _make_condition(
@@ -180,7 +169,7 @@ class VideoDiT(nn.Module):
         """
         Args:
             x: [B, C, T, H, W] 含噪视频 latent
-            t: [B] timestep
+            t: [B] timestep, [0, 1000) 量纲 (AddNoiseResult.t_norm)
             y: [B] 类别 (可选)
         Returns:
             [B, C, T, H, W] 预测的 ε 或 velocity

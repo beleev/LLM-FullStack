@@ -50,7 +50,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from llm_infer.core.utils import softmax, rms_norm, silu, causal_mask
+from llm_infer.core.utils import rms_norm, silu, dense_attention
 
 
 # --------------------------------------------------------------------- #
@@ -103,7 +103,7 @@ def init_weights(cfg: ModelConfig, seed: int = 42) -> ModelWeights:
     def rand(shape):
         # 简化的 xavier: std = 1/sqrt(fan_in)
         fan_in = shape[0]
-        return rs.randn(*shape).astype(np.float32) * (1.0 / np.sqrt(fan_in))
+        return rs.randn(*shape).astype(np.float32) * fan_in ** -0.5   # python float: 保持 fp32 (np.sqrt 标量会升成 fp64)
 
     layers = []
     for _ in range(N):
@@ -139,11 +139,18 @@ def precompute_rope(d: int, max_t: int, base: float = 10000.0) -> Tuple[np.ndarr
     return np.cos(freqs), np.sin(freqs)
 
 
-def apply_rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray, start_pos: int = 0) -> np.ndarray:
-    """对 x 应用 RoPE。x: (T, D) 或 (T, n_head, head_dim)。"""
+def apply_rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray, start_pos: int = 0,
+               positions: Optional[np.ndarray] = None) -> np.ndarray:
+    """对 x 应用 RoPE。x: (T, D) 或 (T, n_head, head_dim)。
+
+    默认位置 = start_pos..start_pos+T-1; 传 positions (T,) 可任意指定
+    (树形投机: 同深度节点共享位置; attention sink: cache 内重编号)。
+    """
     t = x.shape[0]
-    c = cos[start_pos:start_pos + t]   # (T, d/2)
-    s = sin[start_pos:start_pos + t]
+    if positions is None:
+        positions = np.arange(start_pos, start_pos + t)
+    c = cos[positions]                 # (T, d/2)
+    s = sin[positions]
     # 把最后一维 D 切成两半: x = [x1 ; x2], 各 d/2
     x1, x2 = np.split(x, 2, axis=-1)
     # 旋转: [x1, x2] → [x1*cos - x2*sin, x1*sin + x2*cos]
@@ -164,6 +171,8 @@ def attn_forward(
     cos: np.ndarray, sin: np.ndarray,
     kv_cache: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     start_pos: int = 0,
+    positions: Optional[np.ndarray] = None,   # (T_q,) 自定义 RoPE 位置
+    mask: Optional[np.ndarray] = None,        # (T_q, T_k) 加性 mask, None=因果
 ) -> Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
     """单头注意力 + RoPE + KV cache。
 
@@ -178,8 +187,8 @@ def attn_forward(
     v = x @ layer.wv
 
     # 2) RoPE 加在 Q / K 上 (V 不加)
-    q = apply_rope(q, cos, sin, start_pos=start_pos)
-    k = apply_rope(k, cos, sin, start_pos=start_pos)
+    q = apply_rope(q, cos, sin, start_pos, positions)
+    k = apply_rope(k, cos, sin, start_pos, positions)
 
     # 3) 拼接历史 KV
     if kv_cache is not None:
@@ -189,12 +198,8 @@ def attn_forward(
     else:
         K, V = k, v
 
-    # 4) 注意力分数 + 因果 mask + softmax
-    d = q.shape[-1]
-    scores = (q @ K.T) / np.sqrt(d)        # (T_q, T_k)
-    mask = causal_mask(q.shape[0], K.shape[0])
-    attn = softmax(scores + mask, axis=-1)
-    out = attn @ V                          # (T_q, D)
+    # 4) softmax(qKᵀ/√d + mask)·V, (T_q, T_k) 分数矩阵只在这里出现
+    out = dense_attention(q, K, V, mask)    # (T_q, D)
 
     # 5) 输出投影
     out = out @ layer.wo
@@ -214,11 +219,13 @@ def block_forward(
     cos: np.ndarray, sin: np.ndarray,
     kv_cache: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     start_pos: int = 0,
+    positions: Optional[np.ndarray] = None,
+    mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
     """PreLN 风格: norm → sublayer → residual"""
     # attention sublayer
     h = rms_norm(x, layer.norm1_g)
-    h, new_kv = attn_forward(h, layer, cos, sin, kv_cache, start_pos)
+    h, new_kv = attn_forward(h, layer, cos, sin, kv_cache, start_pos, positions, mask)
     x = x + h
     # mlp sublayer
     h = rms_norm(x, layer.norm2_g)
@@ -244,23 +251,37 @@ class TinyLM:
         self.cos, self.sin = precompute_rope(cfg.d_model, cfg.max_seq_len, cfg.rope_base)
 
     # ------------------------------------------------------------- #
-    # prefill: 一次处理整段 prompt                                  #
+    # forward: 通用前向 — prefill / decode / chunked / 投机验证 都是它  #
     # ------------------------------------------------------------- #
+
+    def forward(
+        self,
+        ids: np.ndarray,                                  # (T,) 本次新喂的 token
+        kv_cache: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+        positions: Optional[np.ndarray] = None,           # (T,) 自定义 RoPE 位置 (树形投机)
+        mask: Optional[np.ndarray] = None,                # (T, ctx+T) 自定义加性 mask
+        return_hidden: bool = False,
+    ):
+        """在已有 KV (长度 ctx) 之后再算 T 个 token → (logits (T, V), 新 kv_cache)。
+
+        ctx=0 即 prefill; T=1 即 decode; T>1 且 ctx>0 即 chunked prefill / 投机验证。
+        return_hidden=True 时额外返回最后一层 norm 后的 hidden (T, D) (EAGLE 要用)。
+        """
+        ids = np.atleast_1d(np.asarray(ids, dtype=np.int64))
+        x = self.w.tok_emb[ids]                           # (T, D)
+        start = 0 if kv_cache is None else kv_cache[0][0].shape[0]
+        new_kv = []
+        for li, layer in enumerate(self.w.layers):
+            kv = None if kv_cache is None else kv_cache[li]
+            x, kv = block_forward(x, layer, self.cos, self.sin, kv, start, positions, mask)
+            new_kv.append(kv)
+        h = rms_norm(x, self.w.norm_f_g)                  # (T, D)
+        logits = h @ self.w.lm_head                       # (T, V)
+        return (logits, new_kv, h) if return_hidden else (logits, new_kv)
 
     def prefill(self, ids: np.ndarray) -> Tuple[np.ndarray, List[Tuple[np.ndarray, np.ndarray]]]:
         """ids: (T,) int → (logits (T, V), kv_cache list)"""
-        x = self.w.tok_emb[ids]                  # (T, D)
-        kv_cache = []
-        for layer in self.w.layers:
-            x, kv = block_forward(x, layer, self.cos, self.sin, None, start_pos=0)
-            kv_cache.append(kv)
-        x = rms_norm(x, self.w.norm_f_g)
-        logits = x @ self.w.lm_head              # (T, V)
-        return logits, kv_cache
-
-    # ------------------------------------------------------------- #
-    # decode_step: 单步, 拼接到已有 KV                              #
-    # ------------------------------------------------------------- #
+        return self.forward(ids)
 
     def decode_step(
         self,
@@ -268,15 +289,8 @@ class TinyLM:
         kv_cache: List[Tuple[np.ndarray, np.ndarray]],
     ) -> Tuple[np.ndarray, List[Tuple[np.ndarray, np.ndarray]]]:
         """token_id 单个 → (logits (V,), updated kv_cache)"""
-        x = self.w.tok_emb[np.array([token_id])]  # (1, D)
-        start = kv_cache[0][0].shape[0]            # 当前 context 长度
-        new_kv = []
-        for layer, kv in zip(self.w.layers, kv_cache):
-            x, kv_new = block_forward(x, layer, self.cos, self.sin, kv, start_pos=start)
-            new_kv.append(kv_new)
-        x = rms_norm(x, self.w.norm_f_g)
-        logits = (x @ self.w.lm_head).squeeze(0)   # (V,)
-        return logits, new_kv
+        logits, new_kv = self.forward([token_id], kv_cache)
+        return logits[0], new_kv
 
     # ------------------------------------------------------------- #
     # 简易完整生成 (greedy), 仅做基线对比用                          #
@@ -292,6 +306,11 @@ class TinyLM:
             next_id = int(np.argmax(logits))
             out_ids.append(next_id)
         return out_ids
+
+
+def truncate_kv(kv_cache: List[Tuple[np.ndarray, np.ndarray]], n: int):
+    """KV 回滚: 只保留前 n 个 token (投机解码拒绝 draft 后用, 省掉重新 prefill)。"""
+    return [(K[:n], V[:n]) for K, V in kv_cache]
 
 
 if __name__ == "__main__":

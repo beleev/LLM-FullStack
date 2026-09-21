@@ -1,76 +1,54 @@
 #!/usr/bin/env python
 """
-LLaMA SFT (全参监督微调) 示例
-==================================
+SFT: 在 "反转 prompt" 任务上全参微调, 用**留出集** exact-match 验收; 顺带复现 prompt-mask 差一位的后果。
 
-教学目标:
-    - 演示 SFT 与预训练在 **数据形态** 上的唯一差异: prompt 段 label = -100
-    - 复用 ``llm_models.training.Trainer`` 的训练循环, 把 finetune 视为
-      "新 LossComputer + 新 DataGenerator", 体现策略模式的扩展性
-    - 验证 loss 单调下降, 证明 SFT 通路可工作
-
-运行:
     python -m llm_finetune.run_finetune.sft.train_sft
 """
 
+import math
+
 import torch
 
-from llm_models.models.language_models.llama import LLaMA
-from llm_models.training import Trainer, TrainingConfig
+from llm_finetune.data import InstructionDataGenerator, SeqTask
+from llm_finetune.methods.sft import SFTLoss
+from llm_finetune.run_finetune.common import fit, make_model
+from llm_finetune.utils import print_trainable_parameters
 
-from llm_finetune import (
-    SFTLoss,
-    InstructionDataGenerator,
-    print_trainable_parameters,
-)
+STEPS, LR = 600, 3e-3
+
+
+class OffByOneMask(InstructionDataGenerator):
+    """反面教材: 把 labels[:, :P] (而不是 [:, :P-1]) 置 -100 —— 第一个回复 token 从此没有监督。"""
+
+    def _sample(self):
+        batch = super()._sample()
+        batch["labels"][:, self.task.prompt_len - 1] = -100
+        return batch
 
 
 def main() -> None:
-    cfg = TrainingConfig(
-        learning_rate=3e-4,
-        batch_size=2,
-        seq_len=32,
-        num_steps=50,
-        warmup_steps=5,
-        log_interval=10,
-        seed=42,
-    )
-    torch.manual_seed(cfg.seed)
+    torch.manual_seed(0)
+    task = SeqTask("reverse")
 
-    # ---- 1) 构造 LLaMA Mini (CPU 友好规模) ----
-    vocab_size = 1000
-    model = LLaMA(
-        vocab_size=vocab_size,
-        d_model=256,
-        n_heads=4,
-        num_kv_heads=2,
-        num_layers=2,
-        max_len=128,
-        dropout=0.0,
-    )
+    model = make_model(task)
+    print_trainable_parameters(model, "SFT (全参)")
+    em_before = task.exact_match(model)
+    metrics = fit(model, InstructionDataGenerator(task), SFTLoss(), STEPS, LR)
+    em = task.exact_match(model)
 
-    # SFT 默认全参可训, 打印一行用于和后续 LoRA 示例对照
-    print_trainable_parameters(model, name="LLaMA-Mini SFT")
+    torch.manual_seed(0)
+    buggy = make_model(task)
+    fit(buggy, OffByOneMask(task), SFTLoss(), STEPS, LR, log_interval=STEPS)
+    em_buggy = task.exact_match(buggy)
 
-    # ---- 2) 数据 / Loss ----
-    # 区别于预训练的 DecoderOnlyDataGenerator: 这里 prompt 区 label = -100
-    data_gen = InstructionDataGenerator(
-        vocab_size=vocab_size,
-        batch_size=cfg.batch_size,
-        seq_len=cfg.seq_len,
-        prompt_len=cfg.seq_len // 2,  # 一半 prompt 一半 response
-        seed=cfg.seed,
-    )
-    loss_fn = SFTLoss()
+    first = metrics[0]["total_loss"]
+    print(f"初始 loss {first:.3f} (ln V = {math.log(task.vocab_size):.3f})")
+    print(f"留出集 exact-match: 训练前 {em_before:.3f} → 训练后 {em:.3f}")
+    print(f"prompt mask 多盖一位 (labels[:, :P]) 的同配置模型: exact-match {em_buggy:.3f}")
 
-    # ---- 3) 训练 ----
-    trainer = Trainer(model, cfg, data_gen, loss_fn)
-    metrics = trainer.train()
-
-    # ---- 4) 验证: loss 应当下降 ----
-    first, last = metrics[0]["total_loss"], metrics[-1]["total_loss"]
-    assert last < first, f"SFT loss 未下降: first={first:.4f}  last={last:.4f}"
-    print(f"\nSFT 通过: loss {first:.4f} → {last:.4f}")
+    assert abs(first - math.log(task.vocab_size)) < 0.5, "初始 loss 应 ≈ ln V"
+    assert em > 0.9, f"SFT 没学会任务: 留出集 exact-match {em:.3f}"
+    assert em_buggy < 0.5 < em, "差一位的 mask 应当让第一个回复 token 学不到"
 
 
 if __name__ == "__main__":

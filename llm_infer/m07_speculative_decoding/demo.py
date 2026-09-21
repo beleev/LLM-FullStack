@@ -1,260 +1,127 @@
 """
-m07 demo — Speculative Decoding (greedy + sampling 双版本)
-
-draft 与 target 用同一个 TinyLM 类, 但 draft 用更小的配置 (n_layer=1)
-模拟"便宜模型"。教学场景下两者其实输出无关 (随机权重), 但接受规则的
-逻辑流程完全正确。
-
-本 demo 提供两个变体:
-    - spec_decode_greedy : argmax 比对接受 (实现简单, 但只在 greedy 解码下等价)
-    - spec_decode_sampling: 标准 rejection sampling (Leviathan et al. 2023),
-                            保证最终采样分布与 target 单独采样严格相同
+m07 demo — 投机解码的两个承诺, 都用 assert 验:
+    [1][2] greedy: 输出与 target 单独 greedy 逐 token 相同, target 调用数更少
+    [3]    sampling: 输出分布 == target 单独采样的分布 (经验 TV / 卡方, 对照一个故意写错的规则)
+算法全部在 speculative.py; 这里只有实验。
 """
-
 from __future__ import annotations
 
-from typing import List, Tuple
+import time
 
 import numpy as np
 
-from llm_infer.core import ModelConfig, TinyLM
+from llm_infer.core import ModelConfig, TinyLM, softmax
 from llm_infer.core.utils import banner, kv
+from llm_infer.m07_speculative_decoding.speculative import (
+    ModelDrafter, make_draft, sample, speculative_decode)
 
 
-# --------------------------------------------------------------------- #
-# 工具                                                                  #
-# --------------------------------------------------------------------- #
-
-def _softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
-    """数值稳定的 softmax (按最后一维)。"""
-    if temperature != 1.0:
-        logits = logits / temperature
-    x = logits - np.max(logits, axis=-1, keepdims=True)
-    e = np.exp(x)
-    return e / np.sum(e, axis=-1, keepdims=True)
+def always_accept(d_tokens, d_probs, t_probs, rng):
+    """故意写错的接受规则: 不看 p_t/p_d, 全收 draft → 输出分布被 draft 污染。"""
+    return len(d_tokens), sample(t_probs[-1], rng)
 
 
-def _sample_categorical(probs: np.ndarray, rng: np.random.Generator) -> int:
-    """从离散分布采样一个 token id。"""
-    return int(rng.choice(probs.shape[-1], p=probs))
+def exact_marginals(target: TinyLM, prompt, n_new: int, temperature: float) -> np.ndarray:
+    """枚举所有前缀, 精确算出 target 采样时第 1..n_new 个新 token 的边缘分布 (n_new, V)。"""
+    V = target.cfg.vocab_size
+    marg = np.zeros((n_new, V))
+    prefixes = [((), 1.0)]
+    for d in range(n_new):
+        nxt = []
+        for pre, p_pre in prefixes:
+            logits, _ = target.forward(list(prompt) + list(pre))
+            p = softmax(logits[-1].astype(np.float64) / temperature)       # (V,)
+            marg[d] += p_pre * p
+            if d + 1 < n_new:
+                nxt += [(pre + (v,), p_pre * p[v]) for v in range(V)]
+        prefixes = nxt
+    return marg
 
 
-# --------------------------------------------------------------------- #
-# Baseline                                                              #
-# --------------------------------------------------------------------- #
-
-def baseline_greedy(target: TinyLM, prompt: np.ndarray, max_new: int) -> Tuple[List[int], int]:
-    """target 单独 greedy, 记录 forward 次数。"""
-    out = list(prompt)
-    n_calls = 0
-    logits, kv_t = target.prefill(prompt)
-    n_calls += 1
-    nxt = int(np.argmax(logits[-1]))
-    out.append(nxt)
-    for _ in range(max_new - 1):
-        logits, kv_t = target.decode_step(nxt, kv_t)
-        n_calls += 1
-        nxt = int(np.argmax(logits))
-        out.append(nxt)
-    return out, n_calls
+def plain_sampling(target: TinyLM, prompt, max_new: int, temperature: float, rng) -> list:
+    logits, cache = target.prefill(np.asarray(prompt))
+    out, logits = [], logits[-1]
+    for _ in range(max_new):
+        out.append(sample(softmax(logits.astype(np.float64) / temperature), rng))
+        logits, cache = target.decode_step(out[-1], cache)
+    return out
 
 
-# --------------------------------------------------------------------- #
-# 变体 A: greedy 比对 (实现最简, 仅在 temperature=0 时等价)             #
-# --------------------------------------------------------------------- #
+def tv_and_chi2(samples: np.ndarray, exact: np.ndarray):
+    """samples (N, n_new) int, exact (n_new, V) → 每个位置的 TV 距离与卡方统计量。"""
+    N, V = len(samples), exact.shape[1]
+    tv, chi2 = [], []
+    for d in range(exact.shape[0]):
+        obs = np.bincount(samples[:, d], minlength=V)
+        tv.append(0.5 * np.abs(obs / N - exact[d]).sum())
+        chi2.append(((obs - N * exact[d]) ** 2 / (N * exact[d])).sum())
+    return np.array(tv), np.array(chi2)
 
-def spec_decode_greedy(
-    target: TinyLM, draft: TinyLM, prompt: np.ndarray, max_new: int, K: int = 4
-) -> Tuple[List[int], int, List[int]]:
-    """Greedy 简化版 — argmax 比对一致就接受。
-
-    适用前提: 用户只想要 target 的 greedy 输出 (temperature=0)。
-    在 greedy 设定下, target 与 draft 都退化为 Dirac 分布, rejection 概率
-    min(1, p_target/p_draft) 退化为「token 是否相同」, 因此本变体与
-    rejection sampling 在 greedy 极限下等价。
-
-    若需要随机采样输出, 必须改用 spec_decode_sampling 才能保证分布正确。
-    """
-    confirmed = list(prompt)
-    target_calls = 0
-    accept_history: List[int] = []
-
-    while len(confirmed) - len(prompt) < max_new:
-        # 1) draft 出 K 个 token (从 confirmed 末尾开始)
-        d_logits, d_kv = draft.prefill(np.array(confirmed, dtype=np.int64))
-        d_tokens: List[int] = []
-        cur_logits = d_logits[-1]
-        for _ in range(K):
-            t = int(np.argmax(cur_logits))
-            d_tokens.append(t)
-            cur_logits, d_kv = draft.decode_step(t, d_kv)
-
-        # 2) target 一次 prefill (confirmed + d_tokens)
-        ext = confirmed + d_tokens
-        t_logits, _ = target.prefill(np.array(ext, dtype=np.int64))
-        target_calls += 1
-
-        # 3) 逐位 argmax 比对
-        n_accept = 0
-        base = len(confirmed) - 1
-        for i in range(K):
-            target_pred = int(np.argmax(t_logits[base + i]))
-            if target_pred == d_tokens[i]:
-                confirmed.append(d_tokens[i])
-                n_accept += 1
-            else:
-                confirmed.append(target_pred)
-                break
-        else:
-            # 全部接受, bonus +1
-            confirmed.append(int(np.argmax(t_logits[base + K])))
-        accept_history.append(n_accept)
-
-        if confirmed[-1] == 2:        # eos
-            break
-
-    out = confirmed[: len(prompt) + max_new]
-    return out, target_calls, accept_history
-
-
-# --------------------------------------------------------------------- #
-# 变体 B: 标准 rejection sampling (Leviathan et al. 2023, Algorithm 1) #
-# --------------------------------------------------------------------- #
-
-def spec_decode_sampling(
-    target: TinyLM,
-    draft: TinyLM,
-    prompt: np.ndarray,
-    max_new: int,
-    K: int = 4,
-    temperature: float = 1.0,
-    seed: int = 0,
-) -> Tuple[List[int], int, List[int]]:
-    """标准 speculative decoding 的随机采样版本。
-
-    与 greedy 比对的唯一区别在第 3 步:
-        - 对每个 draft token t_i, 计算 p_target(t_i) 和 p_draft(t_i)
-        - 以 min(1, p_target/p_draft) 概率接受
-        - 拒绝时, 从修正分布 max(0, p_target - p_draft) / Z 重采样
-    可证明: 最终输出 token 序列的分布严格等于 target 单独采样得到的分布
-            (Leviathan et al. 2023 引理 3.5)。
-    """
-    rng = np.random.default_rng(seed)
-    confirmed = list(prompt)
-    target_calls = 0
-    accept_history: List[int] = []
-
-    while len(confirmed) - len(prompt) < max_new:
-        # 1) draft 采样 K 个 token, 同时记录 draft 在每个位置的完整分布
-        d_logits, d_kv = draft.prefill(np.array(confirmed, dtype=np.int64))
-        d_tokens: List[int] = []
-        d_probs_list: List[np.ndarray] = []
-        cur_logits = d_logits[-1]
-        for _ in range(K):
-            p_d = _softmax(cur_logits, temperature)
-            t = _sample_categorical(p_d, rng)
-            d_tokens.append(t)
-            d_probs_list.append(p_d)
-            cur_logits, d_kv = draft.decode_step(t, d_kv)
-
-        # 2) target 一次 prefill 拿到 K+1 个位置的 logits
-        ext = confirmed + d_tokens
-        t_logits, _ = target.prefill(np.array(ext, dtype=np.int64))
-        target_calls += 1
-
-        # 3) 逐位 rejection sampling
-        n_accept = 0
-        base = len(confirmed) - 1
-        rejected = False
-        for i in range(K):
-            p_target = _softmax(t_logits[base + i], temperature)
-            p_draft = d_probs_list[i]
-            t_i = d_tokens[i]
-            ratio = p_target[t_i] / max(p_draft[t_i], 1e-12)
-            accept_prob = min(1.0, float(ratio))
-            if rng.random() < accept_prob:
-                confirmed.append(t_i)
-                n_accept += 1
-            else:
-                # 从修正分布 max(0, p_target - p_draft) 重采样
-                residual = np.maximum(p_target - p_draft, 0.0)
-                Z = residual.sum()
-                if Z > 0:
-                    residual = residual / Z
-                    corrected = _sample_categorical(residual, rng)
-                else:
-                    # 罕见数值边界: 退化为直接采 target
-                    corrected = _sample_categorical(p_target, rng)
-                confirmed.append(corrected)
-                rejected = True
-                break
-
-        if not rejected:
-            # 全部接受, bonus 从 p_target 末位采样
-            p_bonus = _softmax(t_logits[base + K], temperature)
-            confirmed.append(_sample_categorical(p_bonus, rng))
-
-        accept_history.append(n_accept)
-        if confirmed[-1] == 2:        # eos
-            break
-
-    out = confirmed[: len(prompt) + max_new]
-    return out, target_calls, accept_history
-
-
-# --------------------------------------------------------------------- #
-# Demo                                                                  #
-# --------------------------------------------------------------------- #
 
 def main() -> None:
-    banner("M07 - Speculative Decoding (greedy + sampling)")
+    banner("M07 - Speculative Decoding (KV 回滚 + 分布无损检验)")
 
-    cfg_t = ModelConfig(d_model=64, d_mlp=128, n_layer=4, vocab_size=128)
-    target = TinyLM(cfg_t)
-    draft_same = target  # draft == target → 接受率 100%
-    draft_small = TinyLM(ModelConfig(d_model=64, d_mlp=128, n_layer=1, vocab_size=128))
-
+    target = TinyLM(ModelConfig(d_model=64, d_mlp=128, n_layer=4, vocab_size=128))
     prompt = np.array([1, 5, 10, 15, 20, 25], dtype=np.int64)
-    max_new = 32
+    max_new, K = 48, 4
+    ref = target.generate_greedy(prompt, max_new)         # baseline: max_new 次 target forward
 
-    # ---- [1] greedy 变体: argmax 比对 --------------------------------- #
-    print("\n[1] greedy 变体 (argmax 比对) — draft == target, 加速极限")
-    out_a, calls_a = baseline_greedy(target, prompt, max_new)
-    out_b, calls_b, accepts = spec_decode_greedy(target, draft_same, prompt, max_new, K=4)
-    kv("baseline ids", out_a)
-    kv("spec ids    ", out_b[: len(out_a)])
-    kv("一致?", out_a == out_b[: len(out_a)])
-    kv("baseline target_calls", calls_a)
-    kv("spec     target_calls", calls_b)
-    kv("加速 (按 target call 数)", f"{calls_a / calls_b:.2f}x")
-    kv("接受 token 数 / 轮", accepts)
+    print(f"\n[1][2] greedy, K={K}, 生成 {max_new} token (baseline target 调用 = {max_new})")
+    drafts = {
+        "draft == target (上限)": target,
+        "权重加噪 10% (模拟蒸馏 draft)": make_draft(target, noise=0.1),
+        "只用前 2 层 (LayerSkip 式)": make_draft(target, n_layer=2),
+        "独立随机 1 层小模型": TinyLM(ModelConfig(d_model=64, d_mlp=128, n_layer=1, vocab_size=128)),
+    }
+    calls_by_name = {}
+    for name, d in drafts.items():
+        drafter = ModelDrafter(d)
+        out, calls, acc = speculative_decode(target, drafter, prompt, max_new, K)
+        assert out == ref, f"{name}: greedy 投机输出必须与 target greedy 逐 token 相同"
+        assert calls == 1 + len(acc)                      # 1 次 prefill + 每轮 1 次验证
+        calls_by_name[name] = calls
+        kv(name, f"target 调用 {calls:>2} ({max_new / calls:.2f}x), 每轮接受 {np.mean(acc):.2f}/{K}, "
+                 f"draft 调用 {drafter.calls}")
+    print("  (加速按 target 调用数算; 没计 draft 自身开销 —— draft 越贵, 真实加速越打折)")
+    assert calls_by_name["draft == target (上限)"] == 1 + -(-(max_new - 1) // (K + 1))
+    assert calls_by_name["权重加噪 10% (模拟蒸馏 draft)"] < max_new
+    # 猜不中的 draft 每轮仍白送 1 个纠错 token → 调用数不超过 baseline + 1 (只亏 draft 开销)
+    assert calls_by_name["独立随机 1 层小模型"] <= max_new + 1
 
-    # ---- [2] greedy 变体: draft 是更小模型 ---------------------------- #
-    print("\n[2] greedy 变体 — draft 是更小模型 (n_layer=1), 接受率 < 100%")
-    out_c, calls_c, accepts_c = spec_decode_greedy(target, draft_small, prompt, max_new, K=4)
-    kv("spec ids (前 16)", out_c[:16])
-    kv("target_calls", calls_c)
-    kv("接受 token 数 / 轮", accepts_c)
-    avg_accept = sum(accepts_c) / len(accepts_c)
-    kv("平均接受 / K", f"{avg_accept:.2f} / 4 = {100 * avg_accept / 4:.0f}%")
+    print("\n[3] sampling: 投机采样的输出分布 == target 单独采样? (小词表便于精确枚举)")
+    tgt = TinyLM(ModelConfig(vocab_size=16, d_model=32, d_mlp=64, n_layer=2))
+    drf = make_draft(tgt, n_layer=1, noise=0.3)
+    p_small, n_new, K3, T, N = [1, 5, 9], 4, 2, 1.0, 2500
+    t0 = time.perf_counter()
+    exact = exact_marginals(tgt, p_small, n_new, T)       # (4, 16), 枚举 1+16+256+4096 个前缀
+    rng = np.random.default_rng(0)
+    runs = {"plain target 采样": [], "投机采样 (min(1,p_t/p_d)+残差)": [], "错误规则: 全收 draft": []}
+    acc_all = []
+    for _ in range(N):
+        runs["plain target 采样"].append(plain_sampling(tgt, p_small, n_new, T, rng))
+        out, _, acc = speculative_decode(tgt, ModelDrafter(drf), p_small, n_new, K3, T, rng)
+        runs["投机采样 (min(1,p_t/p_d)+残差)"].append(out[len(p_small):])
+        acc_all += acc
+        out, _, _ = speculative_decode(tgt, ModelDrafter(drf), p_small, n_new, K3, T, rng,
+                                       accept=always_accept)
+        runs["错误规则: 全收 draft"].append(out[len(p_small):])
+    kv("设置", f"V=16, T={T}, K={K3}, N={N} 条 × {n_new} token, 每轮接受 {np.mean(acc_all):.2f}/{K3}")
+    res = {}
+    for name, s in runs.items():
+        res[name] = tv_and_chi2(np.array(s), exact)
+        kv(name, "TV " + " ".join(f"{x:.3f}" for x in res[name][0])
+           + " | χ² " + " ".join(f"{x:5.1f}" for x in res[name][1]))
+    kv("耗时", f"{time.perf_counter() - t0:.1f} s  (第 1 个 token 来自 prefill, 第 2~4 个走接受/残差/bonus)")
 
-    # ---- [3] sampling 变体: 标准 rejection sampling ------------------- #
-    print("\n[3] sampling 变体 (rejection sampling) — 保证分布正确性")
-    out_d, calls_d, accepts_d = spec_decode_sampling(
-        target, draft_small, prompt, max_new, K=4, temperature=1.0, seed=42
-    )
-    kv("spec ids (前 16)", out_d[:16])
-    kv("target_calls", calls_d)
-    kv("接受 token 数 / 轮", accepts_d)
-    avg_accept_s = sum(accepts_d) / len(accepts_d)
-    kv("平均接受 / K", f"{avg_accept_s:.2f} / 4 = {100 * avg_accept_s / 4:.0f}%")
-
-    print(
-        "\n  关键差异:"
-        "\n    greedy 变体  : 仅在 temperature=0 时与 target 一致, 实现最简"
-        "\n    sampling 变体: 输出分布严格等于 target 单独采样 (论文核心保证)"
-        "\n  真实 vLLM 实现走 sampling 路径, draft 用蒸馏小模型时典型接受率 60-80%。"
-    )
+    CHI2_CRIT = 37.70                                      # χ²(df=15) 的 99.9% 分位
+    tv_plain, _ = res["plain target 采样"]
+    tv_spec, chi_spec = res["投机采样 (min(1,p_t/p_d)+残差)"]
+    tv_bad, chi_bad = res["错误规则: 全收 draft"]
+    assert (chi_spec < CHI2_CRIT).all(), "投机采样的边缘分布应与精确 target 分布无法区分"
+    assert (tv_spec < 2 * tv_plain.max()).all(), "TV 应与同样 N 的 plain 采样噪声同量级"
+    assert chi_bad[1:].max() > 10 * CHI2_CRIT and tv_bad[1:].max() > 3 * tv_plain.max(), \
+        "全收 draft 的错误规则必须被同一个检验抓出来"
+    print("  ✓ 投机采样通过 (χ² < 37.7, TV ≈ 采样噪声); 错误规则在同一检验下被抓出")
 
 
 if __name__ == "__main__":

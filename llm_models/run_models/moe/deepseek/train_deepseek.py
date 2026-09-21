@@ -1,84 +1,82 @@
 #!/usr/bin/env python
 """
-DeepSeek-V3 (MoE) 训练示例
+DeepSeek-V3 训练示例 — 重点演示 aux-loss-free 负载均衡
 
-演示使用通用 Trainer 训练 DeepSeek-V3 MoE 模型。
-使用合成数据 + MoE 专用损失 (LM loss + 辅助负载均衡 loss)。
+同一个种子训两遍 (router 故意初始化得偏心), 唯一区别是每步之后调不调
+    model.update_routing_bias(routing_info, gamma)      # bias_i += γ·sign(mean_load − load_i)
+aux_loss_weight = 0: 均衡完全靠 bias, LM loss 的梯度不被任何辅助 loss 打扰 (aux_loss 仅作监控打印)。
 
-为什么需要辅助 loss（auxiliary load-balancing loss）：
-- MoE 的 router 容易"塌缩"——所有 token 都被路由到少数几个专家，
-  导致其他专家训不到、参数浪费
-- 辅助 loss 鼓励 token 均匀分配到各路由专家，缓解负载不均衡
-- 总 loss = lm_loss + aux_loss_weight * aux_loss
-  aux_loss_weight 通常很小（如 0.01），避免压过主任务
-
-合成数据：随机 token id 序列，仅用于跑通流程并验证 loss 能下降。
+断言: ① 初始 lm_loss ≈ ln V  ② loss 下降  ③ 开 bias 的负载变异系数 CV 明显更低  ④ 两次的 lm_loss 几乎一样。
+数据: 固定的一个随机 batch —— "loss 下降" 只说明模型能背下这个 batch。
 """
 
+import math
+
 import torch
-from llm_models.models import DeepSeekV3
-from llm_models.training import (
-    Trainer,
-    TrainingConfig,
-    MoELMLoss,
-    DecoderOnlyDataGenerator,
-)
+
+from llm_models.models.moe.deepseekV3 import DeepSeekV3
+from llm_models.training import DecoderOnlyDataGenerator, MoELMLoss, Trainer, TrainingConfig
+
+VOCAB, STEPS = 1000, 100
+
+
+class _KeepRouting(MoELMLoss):
+    """Trainer 不把模型输出交还给调用者, 这里顺手留一份 routing_info 给 bias 更新用。"""
+
+    def compute(self, model_output, labels, **kwargs):
+        self.routing_info = model_output[1]
+        return super().compute(model_output, labels, **kwargs)
+
+
+def train(gamma: float):
+    config = TrainingConfig(
+        learning_rate=3e-4, batch_size=4, seq_len=32, num_steps=STEPS,
+        warmup_steps=5, aux_loss_weight=0.0, log_interval=25, seed=42,
+    )
+    torch.manual_seed(config.seed)
+    model = DeepSeekV3(
+        vocab_size=VOCAB, d_model=128, n_heads=4, num_layers=2, max_len=64,
+        num_shared_experts=1, num_routed_experts=8, top_k=2,
+        latent_dim=32, qk_rope_head_dim=16, dropout=0.0,
+    )
+    with torch.no_grad():  # 偏心的 router: 专家 0/1 的打分被放大 4 倍, 模拟路由开始坍塌
+        for layer in model.layers:
+            layer.moe.router.weight[:2] *= 4
+
+    data_gen = DecoderOnlyDataGenerator(vocab_size=VOCAB, batch_size=config.batch_size, seq_len=config.seq_len)
+    loss_fn = _KeepRouting(aux_loss_weight=config.aux_loss_weight)
+    trainer = Trainer(model, config, data_gen, loss_fn)
+
+    lm_losses, cvs = [], []
+    for step in range(1, STEPS + 1):
+        metrics = trainer.train_step()
+        # optimizer.step() 之后、下一次 forward 之前更新 bias; gamma=0 时只统计 load
+        load = model.update_routing_bias(loss_fn.routing_info, gamma=gamma)  # [L, E]
+        cv = (load.std(dim=1) / load.mean(dim=1)).mean().item()              # 变异系数, 0 = 完全均衡
+        lm_losses.append(metrics["lm_loss"].item())
+        cvs.append(cv)
+        if step == 1 or step % config.log_interval == 0:
+            print(f"  step {step:>3d} | lm_loss {lm_losses[-1]:.4f} | aux(监控) {metrics['aux_loss'].item():.3f} "
+                  f"| load CV {cv:.3f} | layer0 load {load[0].int().tolist()}")
+    return model, lm_losses, sum(cvs[-20:]) / 20
 
 
 def main():
-    # --- 训练配置 ---
-    # 全部为极小值，可在 CPU 上几秒内跑完，仅做流程验证
-    config = TrainingConfig(
-        learning_rate=3e-4,
-        batch_size=2,
-        seq_len=32,
-        num_steps=50,
-        warmup_steps=5,             # 学习率 warmup，前 5 步线性升温
-        aux_loss_weight=0.01,       # 辅助负载均衡 loss 权重
-        log_interval=10,
-        seed=42,
-    )
-    torch.manual_seed(config.seed)
+    print("--- 不更新 bias (gamma=0) ---")
+    _, loss_off, cv_off = train(gamma=0.0)
+    print("--- aux-loss-free bias 更新 (gamma=1e-3) ---")
+    model, loss_on, cv_on = train(gamma=1e-3)
 
-    # --- 模型配置 (MoE-Mini) ---
-    vocab_size = 1000
-    model = DeepSeekV3(
-        vocab_size=vocab_size,
-        d_model=256,
-        n_heads=4,
-        num_layers=2,
-        max_len=128,
-        num_shared_experts=1,       # 1 个共享专家（始终激活）
-        num_routed_experts=4,       # 4 个路由专家
-        top_k=2,                    # 每 token 选 top-2 路由专家
-        dropout=0.1,
-    )
+    info = model.get_num_active_params()
+    print(f"\n总参数 {info['total_params']:,} | 每 token 激活 {info['active_params']:,}")
+    print(f"初始 lm_loss {loss_on[0]:.4f} (ln V = {math.log(VOCAB):.4f}) → 最终 {loss_on[-1]:.4f}")
+    print(f"最后 20 步平均 load CV: 无 bias {cv_off:.3f}  vs  有 bias {cv_on:.3f}")
+    print(f"layer0 routing_bias: {[round(b, 3) for b in model.layers[0].moe.routing_bias.tolist()]}")
 
-    # MoE 模型的关键观察指标：总参数 vs 单 token 实际激活参数
-    param_info = model.get_num_active_params()
-    print(f"DeepSeek-V3 Mini | 总参数: {param_info['total_params']:,} | "
-          f"激活参数: {param_info['active_params']:,}")
-
-    # --- 数据生成器 + MoE 损失函数 ---
-    # 合成数据：每步采样随机 token id；输入和 label 错位 1（next-token prediction）
-    data_gen = DecoderOnlyDataGenerator(
-        vocab_size=vocab_size,
-        batch_size=config.batch_size,
-        seq_len=config.seq_len,
-    )
-    # MoELMLoss 会从模型输出中提取 routing_info，计算辅助负载均衡 loss
-    loss_fn = MoELMLoss(aux_loss_weight=config.aux_loss_weight)
-
-    # --- 训练 ---
-    trainer = Trainer(model, config, data_gen, loss_fn)
-    metrics = trainer.train()
-
-    # --- 验证 ---
-    # 最简单的训练有效性检查：最终 loss 应小于初始 loss
-    assert metrics[-1]["total_loss"] < metrics[0]["total_loss"], "Loss 未下降!"
-    print(f"最终 lm_loss: {metrics[-1]['lm_loss']:.4f} | "
-          f"aux_loss: {metrics[-1]['aux_loss']:.4f}")
-    print("DeepSeek-V3 训练验证通过!")
+    assert abs(loss_on[0] - math.log(VOCAB)) < 0.5, "初始 loss 应 ≈ ln V (init_weights 失效?)"
+    assert loss_on[-1] < loss_on[0] - 1.0, "loss 未下降"
+    assert cv_on < 0.7 * cv_off, "bias 更新没有让负载更均衡"
+    assert abs(loss_on[-1] - loss_off[-1]) < 0.1, "bias 只改路由选择, 不应明显影响 LM loss"
 
 
 if __name__ == "__main__":

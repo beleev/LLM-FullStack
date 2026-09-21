@@ -1,10 +1,10 @@
 <template>
   <div>
-    <h1 class="page-title">任务适配 · SFT / LoRA / DPO</h1>
+    <h1 class="page-title">任务适配 · 从 SFT / LoRA 到 DPO / GRPO / 蒸馏</h1>
     <p class="page-subtitle">
       微调的核心问题是: <strong>用尽量少的数据和算力, 把一个通用 base model 拨到具体任务上</strong>。
-      <RepoLink path="llm_finetune/" label="llm_finetune/" tiny /> 用三个最小可跑的实现, 串起从"全参 SFT"到
-      "PEFT (LoRA)"再到"无 RM 的偏好对齐 (DPO)"的完整脉络。
+      <RepoLink path="llm_finetune/" label="llm_finetune/" tiny /> 用一组最小可跑的实现串起完整脉络: 本页先讲三根主柱 —— 全参 SFT、PEFT (LoRA)、无 RM 的偏好对齐 (DPO);
+      QLoRA / DoRA、SimPO / ORPO、奖励模型、GRPO 及其变体 (DAPO · Dr.GRPO · GSPO)、离线与 on-policy 蒸馏各有专章, 每章都带可拖拽的实验台。
     </p>
 
     <ChapterIntro
@@ -21,8 +21,8 @@
         { path: 'llm_finetune/methods/dpo.py' },
         { path: 'llm_finetune/utils/param_utils.py' },
       ]"
-      :prereq="{ name: 'train-collectives-loop', label: '阶段 3.5 · 通信与 full_loop' }"
-      :next-step="{ name: 'finetune-sft', label: '阶段 4.1 · SFT 数据与 loss' }"
+      :prereq="prevChapter"
+      :next-step="{ name: 'finetune-sft', label: '下一章 · SFT 数据与 loss' }"
     />
 
     <!-- ── 1. 三阶段 alignment 总览 ───────────────────────────── -->
@@ -47,6 +47,8 @@
       <p class="lead">
         和预训练唯一的代码差别只有一行: 把 prompt 区域的 labels 改成
         <code class="inline">-100</code>, 让 cross-entropy 跳过这些位置。
+        这一行最容易写错的是边界: labels 已经左移一格, 所以要 mask 的是前 P−1 格而不是前 P 格 ——
+        <router-link :to="{ name: 'finetune-sft' }">SFT 一章的实验台</router-link>可以亲手把这个 off-by-one 点出来。
       </p>
 
       <div class="grid grid-2" style="gap: 16px;">
@@ -157,13 +159,21 @@
           <tbody>
             <tr><td>最小化</td><td class="mono">w_q, w_v</td><td class="muted">论文起点, 性能/参数比最优</td></tr>
             <tr class="hl"><td>推荐 (本仓库默认)</td><td class="mono">w_q, w_k, w_v, w_o</td><td class="muted">attention 全投影; 实战甜点</td></tr>
-            <tr><td>全注入</td><td class="mono">attn 全部 + ffn 全部</td><td class="muted">类 QLoRA, 极致效果但参数翻倍</td></tr>
+            <tr><td>全注入</td><td class="mono">attn 全部 + ffn 全部</td><td class="muted">QLoRA 论文的做法, 效果最好但 adapter 参数翻倍</td></tr>
           </tbody>
         </table>
         <p class="hint">
           <code class="inline">apply_lora</code> 用 <code class="inline">named_modules</code>
           匹配最后一段属性名 (例如 "w_q"), 与具体层路径无关 —
           所以同一份代码能注入到 LLaMA / Mistral / 任何沿用同名属性的模型。
+        </p>
+        <p class="hint">
+          LoRA 的两个直系后代各有专章:
+          <router-link :to="{ name: 'finetune-qlora' }">QLoRA</router-link>
+          把冻结的基座再压到 4 bit (NF4 分位数码本 + 每 block 一个 absmax scale, 约 4.5 bit/参数,
+          对应 <RepoLink path="llm_finetune/methods/qlora.py" label="llm_finetune/methods/qlora.py" tiny />);
+          <router-link :to="{ name: 'finetune-dora' }">DoRA</router-link>
+          把权重拆成"幅度 × 方向", 让低秩更新只管方向。
         </p>
       </div>
     </section>
@@ -255,18 +265,32 @@
       </div>
     </section>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav
-      :prev="{ name: 'train-collectives-loop', label: '阶段 3.5 · 通信与 full_loop', hint: '先理解训练系统如何组合成完整主循环' }"
-      :next="{ name: 'finetune-sft', label: '阶段 4.1 · SFT 数据与 loss', hint: '从数据和 labels mask 开始拆微调' }"
+      :prev="{ ...prevChapter, hint: '先理解训练系统如何组合成完整主循环' }"
+      :next="{ name: 'finetune-sft', label: '下一章 · SFT 数据与 loss', hint: '从数据和 labels mask 开始拆微调' }"
     />
   </div>
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import EvolutionChain from '@/components/EvolutionChain.vue'
 import RepoLink from '@/components/RepoLink.vue'
+import { learningPath } from '@/data/models.js'
+
+// 上一章从 learningPath 取, 不手写编号 (训练阶段加章后手写的 "3.5" 会过期; 与 Infer.vue 同一写法)
+const prevItem = learningPath[learningPath.findIndex((x) => x.route === 'finetune') - 1]
+const prevChapter = { name: prevItem.route, label: `上一章 · ${prevItem.label}` }
 
 const alignSteps = [
   { name: 'SFT',        year: '2022',
@@ -287,10 +311,10 @@ const alignSteps = [
     color: 'var(--accent)' },
 ]
 
-const sftLabels = `# 例:
-input  = [<bos>] [Q1] [Q2] [Q3] [A1] [A2] [<eos>]
-labels = [-100 ] [-100][-100][-100][A1] [A2] [<eos>]
-         ↑ prompt 全部忽略           ↑ 只对 response 算 loss
+const sftLabels = `# 例: x = [<bos>] [Q1] [Q2] [Q3] [A1] [A2] [<eos>], prompt 长 P = 4
+idx    = x[:-1] = [<bos>] [Q1]  [Q2]  [Q3] [A1] [A2]
+labels = x[1:]  = [-100 ] [-100][-100][A1] [A2] [<eos>]
+                   ↑ 只 mask 前 P-1 = 3 格  ↑ 看到 Q3 要预测 A1: 这一格必须留
 
 # pad 也置 -100`
 
@@ -377,6 +401,10 @@ const decisions = [
   { q: '只有 (问, 答) 数据, 显卡紧?',                a: 'LoRA SFT — 0.5% 参数, 适配器易切换' },
   { q: '已有 SFT 模型, 现在拿到 (chosen, rejected)?', a: 'DPO — 跳过 RM 与 PPO, 一行 loss' },
   { q: '想做风格 / 角色微调, 需要快速切换?',         a: 'LoRA — 多个适配器共享基座' },
+  { q: '连冻结的基座都放不进显存?',                  a: 'QLoRA — 基座 NF4 量化到约 4.5 bit/参数, 只训 adapter' },
+  { q: '偏好数据有了, 但不想多驻留一个 ref 模型?',    a: 'SimPO / ORPO — 无参考的偏好优化' },
+  { q: '答案能被程序判对错 (数学 / 代码)?',           a: 'GRPO 系 (DAPO · Dr.GRPO · GSPO) — 在线采样 + 可验证奖励' },
+  { q: '有一个强 teacher, 想把能力压进小模型?',       a: '蒸馏 — 离线软标签起步, on-policy 蒸馏收尾' },
 ]
 </script>
 

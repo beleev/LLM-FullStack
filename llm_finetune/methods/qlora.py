@@ -1,42 +1,27 @@
 """
-QLoRA — 4-bit NF4 量化基座 + LoRA 适配器 (Dettmers et al., 2023)
-================================================================
+QLoRA — 4-bit NF4 冻结基座 + 高精度 LoRA (Dettmers et al., 2023)
 
-历史背景:
-    LoRA 把"可训练参数"从 100% 砍到 <1%, 但**基座权重本身**仍以 16 位驻留显存
-    —— 65B 模型光权重就要 130GB, 单卡微调依然无门。
-    QLoRA 的洞见: 基座反正是冻结的, 只读不写, 那就把它压到 4 bit 存放;
-    LoRA 增量留在高精度。65B 微调从 780GB (全参) 压到 <48GB, 单卡可跑。
-
-三个关键设计 (本文件实现前两个):
-    1. **NF4 (4-bit NormalFloat)**: 神经网络权重近似 N(0, σ) 分布,
-       与其用均匀 INT4 网格, 不如把 16 个量化格点放在正态分布的分位数上
-       —— 每个格点"接住"等量的概率质量, 信息论意义上对正态数据最优。
-    2. **block-wise absmax scaling**: 每 64 个权重一组, 各自缩放到 [-1, 1]
-       再查 NF4 码本 (与 FP8 的 block scaling 同一思想, 见 llm_train/m13)。
-    3. double quantization / paged optimizer: 把 scale 本身再量化、优化器状态
-       分页到 CPU —— 工程优化, 教学版从略。
-
-存储真相 (本实现诚实地按 4 bit 打包):
-    两个 4-bit 索引拼进一个 uint8 → 每参数 0.5 字节 + 每 64 个参数一个
-    float32 scale (摊到每参数 0.0625 字节), 合计 ~0.56 字节/参数,
-    对比 FP32 的 4 字节/参数 ≈ **7.1x 压缩**。
-
-前向:
-    y = dequant(W_nf4) x + (alpha/r) · B A x
-    教学版每次前向都反量化 (可读优先); 真实 kernel 在 GPU 上融合反量化与 GEMM。
+是什么: 基座反正只读不写 → 压成 4 bit 存; 前向时反量化回高精度算, 梯度只流进 LoRA 支路。
+解决什么: LoRA 省掉了梯度和优化器状态, 但 16-bit 基座本身还在显存里 (65B ≈ 130 GB)。
+核心公式:  y = dequant(W_nf4) x + (α/r) B A x
+           NF4 = 把 16 个格点放在 N(0,1) 的等概率分位数上 (权重近似正态 → 每格接住等量的权重);
+           每 block_size 个权重共用一个 absmax scale。 存储 = 0.5 B/参数 + 4 B/block ≈ 0.56 B/参数 (vs fp32 的 4 B)。
+量化谁: 所有 block 内的线性层 (注意力 4 个 + SwiGLU 3 个, 占参数的绝大部分)。
+        embedding / lm_head 保持高精度: 二者共享权重; embedding 是查表不是 matmul, 每行只被少数 token 更新、
+        分布远非正态; lm_head 的误差直接变成 logits 误差。bitsandbytes 默认同样跳过它们。
+读代码时盯住: `NF4Linear.weight` —— 它是 property, 每次访问都现场反量化 (真实 kernel 把反量化融进 GEMM)。
+未实现: double quantization (把 scale 再量化) 与 paged optimizer。
 """
 
-from typing import List, Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from llm_finetune.methods.lora import DEFAULT_TARGET_MODULES, _name_matches
+from llm_finetune.methods.lora import ALL_LINEARS, LoRALinear, replace_linears
 
-# NF4 码本: 标准正态分布的 16 个等概率质量分位点, 归一化到 [-1, 1]
-# (bitsandbytes 论文附录公布的常数, 0 被显式保留为一个格点)
+# bitsandbytes 公布的 NF4 码本: 标准正态 16 个分位点, 归一化到 [-1, 1], 0 被显式保留
 NF4_CODEBOOK = torch.tensor([
     -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
     -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
@@ -46,123 +31,61 @@ NF4_CODEBOOK = torch.tensor([
 ])
 
 
-def nf4_quantize(
-    w: torch.Tensor, block_size: int = 64
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    把权重量化成 NF4: 返回 (packed_uint8 [N/2], scales [n_blocks])。
-
-    步骤: 按 block 切分 → absmax 缩放到 [-1,1] → 最近邻查码本 → 两索引拼一字节。
-    """
+def nf4_quantize(w: torch.Tensor, block_size: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+    """w → (packed uint8 [⌈N_pad/2⌉], scales [n_blocks])。N_pad = numel 向上对齐到 block_size。"""
     flat = w.detach().reshape(-1).float()
-    pad = (-flat.numel()) % block_size
-    if pad:
-        flat = torch.cat([flat, flat.new_zeros(pad)])
-    blocks = flat.view(-1, block_size)
-
-    scales = blocks.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)  # absmax
-    normed = blocks / scales                                          # ∈ [-1, 1]
-
-    # 最近邻量化: 与 16 个码点逐一比距离 (教学写法; 真实实现用二分)
-    idx = (normed.unsqueeze(-1) - NF4_CODEBOOK.to(w.device)).abs().argmin(dim=-1)
-    idx = idx.view(-1).to(torch.uint8)                                # [N_padded]
-
-    packed = (idx[0::2] << 4) | idx[1::2]                             # 两个 4bit 进一字节
-    return packed, scales.view(-1)
+    flat = F.pad(flat, (0, (-flat.numel()) % block_size))             # 末块补 0
+    blocks = flat.view(-1, block_size)                                # [n_blocks, bs]
+    scales = blocks.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)  # absmax → 归一化到 [-1, 1]
+    # 最近邻查码本: [n_blocks, bs, 1] − [16] → argmin (真实实现用二分)
+    idx = ((blocks / scales).unsqueeze(-1) - NF4_CODEBOOK.to(w.device)).abs().argmin(dim=-1)
+    idx = idx.view(-1).to(torch.uint8)                                # [N_pad]
+    if idx.numel() % 2:                                               # block_size 为奇数时 N_pad 可能是奇数:
+        idx = F.pad(idx, (0, 1))                                      # 补一个索引凑满最后一个字节
+    return (idx[0::2] << 4) | idx[1::2], scales.view(-1)              # 高 4 位 | 低 4 位
 
 
-def nf4_dequantize(
-    packed: torch.Tensor,
-    scales: torch.Tensor,
-    shape: torch.Size,
-    block_size: int = 64,
-) -> torch.Tensor:
-    """反量化: 拆包 → 查码本 → 乘回 block scale → reshape。"""
-    hi = (packed >> 4).long()
-    lo = (packed & 0x0F).long()
-    idx = torch.stack([hi, lo], dim=1).view(-1)                       # 还原交错顺序
-
-    codebook = NF4_CODEBOOK.to(packed.device)
-    flat = codebook[idx].view(-1, block_size) * scales.view(-1, 1)
-    numel = int(torch.tensor(shape).prod())
-    return flat.view(-1)[:numel].view(shape)
+def nf4_dequantize(packed: torch.Tensor, scales: torch.Tensor, shape: torch.Size,
+                   block_size: int = 64) -> torch.Tensor:
+    idx = torch.stack([packed >> 4, packed & 0x0F], dim=1).view(-1).long()   # 还原交错顺序
+    idx = idx[: scales.numel() * block_size]                          # 丢掉凑字节的那个索引
+    flat = NF4_CODEBOOK.to(packed.device)[idx].view(-1, block_size) * scales.view(-1, 1)
+    return flat.view(-1)[: shape.numel()].view(shape)                 # 丢掉末块补的 0
 
 
-class QLoRALinear(nn.Module):
-    """
-    NF4 量化的冻结基座 + 高精度 LoRA 旁路。
+class NF4Linear(nn.Module):
+    """冻结的 4-bit 线性层: 权重只以 buffer (uint8 + scale) 存在, 天然没有梯度。"""
 
-    基座以 buffer 形式存储 (packed uint8 + scales), **天然不可训练**;
-    只有 lora_A / lora_B 是 nn.Parameter。与 methods/lora.py 的 LoRALinear
-    接口对齐 (名字含 'lora_', mark_only_lora_as_trainable 同样适用)。
-    """
-
-    def __init__(
-        self,
-        base_layer: nn.Linear,
-        r: int = 8,
-        alpha: int = 16,
-        block_size: int = 64,
-    ) -> None:
+    def __init__(self, base: nn.Linear, block_size: int = 64) -> None:
         super().__init__()
-        self.in_features = base_layer.in_features
-        self.out_features = base_layer.out_features
-        self.block_size = block_size
-        self.weight_shape = base_layer.weight.shape
+        self.in_features, self.out_features = base.in_features, base.out_features
+        self.block_size, self.shape = block_size, base.weight.shape
+        packed, scales = nf4_quantize(base.weight, block_size)
+        self.register_buffer("packed_weight", packed)
+        self.register_buffer("scales", scales)
+        self.register_buffer("bias", None if base.bias is None else base.bias.detach().clone())
 
-        packed, scales = nf4_quantize(base_layer.weight, block_size)
-        self.register_buffer("packed_weight", packed)     # uint8, 0.5 B/参数
-        self.register_buffer("scales", scales)            # fp32, 1/block 个
-        # bias (若有) 很小, 保持高精度且冻结
-        if base_layer.bias is not None:
-            self.register_buffer("bias", base_layer.bias.detach().clone())
-        else:
-            self.bias = None
-
-        self.r = r
-        self.scaling = alpha / r
-        self.lora_A = nn.Parameter(torch.empty(r, self.in_features))
-        nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
-        self.lora_B = nn.Parameter(torch.zeros(self.out_features, r))  # BA=0 无害启动
-
-    def dequantized_weight(self) -> torch.Tensor:
-        return nf4_dequantize(
-            self.packed_weight, self.scales, self.weight_shape, self.block_size
-        )
+    @property
+    def weight(self) -> torch.Tensor:
+        return nf4_dequantize(self.packed_weight, self.scales, self.shape, self.block_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.dequantized_weight()                     # 教学版: 每次前向反量化
-        out = F.linear(x, w, self.bias)
-        out = out + self.scaling * F.linear(F.linear(x, self.lora_A), self.lora_B)
-        return out
-
-    def memory_bytes(self) -> dict:
-        """基座存储开销对账单: NF4 vs 原 FP32。"""
-        nf4 = self.packed_weight.numel() + self.scales.numel() * 4
-        fp32 = int(torch.tensor(self.weight_shape).prod()) * 4
-        return {"nf4_bytes": nf4, "fp32_bytes": fp32}
+        return F.linear(x, self.weight, self.bias)
 
 
-def apply_qlora(
-    model: nn.Module,
-    r: int = 8,
-    alpha: int = 16,
-    block_size: int = 64,
-    target_modules: Optional[List[str]] = None,
-) -> nn.Module:
-    """把命中 target_modules 的 nn.Linear 替换为 QLoRALinear (复用 lora.py 的匹配规则)。"""
-    targets = target_modules if target_modules is not None else DEFAULT_TARGET_MODULES
-
-    to_replace: List[tuple] = []
-    for parent_name, parent in model.named_modules():
-        for child_name, child in parent.named_children():
-            full_name = f"{parent_name}.{child_name}" if parent_name else child_name
-            if isinstance(child, nn.Linear) and _name_matches(full_name, targets):
-                to_replace.append((parent, child_name, child))
-
-    if not to_replace:
-        raise ValueError(f"没有命中任何 nn.Linear, target_modules={targets}")
-
-    for parent, child_name, child in to_replace:
-        setattr(parent, child_name, QLoRALinear(child, r=r, alpha=alpha, block_size=block_size))
+def apply_qlora(model: nn.Module, r: int = 8, alpha: float = 16, block_size: int = 64,
+                target_modules: Optional[Sequence[str]] = None,
+                layer_cls: type = LoRALinear) -> nn.Module:
+    """命中的 nn.Linear → layer_cls(NF4Linear(原层))。默认命中全部 7 种线性层; layer_cls=DoRALinear 即 QDoRA。"""
+    replace_linears(model, target_modules or ALL_LINEARS,
+                    lambda m: layer_cls(NF4Linear(m, block_size), r=r, alpha=alpha))
     return model
+
+
+def weight_bytes(model: nn.Module) -> int:
+    """整个模型权重的真实字节数 (参数 + NF4 buffer); parameters() 已对共享权重去重。"""
+    n = sum(p.numel() * p.element_size() for p in model.parameters())
+    for m in model.modules():
+        if isinstance(m, NF4Linear):
+            n += m.packed_weight.numel() + m.scales.numel() * m.scales.element_size()
+    return n

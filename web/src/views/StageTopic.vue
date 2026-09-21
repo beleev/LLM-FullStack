@@ -11,12 +11,12 @@
       :next-step="next"
     />
 
-    <section v-if="labList.length" class="section">
+    <section v-if="hasLabs" class="section">
       <h2>0. 动手实验台</h2>
       <p class="lead">
         先动手, 再读字。拖动参数, 观察右侧数字与图形的联动 —— 每个实验台都对应一个可运行的 Python 模块。
       </p>
-      <component :is="lab" v-for="(lab, i) in labList" :key="i" />
+      <LabMount />
     </section>
 
     <section class="section">
@@ -96,12 +96,16 @@
       </p>
       <div class="card">
         <h3>{{ page.snippetTitle }} <span v-if="page.run" class="tag">可运行</span></h3>
-        <pre class="code">{{ page.snippet }}</pre>
+        <CodeBlock :code="page.snippet" />
+        <!-- page.source: 直接从仓库 Python 文件取的真源码, 不会和代码漂移 -->
+        <SourceSnippet v-for="s in sources" :key="s" :src="s" />
         <p v-if="page.run" class="hint">
           运行入口: <code class="inline">{{ page.run }}</code>
         </p>
       </div>
     </section>
+
+    <QuizCard />
 
     <ChapterNav :prev="prev" :next="next" />
   </div>
@@ -114,31 +118,25 @@
 </template>
 
 <script setup>
-import { computed, defineAsyncComponent } from 'vue'
+import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import RepoLink from '@/components/RepoLink.vue'
+import LabMount from '@/components/LabMount.vue'
+import CodeBlock from '@/components/CodeBlock.vue'
+import SourceSnippet from '@/components/SourceSnippet.vue'
+import QuizCard from '@/components/QuizCard.vue'
+import { labMap } from '@/data/labMap.js'
 import { learningPath, stageBy, topicPages } from '@/data/models.js'
 import { looksLikeRepoRef, normalizeRepoRef, splitRefs } from '@/utils/repo.js'
 
-// 可交互实验台注册表: topicPages[x].widgets = ['BpeLab', ...] 即可挂载
-const LABS = {
-  AttnMaskLab: defineAsyncComponent(() => import('@/components/labs/AttnMaskLab.vue')),
-  BpeLab: defineAsyncComponent(() => import('@/components/labs/BpeLab.vue')),
-  MoeRouteLab: defineAsyncComponent(() => import('@/components/labs/MoeRouteLab.vue')),
-  RingAttnLab: defineAsyncComponent(() => import('@/components/labs/RingAttnLab.vue')),
-  GrpoLab: defineAsyncComponent(() => import('@/components/labs/GrpoLab.vue')),
-  SoftmaxTempLab: defineAsyncComponent(() => import('@/components/labs/SoftmaxTempLab.vue')),
-  RetrievalLab: defineAsyncComponent(() => import('@/components/labs/RetrievalLab.vue')),
-  MtpLab: defineAsyncComponent(() => import('@/components/labs/MtpLab.vue')),
-}
-
 const route = useRoute()
 const page = computed(() => topicPages[route.name])
-const labList = computed(() =>
-  (page.value?.widgets || []).map(name => LABS[name]).filter(Boolean)
+const hasLabs = computed(() =>
+  (page.value?.widgets?.length || 0) + (labMap[route.name]?.length || 0) > 0
 )
+const sources = computed(() => [].concat(page.value?.source || []))
 
 const currentIndex = computed(() =>
   learningPath.findIndex(item => item.route === route.name)

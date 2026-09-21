@@ -1,90 +1,60 @@
 """
-m03 demo — Continuous Batching 调度器
+m03 demo — Continuous Batching 调度器 (mock 模型: 只看调度, 不看 token 内容)
 
-用一个 mock model_runner (生成随机 token), 演示:
-    1) 多请求并发的 prefill / decode 切换
-    2) pool 紧张时的 preempt
-    3) 调度统计
-
-不接 TinyLM 也能跑, 关注点是"调度", 不是"模型输出"。
+运行: python -m llm_infer.m03_continuous_batching.demo
+看什么: 每步 batch 的组成 (P=prefill n 个 token, D=decode), pool 占用, 抢占; 以及两个回归:
+    活锁 —— 队首请求拿不到 block 时必须落到 decode;  抢占 —— 不多生成也不丢 token。
 """
 from __future__ import annotations
-import random
 
 from llm_infer.core.utils import banner, kv
-from llm_infer.m03_continuous_batching.scheduler import (
-    Scheduler, SchedulerConfig,
-)
-from llm_infer.m03_continuous_batching.sequence import Stage
+from llm_infer.m03_continuous_batching.scheduler import Scheduler, SchedulerConfig
+
+REQUESTS = [([1, 2, 3, 4, 5], 8), ([10, 20, 30], 4), ([7, 8, 9, 10, 11, 12, 13], 10),
+            ([100, 101], 6), ([50, 51, 52, 53, 54], 5)]          # (prompt, max_new)
 
 
-class MockModelRunner:
-    """把 model.forward 替换成"返回随机 token id"。"""
-    def __init__(self, seed: int = 0):
-        self.rng = random.Random(seed)
-
-    def run(self, batch, stage: Stage):
-        """每条序列输出 1 个 token (prefill 也只关注最后一个 logit)。"""
-        return [self.rng.randint(10, 99) for _ in batch]
+def run(cfg: SchedulerConfig, verbose: bool = True, max_steps: int = 500):
+    sched = Scheduler(cfg)
+    seqs = [sched.add_request(p, m, eos_id=-1) for p, m in REQUESTS]
+    step = 0
+    while sched.has_unfinished():
+        step += 1
+        assert step <= max_steps, "活锁: 调度器空转"
+        batch = sched.schedule()
+        assert batch, "有未完成请求却调度出空 batch"
+        # mock 模型: 第 k 个输出 token 的值就是 k → 抢占重算后内容是否连续一眼可查
+        toks = [seq.num_output if seq.num_computed + n == seq.num_tokens else None for seq, n in batch]
+        desc = " ".join(f"s{seq.seq_id}:{'P' + str(n) if n > 1 else 'D'}" for seq, n in batch)
+        done = sched.postprocess(batch, toks)
+        if verbose:
+            print(f"  step {step:>2}  [{desc:<28}] pool={sched.bm.stats()['utilization']:>6} "
+                  f"preempt={sched.preempt_count}" + (f"  ✓完成 {[s.seq_id for s in done]}" if done else ""))
+    return sched, seqs, step
 
 
 def main():
     banner("M03 - Continuous Batching")
+    for p, m in REQUESTS:
+        print(f"  request: prompt_len={len(p)} max_new={m}")
 
-    cfg = SchedulerConfig(
-        max_batch_seqs=4,
-        max_batch_tokens=64,
-        block_size=4,
-        num_blocks=12,        # 故意小, 容易触发 preempt
-    )
-    sched = Scheduler(cfg)
-    runner = MockModelRunner()
+    print("\n[1] 宽松 pool (32 blocks × 4): 请求随到随进, 各自完成各自退出")
+    sched, seqs, steps_loose = run(SchedulerConfig(max_batch_seqs=4, max_batch_tokens=64, block_size=4, num_blocks=32))
+    assert sched.preempt_count == 0
 
-    # 提交 5 条请求, prompt 长度不同, max_new 不同
-    requests = [
-        ([1, 2, 3, 4, 5],          8),    # seq 0
-        ([10, 20, 30],             4),    # seq 1
-        ([7, 8, 9, 10, 11, 12, 13],10),   # seq 2
-        ([100, 101],               6),    # seq 3
-        ([50, 51, 52, 53, 54],     5),    # seq 4
-    ]
-    for prompt, max_new in requests:
-        sid = sched.add_request(prompt, max_new)
-        print(f"  add request seq_id={sid}, prompt_len={len(prompt)}, max_new={max_new}")
-
-    print(f"\n初始 stats: {sched.stats()}")
-    banner("开始循环 schedule")
-
-    step = 0
-    finished_all = []
-    while sched.has_unfinished():
-        step += 1
-        # ---- prefill 优先 ---------------------------------- #
-        picked, stage = sched.schedule()
-        if stage == Stage.PREFILL and picked:
-            outs = runner.run(picked, stage)
-            done = sched.postprocess(picked, stage, outs)
-            finished_all.extend(done)
-            print(f"step {step:>3} [PREFILL] picked={str([s.seq_id for s in picked]):<25}"
-                  f" finished={[s.seq_id for s in done]} pool={sched.bm.stats()['utilization']}")
-            continue
-        # ---- decode 阶段 ----------------------------------- #
-        decoded = sched.schedule_decode()
-        if not decoded:
-            break
-        outs = runner.run(decoded, Stage.DECODE)
-        done = sched.postprocess(decoded, Stage.DECODE, outs)
-        finished_all.extend(done)
-        print(f"step {step:>3} [DECODE]  picked={str([s.seq_id for s in decoded]):<25}"
-              f" finished={[s.seq_id for s in done]} pool={sched.bm.stats()['utilization']}"
-              f" preempt={sched.preempt_count}")
+    print("\n[2] 紧张 pool (7 blocks × 4 = 28 token): 触发抢占; 队首进不来时 running 照常 decode (活锁回归)")
+    sched, seqs, steps_tight = run(SchedulerConfig(max_batch_seqs=4, max_batch_tokens=64, block_size=4, num_blocks=7))
 
     banner("结果")
-    kv("总 step", step)
-    kv("preempt 次数", sched.preempt_count)
-    kv("完成请求", [s.seq_id for s in finished_all])
-    print("\n  注意: 不同 prompt 长度的请求并发跑, 各自完成各自退出")
-    print("        若 num_blocks 改成 5, 会观察到 preempt 触发")
+    kv("总 step (宽松 / 紧张)", f"{steps_loose} / {steps_tight}")
+    kv("抢占次数", sched.preempt_count)
+    kv("各序列被抢占次数", [s.num_preempted for s in seqs])
+    assert sched.preempt_count > 0
+    for seq, (_, max_new) in zip(seqs, REQUESTS):
+        # 抢占后: 输出一个不多 (max_new 不被重置)、一个不少、顺序不乱
+        assert seq.output_ids == list(range(max_new)), (seq.seq_id, seq.output_ids)
+    assert sched.bm.num_free_blocks() == 7 and sum(sched.bm.ref_count) == 0, "block 泄漏"
+    print("  ✓ 无活锁; 抢占前后输出完整且恰好 max_new 个; block 全部归还")
 
 
 if __name__ == "__main__":

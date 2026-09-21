@@ -1,8 +1,9 @@
 """
-示例代码模块
+可运行示例 — 布局: run_models/<category>/<model>/{infer_X.py, train_X.py, readme.md}
 
-包含各种模型的运行（run_*）和训练（train_*）示例：
-- run_*: 仅做一次前向推理，用于演示模型 API、输入/输出形状
-- train_*: 用合成数据跑若干训练 step，验证 loss 能正常下降
-所有示例均使用极小配置，可直接在 CPU 上几秒内跑完，方便教学演示。
+- infer_X: 最小前向/生成 + 断言 (KV cache 一致性、形状、数值性质)
+- train_X: 在固定的合成 batch 上训几十步, 断言 "初始 loss ≈ ln V" 且 loss 下降 (= 能记住这批数据)
+- readme : 直觉 / 核心公式 / 运行后应该看到什么 / 常见误区 / 自测题
+
+运行: python -m llm_models.run_models.<category>.<model>.train_X   (CPU, < 30s)
 """

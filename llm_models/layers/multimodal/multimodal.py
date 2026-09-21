@@ -1,21 +1,14 @@
 """
-多模态通用构建块
+多模态通用积木: "模态编码器 → (重采样) → 投影 → LLM" 三段式里的前三段
 
-设计背景:
-    现代多模态大模型 (LLaVA / Flamingo / Qwen-VL / Qwen2.5-Omni 等) 通常共享
-    "模态编码器 -> (重采样) -> 投影 -> LLM" 的三段式范式。本文件把这些跨模型
-    可复用的底层组件抽离，避免在各 VLM / Omni 文件中重复实现。
-
-组件一览:
-    - PatchEmbed2D / PatchEmbed3D: ViT (Dosovitskiy, 2020) 与 ViViT (2021) 风格的
-      图像 / 视频切分，把连续像素映射为离散 patch token 序列
-    - PatchTransformerEncoder: 标准 ViT 骨架，用于视觉 / 声谱图 / 视频编码器
-    - PerceiverResamplerBlock / PerceiverResampler:
-      源自 Perceiver IO (2021) 与 Flamingo (DeepMind, 2022)，用少量可学习 latent
-      通过 cross-attention 把任意长度源 tokens 压缩为定长，避免视觉 token 数
-      随分辨率爆炸式膨胀，显著减轻 LLM 侧上下文压力
-    - ModalityProjector: 把模态特征映射到 LLM 嵌入空间
-      (LLaVA 的关键实现细节 — 共享 LLM 词嵌入维度以迁移文本预训练知识)
+是什么: 把图像 / 声谱图 / 视频变成 LLM 能直接拼进上下文的 token 序列 [B, N, D_llm]。
+解决了什么: LLM 只吃 token 序列; 像素是稠密网格, 且 token 数随分辨率平方增长。
+    PatchEmbed2D/3D        切块 + 线性投影 (一次 stride=patch 的卷积): [B,C,H,W] → [B, N, D], N = (H/p)·(W/p)
+    PatchTransformerEncoder ViT 骨架: patch + 可学习位置 → N × 双向 block
+    PerceiverResampler      K 个可学习 latent 作 Q 去 cross-attend N 个 patch ⇒ 输出恒为 K 个 token (Flamingo)
+    ModalityProjector       Linear / MLP 把编码器维度对齐到 LLM 维度 (LLaVA)
+关键数字: 224² 图, patch 14 → 256 token; 336² → 576 token; Resampler 通常压到 32~256。
+读代码时盯住: 序列长度 N 在每一步怎么变 (N_patch → num_latents), 这就是 LLM 要付的上下文成本。
 """
 
 from typing import Optional, Tuple, Union
@@ -36,17 +29,7 @@ def _as_pair(x: Size2D) -> Tuple[int, int]:
 
 
 class PatchEmbed2D(nn.Module):
-    """
-    2D Patch Embedding — ViT 风格的图像/声谱图切块
-
-    把 [B, C, H, W] 按 patch 切块投影为 [B, N, D]，N = (H/ph) * (W/pw)。
-
-    工程要点:
-        - 用一次 stride=patch_size 的 Conv2d 等价实现"切块 + 线性投影"两步，
-          比手工 unfold + matmul 更高效，且权重布局对硬件更友好
-        - 共享给视觉 (RGB 3 通道) 与音频 mel 声谱图 (1 通道) 复用 —
-          声谱图的 (frequency, time) 二维结构本质上也是 2D 张量
-    """
+    """[B, C, H, W] → [B, N, D], N = (H/ph)·(W/pw)。图像 (C=3) 与 mel 声谱图 (C=1, 频率×时间) 共用。"""
 
     def __init__(
         self,
@@ -68,7 +51,7 @@ class PatchEmbed2D(nn.Module):
 
         self.in_channels = in_channels
         self.embed_dim = embed_dim
-        # kernel_size == stride == patch_size: 各 patch 之间无重叠，等价于"先切块再线性投影"
+        # kernel = stride = patch: 无重叠卷积 ≡ "切块 → 展平 → Linear"
         self.proj = nn.Conv2d(
             in_channels, embed_dim,
             kernel_size=self.patch_size, stride=self.patch_size, bias=False,
@@ -87,23 +70,15 @@ class PatchEmbed2D(nn.Module):
             raise ValueError(
                 f"输入尺寸 {(h, w)} 与初始化 input_size {self.input_size} 不一致"
             )
-        x = self.proj(x)                    # [B, D, gH, gW] — Conv2d 输出空间网格
-        # flatten(2) 把 (gH, gW) 拍成一维序列，transpose 到 [B, N, D]
-        # 之后由 Transformer 序列建模来重新捕捉空间关系 (位置编码补回结构信息)
-        return x.flatten(2).transpose(1, 2)  # [B, N, D]
+        x = self.proj(x)                     # [B, D, gH, gW]
+        return x.flatten(2).transpose(1, 2)  # [B, N, D] 按行优先展平; 2-D 结构靠位置编码补回
 
 
 class PatchEmbed3D(nn.Module):
     """
-    3D Patch Embedding — ViViT / VideoMAE 风格的 "tubelet" 切块
+    [B, C, T, H, W] → [B, N, D], N = (T/tubelet)·(H/ph)·(W/pw)  (ViViT 的 tubelet 切块)
 
-    把 [B, C, T, H, W] 用 (tubelet, ph, pw) 三维卷积切成 [B, N, D]，
-    N = (T/tubelet) * (H/ph) * (W/pw)。
-
-    为什么用 tubelet 而不是逐帧 2D patch?
-        - 逐帧 patch 数 = T * (H/ph) * (W/pw)，长视频会爆炸式增长
-        - tubelet 在时间维上做下采样 (典型 tubelet=2)，token 数减半
-        - 同时让每个 token 自带短时运动信息，省去"先空间编码再做时间聚合"的两阶段
+    相比逐帧 2-D patch: 时间维也下采样 (token 数 ÷ tubelet), 且每个 token 自带短时运动信息。
     """
 
     def __init__(
@@ -148,23 +123,16 @@ class PatchEmbed3D(nn.Module):
             raise ValueError(
                 f"输入尺寸 {(t, h, w)} 与初始化 video_size {self.video_size} 不一致"
             )
-        x = self.proj(x)
-        return x.flatten(2).transpose(1, 2)
+        x = self.proj(x)                     # [B, D, gT, gH, gW]
+        return x.flatten(2).transpose(1, 2)  # [B, N, D]
 
 
 class PatchTransformerEncoder(nn.Module):
     """
-    通用 ViT 风格编码器: PatchEmbed -> 可学习 PosEmbed -> N x PreLNBlock -> LayerNorm
+    ViT 骨架: PatchEmbed → + 可学习位置 → N × PreLNBlock (双向, 无 mask) → LayerNorm。
 
-    设计理念:
-        视觉 / 音频声谱图 / 视频虽然来自不同模态，但经过 patch 化后都是
-        token 序列，因此可以共享同一个 Transformer 骨架，差异只体现在
-        前置的 PatchEmbed 与超参数 (维度、层数)。
-
-    为什么用可学习位置嵌入而不是 RoPE?
-        - 视觉/音频编码器是非自回归 (双向注意力)，序列长度固定，
-          可学习绝对位置嵌入更直观且与 ViT 原始论文对齐
-        - LLM 解码端才需要 RoPE 处理变长外推与因果注意力
+    图像 / 声谱图 / 视频 patch 化之后都是 token 序列, 共用这一个骨架, 差别只在传入的 patch_embed。
+    编码器输入长度固定且非自回归, 用可学习绝对位置即可; 变长外推是 LLM 侧 RoPE 的事。
     """
 
     def __init__(
@@ -179,16 +147,12 @@ class PatchTransformerEncoder(nn.Module):
         super().__init__()
 
         self.patch_embed = patch_embed
-        # 可学习位置嵌入 [1, N, D]，broadcast 到 batch
-        # 截断正态初始化 (std=0.02) 是 ViT/BERT 系列的标准做法，
-        # 避免初始权重过大导致前几层激活饱和
         self.pos_embed = nn.Parameter(torch.zeros(1, patch_embed.num_patches, d_model))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)                # [1, N, D]
 
         if d_ff is None:
             d_ff = 4 * d_model
 
-        # 视觉分支继续沿用 ReLU FFN + LayerNorm (与原始 ViT 对齐)
         self.layers = nn.ModuleList(
             [
                 PreLNBlock(
@@ -205,24 +169,15 @@ class PatchTransformerEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.patch_embed(x)
+        x = self.patch_embed(x)                                        # [B, N, D]
         x = self.dropout(x + self.pos_embed)
         for block in self.layers:
             x = block(x)
-        return self.norm(x)
+        return self.norm(x)                                            # [B, N, D]
 
 
 class PerceiverResamplerBlock(nn.Module):
-    """
-    Perceiver Resampler Block — 单层 cross-attention + FFN
-
-    数据流:
-        latents -> LN -> CrossAttn(Q=latents, K/V=source) -> Add
-                -> LN -> FFN -> Add
-
-    源自 Flamingo (NeurIPS 2022)。核心思想是 Q 来自固定数量的 latent，
-    K/V 来自变长源 token，因此输出长度恒等于 latent 数量，与源长度解耦。
-    """
+    """latents += CrossAttn(Q=LN(latents), K=V=source);  latents += FFN(LN(latents))"""
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
@@ -234,28 +189,17 @@ class PerceiverResamplerBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, latents: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
-        residual = latents
-        h = self.norm1(latents)
-        h = self.cross_attn(q=h, k=source, v=source)
-        latents = residual + self.dropout(h)
-
-        residual = latents
-        h = self.norm2(latents)
-        h = self.ffn(h)
-        return residual + self.dropout(h)
+        # latents [B, K, D], source [B, N, D]; 注意力矩阵 [B, K, N]: 每个 latent 从 N 个 patch 里"挑"信息
+        h = self.cross_attn(q=self.norm1(latents), k=source, v=source)
+        latents = latents + self.dropout(h)
+        return latents + self.dropout(self.ffn(self.norm2(latents)))   # [B, K, D]
 
 
 class PerceiverResampler(nn.Module):
     """
-    Perceiver Resampler — 把变长视觉/音频 tokens 压缩到固定长度
+    [B, N, D] → [B, num_latents, D]: 输出长度只由可学习 latent 的个数决定, 与输入 token 数 N 无关 (Flamingo)。
 
-    用 num_latents 个可学习 latent tokens 去 cross-attend 源 tokens，
-    输出形状 [B, num_latents, d_model]，与源 tokens 数量完全解耦。
-
-    为什么需要它?
-        - ViT-Large 在 336x336 输入下产生 576 个 patch，多张图就上千 tokens
-        - 直接拼到 LLM 上下文会快速吃光预算 (尤其是长对话场景)
-        - Resampler 通常压到 32~256 个 token，几乎不损失下游性能
+    代价: latent 不再对应具体的空间位置, 细粒度定位 / OCR 类任务会受损 —— 所以 Qwen2-VL 改用相邻 patch 合并。
     """
 
     def __init__(
@@ -285,9 +229,7 @@ class PerceiverResampler(nn.Module):
         )
 
     def forward(self, source: torch.Tensor) -> torch.Tensor:
-        B = source.size(0)
-        # 同一组 latent 在 batch 内共享 (expand 不复制内存，节省显存)
-        latents = self.latents.unsqueeze(0).expand(B, -1, -1)
+        latents = self.latents.unsqueeze(0).expand(source.size(0), -1, -1)   # [B, K, D] 同一组 latent 全 batch 共享
         for block in self.layers:
             latents = block(latents, source)
         return latents
@@ -295,17 +237,9 @@ class PerceiverResampler(nn.Module):
 
 class ModalityProjector(nn.Module):
     """
-    模态投影器 — 把视觉/音频/视频特征对齐到 LLM 嵌入空间
+    [B, N, in_dim] → [B, N, out_dim]: 单层 Linear (LLaVA-1) 或 Linear-GELU-Linear (LLaVA-1.5), 末尾 LayerNorm。
 
-    - hidden_dim is None: 单层线性 (LLaVA-1 风格，轻量)
-    - 否则: Linear -> GELU -> Linear (LLaVA-1.5 / MLP 风格，表达力更强)
-    最后接 LayerNorm 稳定输出分布，便于与 LLM 预训练 token embedding 混合。
-
-    为什么要"投影"而不是直接拼接?
-        - 视觉编码器 (ViT) 维度常与 LLM 隐维度不同 (e.g. 1024 vs 4096)
-        - 视觉特征分布与文本 embedding 差异大，直接塞入会破坏 LLM 内部分布
-        - 投影层只需少量训练数据即可对齐两模态的表示空间 — 这是 LLaVA
-          "视觉指令微调"能以极低代价取得好效果的关键
+    LLaVA 的关键发现: 冻结视觉编码器和 LLM, 只训这一个小投影层就能把两个空间对齐。
     """
 
     def __init__(

@@ -38,14 +38,14 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from llm_models.layers.core.attention import GroupedQueryAttention
 from llm_models.layers.core.blocks import PreLNBlock
 from llm_models.layers.core.feedforward import SwiGLUFeedForward
 from llm_models.layers.core.normalization import RMSNorm
 from llm_models.layers.core.position_encoding import RotaryPositionalEncoding
-from llm_models.training.loss import LossComputer
+from llm_models.utils.generation import GenerationMixin, KVCache
+from llm_models.utils.init import init_weights
 from llm_models.utils.masks import build_causal_mask, combine_causal_and_padding_mask
 
 
@@ -99,7 +99,7 @@ class MTPModule(nn.Module):
         return self.block(x, mask=mask, rope=rope)
 
 
-class MTPLLaMA(nn.Module):
+class MTPLLaMA(GenerationMixin, nn.Module):
     """
     LLaMA 主干 + K 级串行 MTP 模块 (教学版)。
 
@@ -176,6 +176,8 @@ class MTPLLaMA(nn.Module):
         causal = build_causal_mask(max_len, torch.device("cpu"))
         self.register_buffer("causal_mask", causal, persistent=False)
 
+        init_weights(self)   # weight tying 之后; 初始 CE ≈ ln V
+
     def _causal_mask(self, seq_len: int) -> torch.Tensor:
         if seq_len <= self.causal_mask.size(-1):
             return self.causal_mask[:, :seq_len, :seq_len]
@@ -186,27 +188,35 @@ class MTPLLaMA(nn.Module):
 
     def forward(
         self,
-        idx: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        idx: torch.Tensor,                              # [B, T]
+        attention_mask: Optional[torch.Tensor] = None,  # [B, past+T]
+        cache: Optional[KVCache] = None,
     ) -> Dict[str, Any]:
         """
-        Args:
-            idx: [B, T] token IDs
-        Returns:
-            {"logits": [B, T, V], "mtp_logits": List of [B, T, V]}
+        Returns {"logits": [B, T, V], "mtp_logits": List of [B, T, V]}。
+        给了 cache (= 生成) 时只跑主干, mtp_logits 为空: MTP 模块要拼接 "未来的真实 token",
+        普通自回归解码时它们还不存在 (用作投机解码 draft 是另一条路径)。
         """
         B, T = idx.shape
-        if T > self.max_len:
-            raise ValueError(f"序列长度 {T} 超过 max_len={self.max_len}")
+        past = cache.pos if cache is not None else 0
+        if past + T > self.max_len:
+            raise ValueError(f"序列长度 {past + T} 超过 max_len={self.max_len}")
 
-        causal = self._causal_mask(T)
+        position_ids = torch.arange(past, past + T, device=idx.device)
+        causal = self._causal_mask(past + T)[:, past:]                   # [1, T, past+T]
         mask = combine_causal_and_padding_mask(causal, attention_mask)
 
         # ---- 主干前向 ----
-        h = self._embed(idx)
-        for layer in self.layers:
-            h = layer(h, mask=mask, rope=self.rope)
+        h = self._embed(idx)                                             # [B, T, D]
+        for i, layer in enumerate(self.layers):
+            h = layer(
+                h, mask=mask, rope=self.rope, position_ids=position_ids,
+                cache=cache.layers[i] if cache is not None else None,
+            )
         logits_main = self.lm_head(self.ln_f(h))
+        if cache is not None:
+            cache.pos += T
+            return {"logits": logits_main, "mtp_logits": []}
 
         # ---- MTP 级联: 第 k 级在位置 i 处拼接真实 token t_{i+k} 的 embedding ----
         mtp_logits: List[torch.Tensor] = []
@@ -215,7 +225,7 @@ class MTPLLaMA(nn.Module):
             # 用 0 占位 (这些位置的预测会在 MTPLoss 里被 -100 屏蔽)
             shifted = torch.zeros_like(idx)
             shifted[:, :-k] = idx[:, k:]
-            emb_next = self._embed(shifted)
+            emb_next = self._embed(shifted)                              # [B, T, D]
 
             h = module(h, emb_next, mask=mask, rope=self.rope)
             mtp_logits.append(self.lm_head(module.final_norm(h)))
@@ -223,48 +233,10 @@ class MTPLLaMA(nn.Module):
         return {"logits": logits_main, "mtp_logits": mtp_logits}
 
 
-class MTPLoss(LossComputer):
-    """
-    MTP 联合损失:  L = CE(main) + λ · mean_k CE(mtp_k)
-
-    标签对齐 (labels[i] = t_{i+1} 是标准 next-token 标签):
-        MTP-k 在位置 i 预测 t_{i+1+k} = labels[i+k]
-        → 把 labels 左移 k 位作为第 k 级的目标, 末尾 k 个位置置 -100
-
-    Args:
-        mtp_lambda: MTP 分支权重 λ (DeepSeek-V3: 0.3 → 0.1)
-        ignore_index: 同 cross_entropy 约定
-    """
-
-    def __init__(self, mtp_lambda: float = 0.3, ignore_index: int = -100) -> None:
-        self.mtp_lambda = mtp_lambda
-        self.ignore_index = ignore_index
-
-    def _ce(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        return F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            ignore_index=self.ignore_index,
-        )
-
-    def compute(
-        self,
-        model_output: Dict[str, Any],
-        labels: torch.Tensor,
-        **kwargs,
-    ) -> Dict[str, torch.Tensor]:
-        main_loss = self._ce(model_output["logits"], labels)
-
-        mtp_losses: List[torch.Tensor] = []
-        for k, logits_k in enumerate(model_output["mtp_logits"], start=1):
-            labels_k = torch.full_like(labels, self.ignore_index)
-            labels_k[:, :-k] = labels[:, k:]   # 目标整体左移 k 位
-            mtp_losses.append(self._ce(logits_k, labels_k))
-
-        mtp_loss = torch.stack(mtp_losses).mean()
-        total = main_loss + self.mtp_lambda * mtp_loss
-        return {
-            "total_loss": total,
-            "main_loss": main_loss.detach(),
-            "mtp_loss": mtp_loss.detach(),
-        }
+def __getattr__(name: str):
+    # MTPLoss 已搬到 training/loss.py (models 不该反向依赖 training)。
+    # 惰性转发让 `from llm_models.models.language_models.mtp import MTPLoss` 继续可用, 且不产生循环 import
+    if name == "MTPLoss":
+        from llm_models.training.loss import MTPLoss
+        return MTPLoss
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

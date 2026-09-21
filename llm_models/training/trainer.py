@@ -1,23 +1,13 @@
 """
-通用训练器模块
-================
+通用训练器 — 一个训练循环跑全库所有模型
 
-提供 Trainer 类, 支持本教学库内全部 LLM 模型的训练循环:
-    - 标准 Decoder-only (GPT-3)
-    - Encoder-Decoder   (经典 Transformer)
-    - MoE              (DeepSeek-V3 / V3.2)
-    - 多模态           (Qwen2-VL, Qwen2.5-Omni)
-
-设计核心 - 策略模式:
-    Trainer 不直接关心 "数据怎么来" 或 "损失怎么算", 而是依赖两个抽象:
-        - SyntheticDataGenerator : 负责产出 batch
-        - LossComputer           : 负责把模型输出转化为 loss
-    任何新模型只需实现对应的 generator / loss, 即可复用同一套训练循环,
-    保持训练器的开闭原则 (对扩展开放, 对修改关闭)。
-
-性能小细节:
-    - train_step 返回 tensor 形式的 metrics, 仅在日志打印时才 .item();
-      避免每步都触发 GPU→CPU 同步, 在大模型训练中可显著减少阻塞。
+是什么: Trainer 只认两个策略接口 —— SyntheticDataGenerator (batch 怎么来) 与 LossComputer (loss 怎么算);
+        新模型只需配一对 generator / loss, 循环本身不改。
+单步: generate_batch → pop labels → model(**batch) → loss → backward → clip_grad_norm → AdamW.step → scheduler.step
+关键数字: 第 1 步的 lr = 0 (线性 warmup 从 0 起) → 日志里第一条 loss 就是 "未训练模型" 的 loss,
+          train 脚本据此断言 `|loss₁ − ln V| < 0.5`。
+注意: 默认数据是固定的一个 batch (见 data.py), 所以 "loss 下降" = 能背下这个 batch。
+读代码时盯住: `batch.pop("labels")` —— dict 里剩下的 key 必须正好是 model.forward 的形参名。
 """
 
 from typing import Dict, List, Union
@@ -35,37 +25,11 @@ Metric = Union[torch.Tensor, float]
 
 class Trainer:
     """
-    通用训练器。
+    AdamW + (linear warmup → cosine) + 梯度裁剪。
 
-    单步训练流程 (train_step):
-        1) data_generator.generate_batch() → 取一个 batch
-        2) 弹出 labels / 额外标签, 余下字段作为 model 的 forward 关键字参数
-        3) 模型前向
-        4) loss_computer.compute() → 计算总 loss 与各分量
-        5) loss.backward()  反向传播
-        6) clip_grad_norm_   梯度裁剪 (防爆炸)
-        7) optimizer.step() / scheduler.step() / zero_grad()
-
-    优化器选择: AdamW
-        - Adam 对 Transformer 友好, 自适应学习率减轻调参负担;
-        - W (Decoupled Weight Decay) 把权重衰减从梯度路径中解耦, 避免与 Adam
-          的二阶动量耦合产生 "等效正则减弱" 问题, 是当今 LLM 训练的事实标准。
-        - 注: 严格起见 norm/bias 等参数不应施加 weight decay
-          (它们本就是小量, 正则会损害表达力), 教学版为简洁统一处理。
-
-    学习率调度: LambdaLR + cosine warmup
-        见 TrainingConfig.get_lr_lambda 文档。
-
-    梯度裁剪: clip_grad_norm_
-        Transformer 训练初期容易出现梯度尖峰 (注意力 softmax 饱和、初始化不佳等),
-        一次大梯度可能直接破坏后续训练。裁剪到固定 L2 范数, 牺牲一点更新精度
-        换取训练稳定。
-
-    Args:
-        model:          PyTorch 模型 (nn.Module)。
-        config:         TrainingConfig。
-        data_generator: 合成 batch 生成器 (策略)。
-        loss_computer:  loss 计算器 (策略)。
+    - AdamW: weight decay 与梯度解耦, 不被 Adam 的自适应缩放扭曲 (严格做法应排除 norm/bias, 教学版统一处理)。
+    - clip_grad_norm_: Transformer 训练初期常有梯度尖峰 (softmax 饱和), 一次大更新就能毁掉模型。
+    - metrics 以 tensor 返回, 只在打日志时 .item(): 每步 .item() 会强制 GPU→CPU 同步。
     """
 
     def __init__(

@@ -1,174 +1,148 @@
 """
-M11 — Expert Parallelism (MoE 专家并行)
+M11 — 专家并行 (Expert Parallel, MoE)
 
-MoE 模型 (Mixtral / DeepSeek-V3) 的参数大头在专家 FFN 上, 单卡放不下所有专家。
-EP 把 E 个专家切到 D 张卡上 (每卡 E/D 个), 于是出现一种新的通信模式:
-
-    token 在哪张卡  ≠  它选中的专家在哪张卡
-    → all-to-all #1 (dispatch): 把每个 token 发到它的专家所在的卡
-    → 本地专家计算 (每卡只算自己持有的专家)
-    → all-to-all #2 (combine):  把结果按原路寄回, 按 gate 权重加权求和
-
-与 DDP 的 all-reduce 不同, all-to-all 的通信量取决于 **路由结果**:
-路由越不均衡, 热点卡越慢 (落后者效应), 还会触发容量溢出丢 token。
-所以 MoE 训练必须带 load-balancing 辅助损失 (Switch/Mixtral 的 aux loss,
-DeepSeek-V3 用 aux-loss-free 的 bias 调节, 思想相同: 把路由"推平")。
-
-说明: 本 demo 用 list 模拟 D 张卡, all_to_all 是纯 numpy 数组重排。
+是什么: E 个专家 FFN 分给 D 张卡 (每卡 E/D 个)。token 所在的卡 ≠ 它选中的专家所在的卡, 于是:
+    all-to-all #1 dispatch: token 发往专家所在卡 → 本地专家计算 → all-to-all #2 combine: 结果原路寄回
+解决的瓶颈: 显存 (MoE 参数大头在专家上)。新瓶颈是通信 + **负载均衡**: all-to-all 的量由路由结果决定,
+           最热的卡决定 step 时间; 超过 capacity 的 token 被丢弃 (只走残差)。
+关键公式: capacity = ⌈cf · N_tok / E⌉;   Switch aux loss  L = E · Σ_e f_e · P_e   (f: 实际占比, P: 平均概率)
+          DeepSeek-V3 aux-loss-free: 选专家用 s_e + b_e, 过载 b_e -= γ, 欠载 b_e += γ; gate 权重仍用原始 s_e
+读代码盯住: `send_idx[src][dst]` —— 行号留在源卡不上网线, combine 回来的块靠它按原顺序写回。
 """
 from __future__ import annotations
 
 import numpy as np
 
-from llm_train.core import all_to_all, banner, kv, set_seed
+from llm_train.core import all_to_all, banner, comm, kv, make_rng, max_abs_diff, relu, softmax
 
 
-def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
-    z = x - x.max(axis=axis, keepdims=True)
-    e = np.exp(z)
-    return e / e.sum(axis=axis, keepdims=True)
-
-
-def expert_forward(weights: tuple[np.ndarray, np.ndarray], x: np.ndarray) -> np.ndarray:
-    """每个专家是一个独立的 2 层 MLP: relu(x W1) W2。"""
+def expert_forward(weights, x):
     w1, w2 = weights
-    return np.maximum(x @ w1, 0.0) @ w2
+    return relu(x @ w1) @ w2                                  # [n, d] -> [n, d_ff] -> [n, d]
 
 
-def route(x: np.ndarray, router_w: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """top-1 (Switch 式) 路由: 返回 (选中专家 id, gate 权重, 全量概率)。"""
-    probs = softmax(x @ router_w)        # [N, E]
-    expert_of = probs.argmax(axis=1)     # [N]
-    gate = probs[np.arange(len(x)), expert_of]
-    return expert_of, gate, probs
+def route(x, router_w, bias=None):
+    """top-1 路由。bias 只影响 '选谁', 不影响 gate 权重 (aux-loss-free 的关键)。"""
+    probs = softmax(x @ router_w)                             # [N, E]
+    expert_of = (probs if bias is None else probs + bias).argmax(axis=1)
+    return expert_of, probs[np.arange(len(x)), expert_of], probs
 
 
-def moe_forward_ep(
-    x: np.ndarray,
-    expert_of: np.ndarray,
-    gate: np.ndarray,
-    experts: list[tuple[np.ndarray, np.ndarray]],
-    world: int,
-    capacity: int | None = None,
-) -> tuple[np.ndarray, dict]:
-    """
-    专家并行版 MoE 前向: dispatch all-to-all → 本地专家计算 → combine all-to-all。
+def moe_forward_ep(x_shards, expert_shards, gate_shards, experts, capacity=None):
+    """x_shards: D × [n_local, d]。返回 (D × [n_local, d], 发送矩阵, 丢弃数)。"""
+    world, per_dev = len(x_shards), len(experts) // len(x_shards)
 
-    token 按行号均分在 D 张卡上; 专家按 id 均分在 D 张卡上 (expert e 在卡 e // (E/D))。
-    capacity 不为 None 时, 每个专家最多接收 capacity 个 token, 溢出的 token
-    直接走残差 (输出 0), 这就是 "token dropping"。
-    """
-    n_tokens, e_total = len(x), len(experts)
-    per_dev_experts = e_total // world
-    token_dev = np.arange(n_tokens) // (n_tokens // world)   # token 所在卡
-    expert_dev = expert_of // per_dev_experts                # token 目标卡
+    # ---- all-to-all #1 dispatch: 每张卡按目标卡把本地 token 分成 D 堆 ----
+    send_idx = [[np.where(expert_shards[s] // per_dev == d)[0] for d in range(world)] for s in range(world)]
+    recv_tok = all_to_all([[x_shards[s][i] for i in row] for s, row in enumerate(send_idx)])   # [dst][src]: [n_sd, d]
+    recv_eid = all_to_all([[expert_shards[s][i] for i in row] for s, row in enumerate(send_idx)])  # 专家 id 随行
 
-    # ---- all-to-all #1: dispatch ----
-    # shards[src][dst] = (token 行号, token 向量) — 行号随行李一起寄, 回程要用
-    idx_shards = [
-        [np.where((token_dev == src) & (expert_dev == dst))[0] for dst in range(world)]
-        for src in range(world)
-    ]
-    tok_shards = [[x[idx] for idx in row] for row in idx_shards]
-    recv_idx = all_to_all(idx_shards)    # 每张卡收到: 来自各卡的 token 行号
-    recv_tok = all_to_all(tok_shards)    # 与之对齐的 token 向量
-
-    dispatch_matrix = np.array(
-        [[len(idx_shards[s][d]) for d in range(world)] for s in range(world)]
-    )
-
-    # ---- 本地专家计算 (每张卡只持有自己的专家权重) ----
-    out = np.zeros_like(x)
+    # ---- 本地专家计算: 卡 dev 只持有专家 [dev·per_dev, (dev+1)·per_dev) ----
     dropped = 0
+    back = [[None] * world for _ in range(world)]
     for dev in range(world):
-        ids = np.concatenate(recv_idx[dev]).astype(int)
-        toks = np.concatenate(recv_tok[dev])   # 与 ids 按同样的 src 顺序拼接, 行行对齐
-        for local_e in range(per_dev_experts):
-            e = dev * per_dev_experts + local_e
-            sel = expert_of[ids] == e
-            e_ids, e_toks = ids[sel], toks[sel]
-            if capacity is not None and len(e_ids) > capacity:
-                dropped += len(e_ids) - capacity
-                e_ids, e_toks = e_ids[:capacity], e_toks[:capacity]   # 溢出丢弃
-            if len(e_ids):
-                # all-to-all #2 (combine): 教学上直接按行号写回全局输出
-                out[e_ids] = expert_forward(experts[e], e_toks) * gate[e_ids, None]
+        toks = np.concatenate(recv_tok[dev])                  # [n_recv, d], 按 src 顺序拼
+        eids = np.concatenate(recv_eid[dev])
+        out = np.zeros_like(toks)                             # 被丢弃的 token 输出 0 (外面还有残差连接)
+        for e in range(dev * per_dev, (dev + 1) * per_dev):
+            rows = np.where(eids == e)[0]
+            if capacity is not None and len(rows) > capacity:
+                dropped += len(rows) - capacity
+                rows = rows[:capacity]                        # 先到先得, 超出容量的丢弃
+            out[rows] = expert_forward(experts[e], toks[rows])
+        sizes = np.cumsum([len(t) for t in recv_tok[dev]])[:-1]
+        back[dev] = np.split(out, sizes)                      # 按 src 切回去, 顺序与收到时一致
 
-    stats = {"dispatch": dispatch_matrix, "dropped": dropped}
-    return out, stats
+    # ---- all-to-all #2 combine: 原路寄回, 源卡按自己留着的行号写回并乘 gate ----
+    returned = all_to_all(back)                               # [src][dev]: 与 send_idx[src][dev] 行行对齐
+    outs = []
+    for s in range(world):
+        y = np.zeros_like(x_shards[s])
+        for d in range(world):
+            y[send_idx[s][d]] = returned[s][d]
+        outs.append(y * gate_shards[s][:, None])
+    matrix = np.array([[len(i) for i in row] for row in send_idx])
+    return outs, matrix, dropped
 
 
-def balance_router(x: np.ndarray, router_w: np.ndarray, steps: int, lr: float) -> np.ndarray:
-    """
-    用 Switch 风格的 load-balancing aux loss 训练 router:
-        L_aux = E · Σ_e f_e · P_e
-    f_e: 派给专家 e 的 token 比例 (不可导, 视为常数);  P_e: 平均路由概率 (可导)。
-    f 与 P 同向, 最小化点积会把"热门专家"的概率压下去 → 路由变平。
-    """
-    e_total = router_w.shape[1]
-    w = router_w.copy()
+def train_router_aux(x, router_w, steps, lr):
+    """只用 Switch aux loss 训练 router —— 刻意隔离它的作用; 真实训练是 L_task + α·L_aux (α≈0.01)。"""
+    E, w = router_w.shape[1], router_w.copy()
     for _ in range(steps):
-        probs = softmax(x @ w)                       # [N, E]
-        f = np.bincount(probs.argmax(1), minlength=e_total) / len(x)
-        # dL/d logits = E/N · (diag(p) - p p^T) f   (softmax 的 Jacobian 乘 f)
-        grad_p = np.tile(f, (len(x), 1)) * e_total / len(x)
-        grad_logits = probs * (grad_p - (probs * grad_p).sum(1, keepdims=True))
+        probs = softmax(x @ w)                                # [N, E]
+        f = np.bincount(probs.argmax(1), minlength=E) / len(x)        # argmax 不可导, f 当常数
+        grad_p = np.tile(f, (len(x), 1)) * E / len(x)                 # dL/dP
+        grad_logits = probs * (grad_p - (probs * grad_p).sum(1, keepdims=True))   # 过 softmax 的 Jacobian
         w -= lr * x.T @ grad_logits
     return w
 
 
+def balance_bias(x, router_w, steps, gamma):
+    """aux-loss-free: 不加 loss、不产生干扰梯度, 每步按负载符号微调一个 [E] 的 bias。"""
+    E = router_w.shape[1]
+    bias = np.zeros(E)
+    for _ in range(steps):
+        load = np.bincount(route(x, router_w, bias)[0], minlength=E)
+        bias += gamma * np.sign(load.mean() - load)           # 过载 → 降, 欠载 → 升
+    return bias
+
+
 def main() -> None:
-    banner("M11 - Expert Parallelism (MoE all-to-all)")
+    banner("M11 - Expert Parallel (MoE all-to-all)")
 
-    rs = set_seed(7)
-    world, e_total, n_tokens, d, d_ff = 4, 8, 64, 8, 16
-    x = rs.randn(n_tokens, d).astype(np.float64)
-    experts = [
-        (rs.randn(d, d_ff) * 0.3, rs.randn(d_ff, d) * 0.3) for _ in range(e_total)
-    ]
-    # 刻意制造倾斜的 router: 真实训练初期 / 数据分布漂移时就是这副样子
-    router_w = rs.randn(d, e_total) + np.linspace(1.2, -1.2, e_total)[None, :]
+    rs = make_rng(7)
+    world, E, N, d, d_ff = 4, 8, 64, 8, 16
+    x = rs.randn(N, d)
+    experts = [(rs.randn(d, d_ff) * 0.3, rs.randn(d_ff, d) * 0.3) for _ in range(E)]
+    router_w = rs.randn(d, E) + np.linspace(1.2, -1.2, E)[None, :]    # 故意倾斜: 偏爱编号小的专家
+    capacity = int(np.ceil(1.25 * N / E))                             # capacity factor 1.25 → 10
 
+    def run(expert_of, gate, cap=None):
+        comm.reset()
+        shards = lambda a: np.split(a, world)                         # [N, ...] -> D × [N/D, ...]
+        outs, matrix, dropped = moe_forward_ep(shards(x), shards(expert_of), shards(gate), experts, cap)
+        return np.concatenate(outs), matrix, dropped, comm.total
+
+    # ---- 1) 正确性: EP (两次真实 all-to-all) == 单卡逐专家计算 ----
     expert_of, gate, _ = route(x, router_w)
-
-    # ---- 1) dispatch 计划: 谁给谁发多少 token ----
-    out_ep, stats = moe_forward_ep(x, expert_of, gate, experts, world)
-    print(f"\n[1] all-to-all 发送矩阵 (行=源卡, 列=目标卡, {world} 卡 × 每卡 {e_total // world} 专家)")
-    for row in stats["dispatch"]:
-        print("    " + "  ".join(f"{v:>3}" for v in row))
-
-    # ---- 2) 正确性: EP 输出 == 单卡稠密计算 ----
+    out_ep, matrix, _, wire = run(expert_of, gate)
     dense = np.zeros_like(x)
-    for e in range(e_total):
+    for e in range(E):
         sel = expert_of == e
-        if sel.any():
-            dense[sel] = expert_forward(experts[e], x[sel]) * gate[sel, None]
-    print("\n[2] 正确性")
-    kv("max |dense - EP|", f"{np.abs(dense - out_ep).max():.2e}")
-    assert np.allclose(dense, out_ep), "EP 前向必须与单卡稠密计算一致"
+        dense[sel] = expert_forward(experts[e], x[sel]) * gate[sel, None]
+    print("\n[1] dispatch 发送矩阵 (行 = 源卡, 列 = 目标卡)")
+    for row in matrix:
+        print("      " + " ".join(f"{v:>3}" for v in row))
+    kv("max |dense - EP|", f"{max_abs_diff(dense, out_ep):.1e}")
+    kv("每卡收到的 token", f"{matrix.sum(0).tolist()}  (均匀应为 {N // world})")
+    kv("通信量 (dispatch + combine)", f"{wire:.0f} B/rank")
+    assert max_abs_diff(dense, out_ep) == 0.0
+    assert comm.calls["all_to_all"] == 3, "dispatch 发 token 和专家 id (2 次), combine 1 次"
 
-    # ---- 3) 负载不均衡 → 容量溢出丢 token ----
-    counts = np.bincount(expert_of, minlength=e_total)
-    capacity = int(np.ceil(n_tokens / e_total * 1.25))   # capacity factor 1.25
-    _, stats_cap = moe_forward_ep(x, expert_of, gate, experts, world, capacity=capacity)
-    print("\n[3] 倾斜路由下的负载")
-    kv("每个专家收到的 token 数", counts.tolist())
-    kv("负载不均衡度 max/mean", f"{counts.max() / counts.mean():.2f}x")
-    kv(f"capacity={capacity} 时丢弃 token", f"{stats_cap['dropped']} / {n_tokens}")
+    # ---- 2) 三种路由的负载对比 ----
+    w_aux = train_router_aux(x, router_w, steps=60, lr=0.5)
+    bias = balance_bias(x, router_w, steps=200, gamma=0.01)
+    print(f"\n[2] 负载均衡 (capacity = {capacity})")
+    print(f"      {'':<22}{'每专家 token 数':<36}{'max/mean':>9}{'丢弃':>6}{'最热卡':>7}")
+    stats = {}
+    for name, (eo, g) in {
+        "倾斜 router": (expert_of, gate),
+        "aux loss 60 步": route(x, w_aux)[:2],
+        "aux-loss-free bias": route(x, router_w, bias)[:2],
+    }.items():
+        counts = np.bincount(eo, minlength=E)
+        _, m, dropped, _ = run(eo, g, capacity)
+        stats[name] = (counts.max() / counts.mean(), dropped)
+        print(f"      {name:<22}{str(counts.tolist()):<36}{stats[name][0]:>8.2f}x{dropped:>6}{m.sum(0).max():>7}")
 
-    # ---- 4) aux loss 把路由推平 ----
-    router_balanced = balance_router(x, router_w, steps=60, lr=0.5)
-    expert_of2, gate2, _ = route(x, router_balanced)
-    counts2 = np.bincount(expert_of2, minlength=e_total)
-    _, stats2 = moe_forward_ep(x, expert_of2, gate2, experts, world, capacity=capacity)
-    print("\n[4] 用 load-balancing aux loss 训练 router 60 步后")
-    kv("每个专家收到的 token 数", counts2.tolist())
-    kv("负载不均衡度 max/mean", f"{counts2.max() / counts2.mean():.2f}x")
-    kv("丢弃 token", f"{stats2['dropped']} / {n_tokens}")
+    base_imb, base_drop = stats["倾斜 router"]
+    assert base_drop > 0
+    for name in ("aux loss 60 步", "aux-loss-free bias"):
+        assert stats[name][0] < base_imb and stats[name][1] < base_drop, name
+    # bias 法不改 router 权重 → gate 概率与原始完全相同, 只是 "选谁" 变了
+    assert np.array_equal(route(x, router_w, bias)[2], route(x, router_w)[2])
 
-    assert counts2.max() / counts2.mean() < counts.max() / counts.mean()
-    print("\n  OK: EP 的代价是两次 all-to-all + 路由均衡问题;")
-    print("      aux loss (或 DeepSeek-V3 的 bias 调节) 把热点专家压平, 丢 token 减少。")
+    print("\n  OK: EP 输出与单卡逐位相同; 两种均衡手段都压低了 max/mean 和丢 token 数。")
 
 
 if __name__ == "__main__":

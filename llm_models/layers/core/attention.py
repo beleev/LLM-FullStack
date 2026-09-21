@@ -1,23 +1,16 @@
 """
-注意力机制模块 — Attention 演进史的浓缩版
+注意力模块 — 一条主线: 每一代都在压 KV cache / 计算量, 同时尽量不掉效果
 
-按时间线 / 论文顺序排列:
-- ScaledDotProductAttention: "Attention Is All You Need" (Vaswani et al., 2017) 的数学核心
-- SingleHeadSelfAttention:   单头自注意力，教学用，便于观察权重分布
-- MultiHeadAttention:        教学版多头 (per-head 显式循环)，便于逐头可视化
-- GroupedQueryAttention:     GQA (Ainslie et al., 2023) — LLaMA-2 70B / Qwen2 等用来缓解
-                             KV cache 显存瓶颈：Q 头多、KV 头少，每组 Q 共享同一对 KV
-- MultiHeadLatentAttention:  MLA (DeepSeek-V2/V3, 2024) — 把 KV 投到低秩 latent c_kv，
-                             KV cache 减少 ~93%；同时引入解耦 RoPE 解决 latent 不能旋转的问题
-- MultiHeadLatentSparseAttention: DSA (DeepSeek V3.2, 2025) — MLA + Lightning Indexer，
-                             把 attention 从 O(L^2) 降到 O(L*k)，支持超长上下文
+    softmax(QKᵀ/√d)·V                       ScaledDotProductAttention (2017, 数学核心)
+    → MHA   每 head 一份 K/V, cache 最大      MultiHeadAttention (教学版逐头循环, 便于可视化)
+    → GQA   H 个 Q head 共享 Hkv 对 K/V       GroupedQueryAttention (cache ÷ H/Hkv; Hkv=1 即 MQA)
+            + 可选 QK-Norm / attention sink / KV cache
+    → MLA   K/V 压成低秩 latent c_kv          MultiHeadLatentAttention (DeepSeek-V2/V3, cache ↓ ~93%, 解耦 RoPE)
+    → DSA   MLA + Lightning Indexer 选 top-k  MultiHeadLatentSparseAttention (V3.2, O(L²) → O(L·k))
 
-设计权衡总览:
-    MHA   (KV cache 大、表达力满)
-      → MQA (KV head=1，cache 最小但效果掉)
-      → GQA (折中：cache 小且效果接近 MHA，工业首选)
-      → MLA (低秩压缩 KV，cache 进一步降，引入更复杂的解耦 RoPE)
-      → DSA (在 MLA 上再叠加稀疏选择，主攻长上下文成本)
+统一接口: forward(q, k, v, mask, rope, position_ids[, cache]) → Tensor; mask 为 bool, True = 可见。
+KV cache 协议见 llm_models/utils/generation.py。
+读代码时盯住: scores 的形状 [B, H, T, S] —— T 是 query 数 (解码时 = 1), S 是 key 数 (= 已缓存 + 本步)。
 """
 
 import math
@@ -26,6 +19,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from llm_models.layers.core.normalization import RMSNorm
 
 
 def _normalize_attn_mask(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -156,22 +151,20 @@ class GroupedQueryAttention(nn.Module):
     """
     Grouped-Query Attention (GQA) — Ainslie et al., 2023
 
-    动机:
-        推理阶段 KV cache 显存随 num_heads 线性增长，是大模型显存的最大头之一
-        (LLaMA-2 70B 单 token 的 KV cache 高达数 MB)。
-        GQA 让多组 Q head 共享同一对 K/V head，cache 体积 ÷ num_groups，
-        几乎不掉点 (论文显示与 MHA 差距 < 1%)。
+    KV cache 随 KV head 数线性增长。GQA 让 num_groups = H / Hkv 个 Q head 共享一对 K/V head,
+    cache ÷ num_groups, 质量几乎不掉。Hkv == H → MHA;  Hkv == 1 → MQA。
 
-    极限情况:
-        - num_kv_heads == num_heads     → 普通 MHA (cache 最大)
-        - num_kv_heads == 1             → MQA (cache 最小，但效果略差)
-        - 1 < num_kv_heads < num_heads  → GQA (LLaMA-2 70B / Qwen2 / Mistral 标配)
+    可选零件 (默认全关, 关掉时与经典 GQA 逐位相同):
+        qk_norm:  Q/K 在 RoPE 之前各过一个 head_dim 上的 RMSNorm (Qwen3 / OLMo-2)。
+                  logit = |q||k|cosθ·scale, 归一化后 |q|,|k| 被钉住, 权重再大 logit 也有界。
+        use_sink: 每个 head 一个可学 logit, 作为额外一列参与 softmax 后丢弃 (GPT-OSS)。
+                  让 head 可以 "谁都不看" (概率质量倒进 sink), 而不是被迫把 1 分完。
+        cache:    见 llm_models/utils/generation.py。存的是 RoPE 之后、复制分组之前的 K/V。
 
     Args:
-        d_model: 模型维度
-        num_heads: Q 的 head 数
-        num_kv_heads: K/V 的 head 数；默认等于 num_heads (即 MHA)
-        bias: 是否使用偏置 (现代 LLM 普遍 bias=False，节省参数且训练更稳)
+        d_model / num_heads: 模型维度 / Q head 数
+        num_kv_heads: K/V head 数, 默认等于 num_heads (MHA)
+        bias: 现代 LLM 普遍 False; GPT-3 风格传 True
     """
 
     def __init__(
@@ -180,6 +173,8 @@ class GroupedQueryAttention(nn.Module):
         num_heads: int,
         num_kv_heads: Optional[int] = None,
         bias: bool = False,
+        qk_norm: bool = False,
+        use_sink: bool = False,
     ):
         super().__init__()
 
@@ -203,41 +198,58 @@ class GroupedQueryAttention(nn.Module):
         self.w_v = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=bias)
         self.w_o = nn.Linear(num_heads * self.head_dim, d_model, bias=bias)
 
-    def forward(self, q, k=None, v=None, mask=None, rope=None, position_ids=None):
+        self.q_norm = RMSNorm(self.head_dim) if qk_norm else None
+        self.k_norm = RMSNorm(self.head_dim) if qk_norm else None
+        # sink logit 初始 0: 相当于多一个 "分数为 0 的空 key"
+        self.sink = nn.Parameter(torch.zeros(num_heads)) if use_sink else None
+
+    def forward(
+        self, q, k=None, v=None, mask=None, rope=None, position_ids=None,
+        cache: Optional[dict] = None,
+    ):
         k = q if k is None else k
         v = q if v is None else v
 
         B, T, _ = q.shape
         S = k.size(1)
 
-        # 投影并切头：[B, T, D] -> [B, T, H, Dh] -> [B, H, T, Dh]
-        # transpose(1,2) 是为了让 head 维放到 batch 维之后，便于批量 matmul
+        # [B, T, D] -> [B, T, H, Dh] -> [B, H, T, Dh]
         Q = self.w_q(q).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         K = self.w_k(k).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
         V = self.w_v(v).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        # RoPE 在切头之后、scores 之前应用：每个 head 独立旋转
-        if rope is not None:
+        if self.q_norm is not None:            # QK-Norm 在 RoPE 之前: 旋转不改范数
+            Q, K = self.q_norm(Q), self.k_norm(K)
+
+        if rope is not None:                   # 只转 Q/K; V 携带内容, 不带位置
             Q = _call_rope(rope, Q, position_ids)
             K = _call_rope(rope, K, position_ids)
 
-        # 把 KV head 复制 num_groups 份，使其形状对齐 Q head，能直接做 matmul
-        # 教学实现用 repeat_interleave；高性能 kernel (FlashAttention) 会跳过这一步
+        if cache is not None:                  # 追加本步 K/V (已旋转), 然后对全部历史做注意力
+            if "k" in cache:
+                K = torch.cat([cache["k"], K], dim=2)     # [B, Hkv, S_past+S, Dh]
+                V = torch.cat([cache["v"], V], dim=2)
+            cache["k"], cache["v"] = K, V
+
+        # KV head 复制 num_groups 份对齐 Q head (FlashAttention 等 kernel 会跳过这步拷贝)
         if self.num_groups > 1:
-            K = K.repeat_interleave(self.num_groups, dim=1)
+            K = K.repeat_interleave(self.num_groups, dim=1)   # [B, H, S, Dh]
             V = V.repeat_interleave(self.num_groups, dim=1)
 
-        # [B, H, T, Dh] · [B, H, Dh, S] -> [B, H, T, S]
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale   # [B, H, T, S]
 
         norm_mask = _normalize_attn_mask(mask)
         if norm_mask is not None:
             scores = scores.masked_fill(norm_mask == 0, float("-inf"))
 
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, V)  # [B, H, T, Dh]
+        if self.sink is not None:
+            sink = self.sink.view(1, -1, 1, 1).expand(B, -1, T, 1)   # [B, H, T, 1]
+            attn = F.softmax(torch.cat([scores, sink], dim=-1), dim=-1)[..., :-1]  # 行和 < 1
+        else:
+            attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, V)                                   # [B, H, T, Dh]
 
-        # 还原回 [B, T, H*Dh] 再做输出投影。contiguous() 是因为 transpose 不连续
+        # transpose 后内存不连续, view 前必须 contiguous
         out = out.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
         return self.w_o(out)
 
@@ -246,42 +258,26 @@ class MultiHeadLatentAttention(nn.Module):
     """
     Multi-Head Latent Attention (MLA) — DeepSeek-V2/V3 论文核心
 
-    背景:
-        GQA 通过减少 KV head 数压缩 cache，但仍需缓存 num_kv_heads * head_dim 维度。
-        DeepSeek-V2 提出: 把 KV 投到一个 **更小的低秩 latent c_kv** (例如 512 维)，
-        实际 KV 现场升维即可。论文报告 KV cache 减少约 93% 而效果不掉。
+    GQA 靠减少 KV head 省 cache, 但每 token 仍要存 2·Hkv·Dh 个数。
+    MLA 换个思路: 把 K/V 压进一个低秩 latent, 每 token 只存 (r + rope) 个数:
 
-    三大关键设计:
-        1. KV 低秩压缩 (LoRA-like):
-               c_kv = W_DKV(x)，shape [B, T, kv_lora_rank]
-           K/V 都由同一个 c_kv 升维而来。推理只需缓存 c_kv (+ 共享 K-rope)。
+        c_kv   = W_DKV x                 [B, T, r]      ← 缓存它
+        k_rope = RoPE(W_KR x)            [B, 1, T, rope] ← 和它 (所有 head 共享)
+        K = [W_UK c_kv | k_rope],  V = W_UV c_kv        ← 每步现场升维, 不缓存
 
-        2. 解耦 RoPE (decoupled RoPE):
-           为什么 latent c_kv 不能直接 RoPE？因为 RoPE 是 head_dim 上的旋转，
-           作用在低秩 c_kv 上会破坏其低秩结构 (吸收 trick 失效)。
-           方案: 把 Q/K 的每头维度拆成两段:
-               - nope 段 (no positional): 走 latent，不旋转
-               - rope 段 (rotary):        独立小投影，加旋转，承载位置信息
-           推理时 nope 段的 K 可被 W_UK 吸收进 Q 侧，只对 c_kv 算 matmul。
+    为什么要 "解耦 RoPE": RoPE 是随位置变化的旋转, 直接转 c_kv 升维出的 K 会让 W_UK
+    无法被吸收进 Q 侧; 所以每头维度拆成 nope 段 (走 latent, 不旋转) + rope 段 (小投影, 旋转)。
 
-        3. 共享 K-rope:
-           rope 段在所有 head 之间共享同一个 [B, T, rope_dim] 向量，再 broadcast，
-           进一步压缩 cache (rope 段不按 head 切分)。
+    关键数字: DeepSeek-V3 r=512, rope=64 → 576 floats/token/层; 同规模 MHA (128 头×128 维)
+    要 32768 → 省 ~98%。读代码时盯住 forward 里的 c_kv / k_rope 两个变量。
 
     Args:
-        d_model: 模型维度
-        num_heads: 注意力头数
-        kv_lora_rank: KV 潜变量维度 c_kv (DeepSeek-V3 用 512)
-        qk_nope_head_dim: Q/K 的 nope (不加 rope) 段每头维度
-        qk_rope_head_dim: Q/K 的 rope (加旋转) 段每头维度
-        v_head_dim: V 每头维度，默认等于 qk_nope_head_dim
-        q_lora_rank: Q 的低秩维度 (可选，DeepSeek-V3 也压缩了 Q 来省训练显存)
-        bias: 是否使用偏置
-
-    备注:
-        本实现走的是 "先升维再算 attention" 的训练等价路径，便于阅读；
-        生产推理会做 "权重吸收" (absorb W_UK into W_Q)，仅缓存 c_kv 即可，
-        KV cache 大小 = (kv_lora_rank + qk_rope_head_dim) per token。
+        kv_lora_rank:     latent 维度 r
+        qk_nope_head_dim: Q/K 每头不旋转段
+        qk_rope_head_dim: Q/K 每头旋转段 (传入的 rope 模块 head_dim 必须等于它)
+        v_head_dim:       V 每头维度, 默认 = qk_nope_head_dim
+        q_lora_rank:      Q 的低秩维度 (可选, V3 用它省训练激活显存)
+        latent_dim:       kv_lora_rank 的旧别名
     """
 
     def __init__(
@@ -330,74 +326,80 @@ class MultiHeadLatentAttention(nn.Module):
         # --- 输出投影 ---
         self.w_o = nn.Linear(num_heads * v_head_dim, d_model, bias=bias)
 
-    def forward(self, q, k=None, v=None, mask=None, rope=None, position_ids=None):
-        # MLA 仅用于 self-attention，k/v 若传入需与 q 同；保留参数仅为兼容统一签名
+    def forward(
+        self, q, k=None, v=None, mask=None, rope=None, position_ids=None,
+        cache: Optional[dict] = None, return_attn: bool = False,
+    ):
+        """
+        cache:       每层一个可变 dict。只存 c_kv [B, S, r] 与 post-RoPE 的共享 k_rope
+                     [B, 1, S, rope]; K/V 每步从 latent 现场升维 —— MLA 省 cache 的全部秘密。
+        return_attn: True 时额外返回 detach 的注意力概率 [B, H, T, S] (DSA indexer 对齐 loss 的目标)。
+        """
+        # MLA 仅用于 self-attention; k/v 参数只为统一签名
         x = q
         B, T, _ = x.shape
         H = self.num_heads
 
-        # --- 1) Q 投影 (可选低秩 down→up)，再切头并切分 nope/rope 两段 ---
+        # --- 1) Q: (可选低秩) 投影 → 切头 → 拆 nope/rope 两段 ---
         q_proj = self.q_up(self.q_down(x)) if self.q_down is not None else self.q_up(x)
-        q_proj = q_proj.view(B, T, H, self.qk_head_dim).transpose(1, 2)  # [B, H, T, qk_head]
+        q_proj = q_proj.view(B, T, H, self.qk_head_dim).transpose(1, 2)  # [B, H, T, nope+rope]
         q_nope, q_rope = torch.split(
             q_proj, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
-        # --- 2) KV 压缩：一次投到 [c_kv | k_rope]，c_kv 是低秩 latent，k_rope 共享 ---
-        kv_mix = self.kv_down(x)  # [B, T, kv_lora + rope_dim]
+        # --- 2) KV 压缩: 一次投到 [c_kv | k_rope] ---
+        kv_mix = self.kv_down(x)  # [B, T, r + rope]
         c_kv, k_rope = torch.split(
             kv_mix, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
-        # 解耦 K rope 在所有 head 之间共享: [B, T, rope] -> [B, 1, T, rope]
-        k_rope = k_rope.unsqueeze(1)
+        k_rope = k_rope.unsqueeze(1)  # [B, 1, T, rope], 所有 head 共享
 
-        # 从同一个 c_kv 升维出 K-nope 和 V (两组 up-projection)
-        k_nope = self.k_up(c_kv).view(B, T, H, self.qk_nope_head_dim).transpose(1, 2)
-        v_heads = self.v_up(c_kv).view(B, T, H, self.v_head_dim).transpose(1, 2)
-
-        # --- 3) 仅对 rope 段做 RoPE 旋转 (nope 段保持不变以维持低秩结构) ---
+        # --- 3) 只旋转 rope 段 (c_kv 不能旋转, 否则 W_UK 无法被吸收) ---
         if rope is not None:
             q_rope = _call_rope(rope, q_rope, position_ids)
             k_rope = _call_rope(rope, k_rope, position_ids)
 
-        # 把共享 K-rope 广播到所有 head: [B, 1, T, rope] -> [B, H, T, rope]
-        k_rope = k_rope.expand(-1, H, -1, -1)
+        # --- KV cache: 追加本步的 latent, 之后对全部 S 个位置做注意力 ---
+        if cache is not None:
+            if "c_kv" in cache:
+                c_kv = torch.cat([cache["c_kv"], c_kv], dim=1)        # [B, S, r]
+                k_rope = torch.cat([cache["k_rope"], k_rope], dim=2)  # [B, 1, S, rope]
+            cache["c_kv"], cache["k_rope"] = c_kv, k_rope
+        S = c_kv.size(1)
 
-        # --- 4) 拼接 [nope | rope] 后做标准缩放点积注意力 ---
-        q_combined = torch.cat([q_nope, q_rope], dim=-1)  # [B, H, T, qk_head]
-        k_combined = torch.cat([k_nope, k_rope], dim=-1)
+        # 从 (缓存的) latent 现场升维出 K-nope 和 V
+        k_nope = self.k_up(c_kv).view(B, S, H, self.qk_nope_head_dim).transpose(1, 2)  # [B, H, S, nope]
+        v_heads = self.v_up(c_kv).view(B, S, H, self.v_head_dim).transpose(1, 2)       # [B, H, S, v]
 
-        scores = torch.matmul(q_combined, k_combined.transpose(-2, -1)) * self.scale
+        # --- 4) 拼 [nope | rope] 后做标准缩放点积注意力 ---
+        q_combined = torch.cat([q_nope, q_rope], dim=-1)                        # [B, H, T, nope+rope]
+        k_combined = torch.cat([k_nope, k_rope.expand(-1, H, -1, -1)], dim=-1)  # [B, H, S, nope+rope]
+
+        scores = torch.matmul(q_combined, k_combined.transpose(-2, -1)) * self.scale  # [B, H, T, S]
 
         norm_mask = _normalize_attn_mask(mask)
         if norm_mask is not None:
             scores = scores.masked_fill(norm_mask == 0, float("-inf"))
 
         attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v_heads)  # [B, H, T, v_head]
+        out = torch.matmul(attn, v_heads)  # [B, H, T, v]
 
-        out = out.transpose(1, 2).contiguous().view(B, T, H * self.v_head_dim)
-        return self.w_o(out)
+        out = self.w_o(out.transpose(1, 2).contiguous().view(B, T, H * self.v_head_dim))
+        return (out, attn.detach()) if return_attn else out
 
 
 class LightningIndexer(nn.Module):
     """
     Lightning Indexer — DSA (DeepSeek V3.2) 的廉价选择器
 
-    背景:
-        长上下文场景下，标准 attention 是 O(L^2)，128k 上下文几乎不可行。
-        DSA 的思路是 "先粗选后细算"：
-            1. 用一个轻量 Indexer 快速估计 query-key 相关性
-            2. 仅保留每行 top-k 个候选位置
-            3. 再让昂贵的 MLA 只在这 k 个位置上算 softmax+加权
+    "先粗选后细算": 用几个又小又便宜的 head 给每对 (t, s) 打分, 只留每行 top-k,
+    昂贵的 MLA 只在这 k 个位置上算。
 
-    设计要点:
-        - Indexer head 数小、维度小 (<< 主 attention)，开销可忽略
-        - 用 ReLU 而非 softmax: 避免归一化导致的稀疏性丢失，单调性即可用于排序
-        - 多 head 分数相加再排序，提供集成稳健性
+        I[t, s] = Σ_h ReLU( q_h[t] · k_h[s] / sqrt(d) )      # 只需要排序, 不需要归一化
 
-    公式 (简化):
-        score(q_t, k_s) = Σ_h ReLU( (q_h · k_h) / sqrt(d_head) )
+    top-k 不可导 → indexer 从 LM loss 拿不到任何梯度。它靠单独的对齐 loss 训练
+    (见 MultiHeadLatentSparseAttention): 让 softmax(I) 去拟合主注意力的分布。
+    教学简化: 官方还有按 query 生成的 head 权重 w[t,h] 和 indexer 自己的 RoPE, 此处省略。
     """
 
     def __init__(
@@ -433,25 +435,24 @@ class LightningIndexer(nn.Module):
         q: torch.Tensor,
         k: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        cache: Optional[dict] = None,
     ) -> torch.Tensor:
-        """
-        Returns:
-            index_scores: [B, T, S]
-        """
+        """返回 index_scores [B, T, S]; 不可见位置为 -inf。cache 里多存一份 indexer 的 key。"""
         k = k if k is not None else q
-        q_heads = self._split_heads(self.w_q(q))
-        k_heads = self._split_heads(self.w_k(k))
+        q_heads = self._split_heads(self.w_q(q))  # [B, Hi, T, Di]
+        k_heads = self._split_heads(self.w_k(k))  # [B, Hi, S, Di]
 
-        # einsum 等价于 matmul，但语义更清晰：算所有 (t, s) 对的内积
+        if cache is not None:  # decode: 历史 token 的 indexer key 也要缓存, 否则没法给旧位置打分
+            if "idx_k" in cache:
+                k_heads = torch.cat([cache["idx_k"], k_heads], dim=2)
+            cache["idx_k"] = k_heads
+
         scores = torch.einsum("bhtd,bhsd->bhts", q_heads, k_heads) * self.scale
-        scores = F.relu(scores)        # 负相关直接置 0，保留正相关
-        scores = scores.sum(dim=1)     # 聚合所有 indexer head -> [B, T, S]
+        scores = F.relu(scores).sum(dim=1)  # [B, T, S]
 
         norm_mask = _normalize_attn_mask(mask)
         if norm_mask is not None:
-            # 将 [B,1,T,S] 压回 [B,T,S]
-            mask_flat = norm_mask.squeeze(1).bool()
-            scores = scores.masked_fill(~mask_flat, float("-inf"))
+            scores = scores.masked_fill(~norm_mask.squeeze(1).bool(), float("-inf"))
 
         return scores
 
@@ -460,19 +461,20 @@ class MultiHeadLatentSparseAttention(nn.Module):
     """
     DeepSeek Sparse Attention (DSA) + MLA — DeepSeek V3.2 (2025)
 
-    在 MLA 之上叠加 Lightning Indexer 选 top-k 的稀疏化方案，
-    把 attention 复杂度从 O(L^2) 降到 O(L*k)，主攻超长上下文成本。
+    MLA 省了 cache, 但注意力算力仍是 O(L²)。DSA: indexer 打分 → (先 mask 再) top-k →
+    MLA 只在选中的 k 个 key 上算, 复杂度 O(L·k)。
 
-    流程:
-        1) Lightning Indexer 算粗略相关性，**在因果/padding mask 之后** 选 top-k
-        2) 把 top-k 编成稀疏 mask 喂给 MLA，MLA 仅在这些位置算 softmax+V 加权
+    indexer 怎么训练 (top-k 不可导, LM loss 给不了梯度):
+        p[t,:] = mean_h 主注意力概率 (detach)             # 老师
+        q[t,:] = softmax(I[t,:])  (同一可见集合上)         # 学生
+        index_loss = KL(p ‖ q)
+      - indexer 的输入也 detach: index_loss 只更新 indexer, LM loss 只更新主模型, 互不干扰。
+      - dense_warmup=True  (论文第 1 阶段): MLA 看全部因果可见位置, indexer 拟合稠密注意力;
+        dense_warmup=False (第 2 阶段):     MLA 只看 top-k, KL 也只在选中集合上算。
 
-    教学实现: 仍构造 [B, T, S] 的稠密 sparse_mask 再传给 MLA；
-              生产版本会跳过被 mask 掉的 KV 读取，配合自定义 CUDA kernel。
-
-    重要正确性提醒:
-        必须先用 base_mask 把不可见位置的 indexer 分数压成 -inf，再 topk；
-        否则 top-k 可能选中未来 token，造成训练时数据泄漏。
+    每次有梯度的 forward 后可读: last_index_loss (标量), last_index_scores / last_attn_target
+    ([B, T, S], detach, 供监控 top-k 召回率)。
+    教学实现仍构造稠密 [B, T, S] mask; 生产版靠自定义 kernel 真正跳过未选中的 KV。
     """
 
     def __init__(
@@ -497,8 +499,10 @@ class MultiHeadLatentSparseAttention(nn.Module):
             raise ValueError(f"sparse_top_k 必须为正数，当前 {sparse_top_k}")
 
         self.sparse_top_k = sparse_top_k
+        self.dense_warmup = False    # True: MLA 走稠密, indexer 只旁听学习 (论文 warm-up 阶段)
+        self.last_index_loss = None  # 每次带梯度的 forward 后刷新
 
-        self.mla = MultiHeadLatentAttention(
+        self.mla =MultiHeadLatentAttention(
             d_model=d_model,
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
@@ -535,36 +539,50 @@ class MultiHeadLatentSparseAttention(nn.Module):
         B, T, S = index_scores.shape
         k = min(self.sparse_top_k, S)
 
-        if k >= S:
-            # 稀疏实际等价于稠密
+        if k >= S:  # 稀疏退化为稠密
             if base_mask is None:
                 return torch.ones_like(index_scores, dtype=torch.bool)
-            return base_mask.bool()
+            return base_mask.bool().expand(B, T, S)
 
-        # 重要修复: 先屏蔽被 base_mask 禁止的位置，再取 top-k
+        # 必须先 mask 再 top-k, 否则会选中未来 token (数据泄漏)
         scores = index_scores
         if base_mask is not None:
             scores = scores.masked_fill(~base_mask.bool(), float("-inf"))
 
-        topk_indices = torch.topk(scores, k=k, dim=-1).indices
+        # 不可导: 梯度到此为止。用 stable sort 而非 torch.topk: ReLU 后大量分数恰为 0,
+        # topk 对并列的取舍随行长而变 → 带 cache 的 decode 会和整段 forward 选出不同的 key。
+        # stable sort 下并列者固定取靠前的位置, 两条路径一致。
+        topk_indices = scores.sort(dim=-1, descending=True, stable=True).indices[..., :k]
         sparse = torch.zeros(B, T, S, dtype=torch.bool, device=index_scores.device)
         sparse.scatter_(-1, topk_indices, True)
 
         if base_mask is not None:
-            sparse = sparse & base_mask.bool()
+            sparse = sparse & base_mask.bool()  # 可见位置不足 k 个的行会选到 -inf, 这里剔掉
         return sparse
 
-    def forward(self, q, k=None, v=None, mask=None, rope=None, position_ids=None):
-        # 1) Lightning Indexer 给所有 (t, s) 打分
-        index_scores = self.indexer(q, k=q, mask=mask)
+    def forward(self, q, k=None, v=None, mask=None, rope=None, position_ids=None, cache=None):
+        # 1) indexer 打分。输入 detach: index_loss 不应改动主干的表示
+        index_scores = self.indexer(q.detach(), mask=mask, cache=cache)  # [B, T, S]
 
-        # 把外部 mask 规范成 [B, T, S]，传给 _sparse_mask_from_topk 做先 mask 再 topk
-        base_mask_3d = None
-        if mask is not None:
-            m = _normalize_attn_mask(mask).squeeze(1)
-            base_mask_3d = m if m.dim() == 3 else m.unsqueeze(0).expand(q.size(0), -1, -1)
+        base_mask = None if mask is None else _normalize_attn_mask(mask).squeeze(1)  # [B|1, T, S]
+        sparse_mask = self._sparse_mask_from_topk(index_scores, base_mask)
+        used_mask = sparse_mask
+        if self.dense_warmup and base_mask is not None:
+            used_mask = base_mask.bool().expand_as(sparse_mask)
 
-        sparse_mask = self._sparse_mask_from_topk(index_scores, base_mask_3d)
+        # 2) MLA 只在 used_mask 允许的位置上做注意力
+        out, attn = self.mla(
+            q, mask=used_mask, rope=rope, position_ids=position_ids,
+            cache=cache, return_attn=True,
+        )  # attn: [B, H, T, S], 已 detach
 
-        # 2) MLA 在稀疏 mask 限定的 top-k 候选上做精细 attention
-        return self.mla(q, mask=sparse_mask, rope=rope, position_ids=position_ids)
+        # 3) indexer 对齐 loss: KL( 主注意力 ‖ softmax(indexer 分数) ), 都限定在 used_mask 上
+        self.last_index_loss = None
+        if torch.is_grad_enabled():
+            p = attn.mean(dim=1)  # [B, T, S]; 各头都已归一, 平均后每行仍和为 1
+            log_q = F.log_softmax(index_scores.masked_fill(~used_mask, float("-inf")), dim=-1)
+            log_q = log_q.masked_fill(~used_mask, 0.0)  # 这些位置 p=0, 置 0 避免 0·(-inf)=nan
+            kl = (p * (p.clamp_min(1e-9).log() - log_q)).sum(dim=-1)  # [B, T]
+            self.last_index_loss = kl.mean()
+            self.last_index_scores, self.last_attn_target = index_scores.detach(), p
+        return out

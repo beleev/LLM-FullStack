@@ -1,0 +1,30 @@
+// 阶段 3 · llm_train 术语。number 取自对应 demo 的实际输出或论文公式。
+const t = (term, aka, oneliner, number, route) => ({ term, aka, stage: 'train', oneliner, number, route })
+
+export default [
+  t('DDP', 'Distributed Data Parallel', '每卡一份完整模型算不同样本, all-reduce 梯度后同步更新', '每卡每步发 2(N−1)/N·S', 'train-batch-ddp'),
+  t('Ring all-reduce', '环形全归约', '张量切 N 块沿环传: 先边传边加, 再传一圈', 'N=8 → 14 步, 每卡发 1.75S', 'train-collectives-loop'),
+  t('reduce-scatter', '归约散播', '求和后每卡只留自己那 1/N; ring all-reduce 的前半段', '每卡发 (N−1)/N·S', 'train-collectives-loop'),
+  t('all-to-all', '全交换', '每卡给每卡发不同的数据; MoE 路由和 Ulysses 的核心原语', 'out[dst][src] = in[src][dst]', 'train-ulysses'),
+  t('张量并行', 'TP / Megatron', '切单层矩阵: 先列切后行切, 中间激活函数本地算', '一层 = 前向 2 + 反向 2 次 all-reduce', 'train-model-parallel'),
+  t('流水线并行', 'PP / Pipeline Parallel', '按层切 stage, micro-batch 在 stage 间流动', '气泡 = (PP−1)/(M+PP−1)', 'train-model-parallel'),
+  t('1F1B', 'One-Forward-One-Backward', 'warmup 后一前一后交替; 气泡同 GPipe, 省的是在途激活', 'PP=4,M=8: 峰值 [4,3,2,1] vs [8,8,8,8]', 'train-pipeline-schedules'),
+  t('交错 1F1B', 'Interleaved 1F1B', '每卡拿 v 个小 stage, 气泡除以 v, 代价是 v 倍 P2P', '27.3% → 15.8% (v=2)', 'train-pipeline-schedules'),
+  t('ZeRO', 'Zero Redundancy Optimizer', '把优化器状态 / 梯度 / 参数依次按卡切成 1/N', '16Ψ → 4Ψ+12Ψ/N → 2Ψ+14Ψ/N → 16Ψ/N', 'train-memory'),
+  t('FSDP', 'Fully Sharded Data Parallel', '≈ ZeRO-3: 用到哪层 gather 哪层, 算完立刻 free', '通信 ≈ 1.5× DDP', 'train-memory'),
+  t('2+2+12', '混合精度 Adam 显存账', '参数 2 + 梯度 2 + fp32 master/m/v 12 字节', '7B → 112 GB; ZeRO-1×64 卡 ≈ 29 GB', 'train-memory'),
+  t('激活重算', 'Activation Checkpointing', '只存段边界, 反向时重跑段内前向', '峰值 L/k + k, k=√L; 计算 +33%', 'train-memory'),
+  t('混合精度', 'AMP', 'fp16 算前反向, fp32 master 做更新', '纯 fp16 权重 + 1e-5 更新: 100 步不动', 'train-precision-stability'),
+  t('Loss Scaling', '动态损失缩放', '反向前放大 loss 防小梯度下溢; 溢出就跳步并减半', 'FP16 最小 6e-8; 连续 2000 好步翻倍', 'train-precision-stability'),
+  t('BF16', 'bfloat16', '8 位指数 + 7 位尾数: 范围同 FP32, 不需要 loss scale', '精度比 FP16 粗 8 倍', 'train-precision-stability'),
+  t('FP8', 'E4M3 / E5M2', '8 位浮点训练: 必须配 scale, 更必须留高精度 master', 'E4M3 max 448; scaling 29×, master 584×', 'train-precision-stability'),
+  t('Block Scaling', '细粒度缩放', '每个小 block 一个 scale, 限制 outlier 能连累的邻居数', 'FP8 上 outlier > 1e5× 才见分晓', 'train-low-precision'),
+  t('MXFP4', 'OCP Microscaling FP4', 'E2M1 元素 + 每 32 个共享一个 2 的幂 (E8M0) scale', '4.25 bit; 42% block 最大值被饱和', 'train-low-precision'),
+  t('NVFP4', 'NVIDIA FP4', 'E2M1 元素 + 每 16 个共享一个带尾数的 E4M3 scale', '4.5 bit; 误差 0.095 vs MXFP4 0.113', 'train-low-precision'),
+  t('WSD', 'Warmup-Stable-Decay', '稳定段 LR 与总步数无关, 最后 ~10% 才退火; 随时可加训', '改总步数: cosine 差 5.96e-4, WSD 差 0', 'train-lr-schedule'),
+  t('Muon', 'Momentum Orthogonalized', '把 2-D 权重的动量矩阵正交化后再更新', 'NS 5 步: σ 1e-4 → 0.041; 状态是 Adam 的一半', 'train-muon'),
+  t('专家并行', 'EP / Expert Parallel', '专家分卡, token 经两次 all-to-all 找专家再回家', '64 token, 8 专家, cf=1.25 → 容量 10', 'train-moe-seq'),
+  t('Ring Attention', '上下文并行 / CP', '序列切给多卡, KV 块沿环传, online softmax 精确合并', '每卡只持有 1/D 的 KV', 'train-moe-seq'),
+  t('Zigzag 切分', 'Zigzag Sharding', '序列切 2D 段一头一尾配对, 因果 mask 下每卡工作量相同', '墙钟 228 → 132, 快 1.73×', 'train-moe-seq'),
+  t('Ulysses', 'DeepSpeed-Ulysses', 'all-to-all 把切序列换成切头: 每卡完整序列、部分头', '每卡发 4(P−1)/P²; P 须整除头数', 'train-ulysses'),
+]

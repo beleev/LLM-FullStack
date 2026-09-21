@@ -1,93 +1,60 @@
 """
-Knowledge Distillation — 知识蒸馏 (Hinton et al., 2015)
-========================================================
+知识蒸馏 (off-policy, forward KL) — Hinton et al., 2015
 
-历史背景:
-    大模型能力强但部署贵。蒸馏让小模型 (student) 不仅学习硬标签, 还模仿
-    大模型 (teacher) 的**完整输出分布**。LLM 时代它无处不在:
-        - DistilBERT (2019): 6 层学 12 层, 保留 97% 能力
-        - 各家 "-mini / -flash / -turbo" 小模型普遍有蒸馏环节
-        - DeepSeek-R1 (2025): 用 R1 的输出把推理能力蒸进 Qwen/Llama 小模型
-          (R1 蒸馏版走的是数据蒸馏/序列蒸馏: 老师生成文本给学生做 SFT;
-           本文件实现的是 logit 蒸馏, 两者思想一致 —— 学分布而非学标签)
-
-为什么软标签比硬标签信息多 (dark knowledge):
-    硬标签:  "正确答案是 token 42"                     → log V 比特
-    软标签:  "42: 0.7, 17: 0.2, 99: 0.05, ..."        → 老师对相似 token 的
-             相对排序、置信度全在分布里, 学生每个样本拿到 V 维监督
-
-温度 T 的作用:
-    softmax(z/T): T 越大分布越平, 非最大项的"暗知识"被放大。
-    KL 项要乘 T^2: softmax(z/T) 的梯度自带 1/T^2 缩放, 不补偿的话
-    调温度会顺带改变 KD 项与 CE 项的相对权重 (Hinton 论文的细节)。
-
-损失:
-    L = α · CE(student, 硬标签) + (1-α) · T² · KL( p_teacher^T ‖ p_student^T )
+是什么: student 除了学硬标签, 还在**同一批数据**的每个位置上模仿 teacher 的整个输出分布。
+解决什么: 硬标签每个位置只有 log V 比特; teacher 的分布还带着 "其它答案各有多合理" —— 对有多个合理答案的数据,
+          一条软标签 ≈ 许多条采样出来的硬标签, 方差小得多。
+核心公式:  L = α·CE(student, y) + (1−α)·T²·KL( p_T^teacher ‖ p_T^student ),   p_T = softmax(z / T)
+           ×T²: softmax(z/T) 的梯度自带 1/T², 不补回来的话调 T 会顺带改变两项的相对权重。
+读代码时盯住: `mask` —— KD 项和 CE 项必须用**同一个** mask (label = −100 的位置都不算), 否则 prompt / pad 位置也在被蒸馏。
+forward KL = mode-covering: teacher 有质量的地方 student 都得有。数据来自 teacher / 数据集而不是 student 自己,
+所以 student 从没在**自己会走到的前缀**上被训练过 → 对照 on_policy_distill.py。
 """
 
 from typing import Dict
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
+from llm_models.training.loss import LossComputer
+from llm_finetune.utils.param_utils import freeze_module
 
-class DistillLoss:
-    """
-    logit 蒸馏损失。
 
-    与库内其它 LossComputer 不同, 它需要 teacher / student 两路 logits,
-    因此不接入通用 Trainer, 由 run_finetune/distill 的训练循环直接调用
-    (与 DPOTrainer 重写 train_step 是同一类问题的两种解法)。
+class TeacherStudent(nn.Module):
+    """和 dpo.PairwiseForward 同一个扩展点: 把 "student 前向 + 冻结 teacher 前向" 包成一个 Module 交给通用 Trainer。"""
 
-    Args:
-        temperature: 软化温度 T (常用 1~4; 越大暗知识越多, 信号也越弱)
-        alpha:       硬标签 CE 的权重 (1-alpha 给蒸馏项)
-    """
+    def __init__(self, student: nn.Module, teacher: nn.Module) -> None:
+        super().__init__()
+        self.student = student
+        freeze_module(teacher)
+        teacher.eval()
+        self._teacher = (teacher,)                # tuple: 不注册为子模块 → 不进 optimizer, 不被 .train() 影响
+
+    def forward(self, idx: torch.Tensor) -> Dict[str, torch.Tensor]:
+        with torch.no_grad():                     # teacher 只提供目标
+            teacher_logits = self._teacher[0](idx)
+        return {"student": self.student(idx), "teacher": teacher_logits}      # [B, T, V] ×2
+
+
+class DistillLoss(LossComputer):
+    """temperature: 越大 teacher 分布越平, 非最大项越显眼; alpha: 硬标签 CE 的权重。"""
 
     def __init__(self, temperature: float = 2.0, alpha: float = 0.3) -> None:
-        if temperature <= 0:
-            raise ValueError("temperature 必须 > 0")
-        if not (0.0 <= alpha <= 1.0):
-            raise ValueError("alpha 必须在 [0, 1]")
-        self.temperature = temperature
-        self.alpha = alpha
+        if temperature <= 0 or not 0.0 <= alpha <= 1.0:
+            raise ValueError("需要 temperature > 0 且 0 ≤ alpha ≤ 1")
+        self.temperature, self.alpha = temperature, alpha
 
-    def compute(
-        self,
-        student_logits: torch.Tensor,   # [B, T, V] 需要梯度
-        teacher_logits: torch.Tensor,   # [B, T, V] 应当 detach / no_grad 得到
-        labels: torch.Tensor,           # [B, T]    硬标签 (-100 跳过)
-    ) -> Dict[str, torch.Tensor]:
-        V = student_logits.size(-1)
-        T = self.temperature
+    def compute(self, model_output: Dict[str, torch.Tensor], labels: torch.Tensor,
+                **kwargs) -> Dict[str, torch.Tensor]:
+        s, t, T = model_output["student"], model_output["teacher"], self.temperature
+        ce = F.cross_entropy(s.reshape(-1, s.size(-1)), labels.reshape(-1), ignore_index=-100)
 
-        # ---- 硬标签 CE (与普通 LM 训练相同) ----
-        ce = F.cross_entropy(
-            student_logits.reshape(-1, V),
-            labels.reshape(-1),
-            ignore_index=-100,
-        )
+        mask = labels != -100                                                        # [B, T]
+        log_p_s = F.log_softmax(s / T, dim=-1)                                       # [B, T, V]
+        log_p_t = F.log_softmax(t / T, dim=-1)
+        kl_tok = (log_p_t.exp() * (log_p_t - log_p_s)).sum(dim=-1)                   # [B, T] 逐位置 KL(teacher‖student)
+        kd = (kl_tok * mask).sum() / mask.sum() * T * T                              # 只在被监督的位置上平均
 
-        # ---- 软标签 KL: 两边都用温度 T 软化, 再乘 T^2 补偿梯度 ----
-        kd = F.kl_div(
-            F.log_softmax(student_logits / T, dim=-1).reshape(-1, V),
-            F.softmax(teacher_logits.detach() / T, dim=-1).reshape(-1, V),
-            reduction="batchmean",
-        ) * (T * T)
-
-        total = self.alpha * ce + (1.0 - self.alpha) * kd
-        return {
-            "total_loss": total,
-            "ce_loss": ce.detach(),
-            "kd_loss": kd.detach(),
-        }
-
-
-@torch.no_grad()
-def soften_demo(logits: torch.Tensor, temperatures: tuple = (1.0, 2.0, 4.0)) -> None:
-    """打印同一行 logits 在不同温度下的 top-3 概率 —— 直观看到"暗知识"被放大。"""
-    for T in temperatures:
-        probs = F.softmax(logits / T, dim=-1)
-        top_p, top_i = probs.topk(3)
-        items = ", ".join(f"tok{int(i)}: {float(p):.3f}" for p, i in zip(top_p, top_i))
-        print(f"    T={T:<4} top-3: {items}")
+        return {"total_loss": self.alpha * ce + (1 - self.alpha) * kd,
+                "ce_loss": ce.detach(), "kd_loss": kd.detach()}

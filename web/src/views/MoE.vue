@@ -203,6 +203,13 @@
       </div>
     </section>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav
       :prev="{ name: 'blocks', label: 'Block 组装器', hint: 'MoE 只是 ffn 槽位的一种填法' }"
       :next="{ name: 'diffusion', label: '扩散生成', hint: '换一条主线: 用 attention 学「去噪」而不是「下一个 token」' }"
@@ -211,6 +218,8 @@
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import { ref, reactive, computed, watch, onMounted } from 'vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'

@@ -1,18 +1,10 @@
 """
-训练配置模块
-================
+训练超参 — 一个 frozen dataclass + "linear warmup → cosine decay" 调度
 
-定义训练超参数的不可变数据类 (frozen dataclass)。
-
-为什么用 frozen dataclass？
-- 配置一旦构造完成就不应被修改，避免训练中途意外篡改导致难以复现的 bug
-- 不可变对象天然线程安全，便于多 worker 共享
-- 与 "代码风格中的 immutability 原则" 保持一致
-
-设计要点：
-- 学习率调度采用 "linear warmup + cosine decay"，这是 Transformer 训练的事实标准：
-  warmup 缓解 Adam 在初期对二阶动量估计不准带来的发散，
-  cosine 衰减末期接近 0，便于模型收敛到平坦极小值。
+为什么 frozen: 配置构造后不可改, 训练中途被意外篡改是最难复现的一类 bug。
+调度: step < warmup 时 lr 系数 = step / warmup (从 **0** 线性升到 1; Adam 前几步二阶动量估计不准, 大 lr 易发散);
+      之后 0.5·(1 + cos(π·progress)) 平滑降到 0。
+读代码时盯住: `lr_lambda(0) == 0` —— 第 1 步不更新参数, 所以日志第一条 loss 是未训练模型的 loss。
 """
 
 import math
