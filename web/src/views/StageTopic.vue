@@ -12,31 +12,30 @@
     />
 
     <section v-if="hasLabs" class="section">
-      <h2>0. 动手实验台</h2>
+      <h2>先动手</h2>
       <p class="lead">
-        先动手, 再读字。拖动参数, 观察右侧数字与图形的联动 —— 每个实验台都对应一个可运行的 Python 模块。
+        拖一下滑杆, 右边的数字会跟着动。看懂哪个数字被什么牵着走, 下面的字就好读了。
       </p>
       <LabMount />
     </section>
 
     <section class="section">
-      <h2>1. 本章抓手</h2>
+      <h2>三句话</h2>
       <p class="lead">
-        先用三句话锁定概念边界, 再回到原始代码。读代码时只追关键变量,
-        不把注意力分散到框架细节上。
+        这一章全部的内容就这三条。带「重点」的那条是走的时候必须带上的。
       </p>
       <div class="grid grid-3">
-        <div v-for="p in page.points" :key="p.title" class="card point-card">
-          <h3>{{ p.title }}</h3>
+        <div v-for="p in page.points" :key="p.title" class="card point-card" :class="{ key: p.key }">
+          <h3>{{ p.title }} <span v-if="p.key" class="key-tag">重点</span></h3>
           <p class="desc">{{ p.body }}</p>
         </div>
       </div>
     </section>
 
     <section class="section">
-      <h2>2. 知识怎么接上前后文</h2>
+      <h2>它接在哪</h2>
       <p class="lead">
-        每个子章都不是孤立概念。下面按“上一层抽象 → 本章机制 → 后续用途”读。
+        没有哪个技术是凭空出现的。左边是它替换掉的东西, 右边是它后来被用在哪。
       </p>
       <div class="card link-card">
         <div v-for="l in page.links" :key="`${l.from}-${l.to}`" class="link-row">
@@ -57,9 +56,9 @@
     </section>
 
     <section class="section">
-      <h2>3. 原始代码对照</h2>
+      <h2>去代码里找什么</h2>
       <p class="lead">
-        这一节只列读代码必须抓住的行级意图: 变量代表什么, 为什么这样写, 它验证了什么。
+        打开源码之前先看这张表。只盯这几行, 其余的先放过。
       </p>
       <div class="card" style="padding: 0; overflow-x: auto;">
         <table class="topic-table">
@@ -67,7 +66,7 @@
             <tr>
               <th>概念</th>
               <th>代码位置 / 表达式</th>
-              <th>读这一行要理解什么</th>
+              <th>这一行在说什么</th>
             </tr>
           </thead>
           <tbody>
@@ -90,9 +89,9 @@
     </section>
 
     <section class="section">
-      <h2>4. 最小代码骨架</h2>
+      <h2>骨架长这样</h2>
       <p class="lead">
-        下面是从原始代码里抽出的核心控制流。完整实现仍以对应 Python 文件为准。
+        只留控制流, 细节都砍了。想看完整实现就展开下面的真源码 —— 那是直接从仓库文件里读出来的, 不会和代码脱节。
       </p>
       <div class="card">
         <h3>{{ page.snippetTitle }} <span v-if="page.run" class="tag">可运行</span></h3>
@@ -100,7 +99,7 @@
         <!-- page.source: 直接从仓库 Python 文件取的真源码, 不会和代码漂移 -->
         <SourceSnippet v-for="s in sources" :key="s" :src="s" />
         <p v-if="page.run" class="hint">
-          运行入口: <code class="inline">{{ page.run }}</code>
+          跑一下: <code class="inline">{{ page.run }}</code>
         </p>
       </div>
     </section>
@@ -177,6 +176,12 @@ const topicRef = (ref) => {
 <style scoped>
 .point-card h3 {
   margin-bottom: 6px;
+}
+/* key: true 的那条是这一章必须带走的 */
+.point-card.key { border-color: var(--accent); }
+.key-tag {
+  font-size: 10px; font-weight: 500; padding: 1px 6px; border-radius: 3px;
+  background: var(--accent-soft); color: var(--accent); letter-spacing: 0.3px;
 }
 
 .link-card {

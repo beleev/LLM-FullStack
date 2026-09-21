@@ -2,18 +2,19 @@
   <div>
     <h1 class="page-title">MoE 路由可视化</h1>
     <p class="page-subtitle">
-      MoE (Mixture of Experts) 把一个巨大 FFN 切成 E 个小 FFN, 每个 token 只激活 top-k 个,
-      用 "E/k 倍参数量、k 倍算力" 换取容量与算力的解耦。本页并排对比两种范式:
-      <strong>Mixtral (softmax + 外部 aux)</strong> vs <strong>DeepSeek (sigmoid + 共享专家 + aux-free bias)</strong>。
+      想让模型更懂，最直接的办法是把 FFN 做大；但 FFN 一大，每个 token 的算力就跟着涨。
+      MoE 的办法是把一个巨大 FFN 切成 E 个小 FFN，每个 token 只激活其中 top-k 个：参数量涨 E/k 倍，算力只涨 k 倍，
+      容量和算力就此解耦。本页把两套路由哲学并排放：
+      <strong>Mixtral (softmax + 外挂 aux loss)</strong> 对 <strong>DeepSeek (sigmoid + 共享专家 + aux-free bias)</strong>。
     </p>
 
     <ChapterIntro
-      tldr="MoE = 给 ffn 槽位换上「E 个小 FFN + 一个 router」。Mixtral 与 DeepSeek 不是版本号差异, 而是两套不同的路由哲学。"
-      question="专家变多以后, 如何避免 router 把所有 token 都送到那几个明星专家? 让训练 loss 不被「负载均衡」污染?"
+      tldr="MoE 就是把 ffn 槽位换成「E 个小 FFN + 一个 router」。Mixtral 和 DeepSeek 不是新旧版本, 是两套不同的路由哲学。"
+      question="专家一多, 怎么防止 router 把所有 token 都塞给那几个明星专家? 又怎么不让「负载均衡」这件事污染语言建模的 loss?"
       :goals="[
-        '看懂 MoE 是怎么把单 FFN 替换成 router + E 个小 FFN',
-        '区分 Mixtral 的 softmax top-k 与 DeepSeek 的 sigmoid + shared 路由',
-        '理解 aux-free 路由怎么避免「明星专家」吃掉所有 token',
+        '看懂一个 FFN 是怎么被换成 router 加 E 个小 FFN 的',
+        '分清 Mixtral 的 softmax top-k 和 DeepSeek 的 sigmoid + 共享专家',
+        '说清 aux-free 的偏置怎么在不碰门控权重的前提下把负载拉平',
       ]"
       :codes="[
         { path: 'llm_models/layers/sparse/moe.py', label: 'moe.py · MixtralMoE' },
@@ -64,6 +65,10 @@
         <button @click="regenerate">🎲 重新采样 tokens</button>
         <button @click="animateFlow" :disabled="animating">▷ 播放路由动画</button>
       </div>
+      <p class="desc" style="margin-top: 10px;">
+        把「路由坍塌倾向」拉到 100%：大部分 token 都往前两个专家挤，负载标准差变红，其余专家白占着显存。
+        真实训练里这是个正反馈——被选中得多的专家学得更好，于是更容易被选中。所以 MoE 必须配一套均衡机制。
+      </p>
     </div>
 
     <!-- 主可视化: 左 tokens → 中 router → 右 experts -->
@@ -146,24 +151,29 @@
         <div class="stat">
           <div class="k">负载标准差</div>
           <div class="v" :style="{ color: loadStdColor }">{{ loadStd.toFixed(2) }}</div>
-          <div class="hint">越低表示路由越均衡</div>
+          <div class="hint">越小越均衡; 拖「路由坍塌倾向」看它变红</div>
         </div>
         <div class="stat">
-          <div class="k">最热门专家</div>
+          <div class="k">最热门的专家</div>
           <div class="v">E{{ hottestExpert.idx }}</div>
-          <div class="hint">承载 {{ Math.round(hottestExpert.load / totalRoutedAssigns * 100) }}% 的路由</div>
+          <div class="hint">一个人扛了 {{ Math.round(hottestExpert.load / totalRoutedAssigns * 100) }}% 的路由</div>
         </div>
         <div class="stat">
           <div class="k">激活比例</div>
           <div class="v accent">{{ (topK / numExperts * 100).toFixed(1) }}%</div>
-          <div class="hint">top-k / 总专家, 算力占比</div>
+          <div class="hint">top-k / 总专家 = 每个 token 实际用掉的算力占比</div>
         </div>
       </div>
     </div>
 
     <!-- 对比表 -->
     <section class="section">
-      <h2>Mixtral vs DeepSeek MoE 差异</h2>
+      <h2>Mixtral 和 DeepSeek 的 MoE 差在哪</h2>
+      <p class="lead">
+        每一行都是一个被踩过的坑: 专家太大就没法分工, 没有共享专家每个专家都要重学一遍通用能力,
+        不做均衡就会滚雪球滚成路由坍缩, 而用 aux loss 做均衡又会跟语言建模抢梯度。
+        DeepSeek 的每一列都是对左边那一列的回答。
+      </p>
       <div class="card">
         <table class="compare">
           <thead>
@@ -183,12 +193,12 @@
               <td>top-k 后再 renormalize</td>
             </tr>
             <tr><td class="row-label">共享专家</td>
-              <td>❌ 无</td>
-              <td>✅ 始终激活 (托底通用能力)</td>
+              <td>❌ 没有</td>
+              <td>✅ 每个 token 都过, 专管通用知识 — 路由专家才腾得出容量去分化</td>
             </tr>
             <tr><td class="row-label">负载均衡</td>
-              <td>Switch-style 外部 aux loss</td>
-              <td>aux-loss-free bias (不污染主 loss)</td>
+              <td>Switch 那套外挂 aux loss, 梯度直接压热门专家的路由分数</td>
+              <td>aux-loss-free bias: 不收梯度, 只改 top-k 选谁 (demo 实测负载 CV 从 0.273 降到 0.124, LM loss 几乎不动: 2.979 vs 2.982)</td>
             </tr>
             <tr><td class="row-label">专家粒度</td>
               <td>8 个大专家</td>

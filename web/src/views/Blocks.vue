@@ -2,18 +2,18 @@
   <div>
     <h1 class="page-title">Block 组装器</h1>
     <p class="page-subtitle">
-      本库的核心设计洞察: <strong>模型差异集中在"构造参数"而非"新类"</strong>。
-      从下面的零件菜单里各选一个, 看看你拼出了哪个模型。对应
+      这个库最省事的一点: <strong>模型之间的差别基本都在"构造参数"上, 很少需要新写一个类</strong>。
+      下面的零件菜单每栏挑一个, 看看拼出来的是哪个模型。骨架就一份:
       <RepoLink path="llm_models/layers/core/blocks.py:PreLNBlock" label="llm_models/layers/core/blocks.py::PreLNBlock(attn, ffn, norm_cls)" tiny />。
     </p>
 
     <ChapterIntro
-      tldr="LLaMA、Mixtral、DeepSeek-V3 不是「新模型」, 是同一份 PreLNBlock 用不同的 attn/ffn/norm/pos 实例化出来的结果。"
-      question="如果模型间的差异只是 4 个构造参数, 那「读 N 个模型源码」是不是变成了「读 N 张零件配置表」?"
+      tldr="LLaMA、Mixtral、DeepSeek-V3 不是三个新模型, 是同一份 PreLNBlock 换了 attn / ffn / norm / pos 四个参数实例化出来的。"
+      question="模型之间就差 4 个构造参数的话, 「读 N 个模型的源码」是不是变成了「读 N 张零件配置表」?"
       :goals="[
-        '把不同模型抽象成 PreLNBlock 的 4 个零件配置',
-        '理解 Pre-LN vs Post-LN 在训练稳定性上的差异',
-        '能从 LLaMA / Mixtral / DeepSeek 中读出零件替换的位置',
+        '把任意一个模型翻译成 PreLNBlock 的四个零件配置',
+        '说清 Pre-LN 为什么让深层模型不靠精细 warmup 也能开训',
+        '在 LLaMA / Mixtral / DeepSeek 的代码里一眼找到零件被换掉的那几行',
       ]"
       :codes="[
         { path: 'llm_models/layers/core/blocks.py', label: 'blocks.py · PreLNBlock' },
@@ -42,7 +42,9 @@
       <div class="card">
         <h3>数据流 · Pre-LN Block <span class="tag">{{ modelMatch.name }}</span></h3>
         <p class="desc" style="margin-bottom: 20px;">
-          Pre-LN 把归一化从残差主路径移到子层分支内, 是训练稳定的关键 (Xiong et al., 2020)。
+          盯住那两条虚线: 残差主干上一个 norm 都没有。原始 Post-LN 是先加再归一化, 梯度每过一层就被缩放一次,
+          几十层堆上去就得靠精细的 warmup 才敢开训。Pre-LN 把 norm 挪进子层分支里, 主干变成纯加法, 梯度直通到底
+          (Xiong et al., 2020) —— 这一步之后, 深层 Transformer 才算好训。
         </p>
 
         <svg viewBox="0 0 440 420" width="100%" :height="420">
@@ -182,7 +184,7 @@
         </div>
 
         <div class="card" style="margin-top: 16px;">
-          <h3>这一组合的总参数量影响</h3>
+          <h3>换零件之后, 参数量和 cache 变成多少</h3>
           <div class="stat" style="margin-top: 4px;">
             <div class="k">FFN 参数</div>
             <div class="v">{{ ffnParams }}</div>
@@ -200,7 +202,12 @@
     <!-- 快速切换到真实模型 -->
     <section class="section">
       <h2>一键载入预设</h2>
-      <p class="lead">点击下面任一模型, 自动填充其零件配置:</p>
+      <p class="lead">
+        点任意一个模型, 它的零件配置会自动填进上面的菜单。
+        按年份点一遍 Transformer → GPT-3 → LLaMA → Mixtral → DeepSeek-V3, 你会看到四个槽位是一个一个被换掉的:
+        norm 从 Post-LN 挪到 Pre-LN 再瘦成 RMSNorm, ffn 从 ReLU 换 GELU 再换门控的 SwiGLU,
+        attn 从 MHA 砍到 GQA 再压成 MLA, pos 从正余弦换成 RoPE。
+      </p>
       <div class="btn-group">
         <button v-for="preset in presets" :key="preset.name"
                 @click="loadPreset(preset)">
@@ -213,11 +220,25 @@
     <section class="section">
       <h2>内部矩阵变换</h2>
       <p class="lead">
-        展开所选零件的"计算流 + 权重矩阵"。每一步都标注张量的符号形状与按当前参数计算出的数值;
-        拖动形状滑条, 所有数字会同步刷新。源代码:
+        把选中的零件拆开看计算流和权重矩阵。每一步都标了张量的符号形状, 以及按当前参数算出来的实际数字;
+        拖形状滑条, 所有数字同步刷新。源码:
         <RepoLink path="llm_models/layers/core/{attention,feedforward,normalization,position_encoding}.py" label="llm_models/layers/core/{attention,feedforward,normalization,position_encoding}.py" tiny />。
       </p>
       <InspectorPanel :config="config" :tab="inspectorTab" @update:tab="inspectorTab = $event" />
+    </section>
+
+    <!-- 零件都拼对了, 模型也不一定训得起来: 初始化是另一道坎 -->
+    <section class="section">
+      <h2>零件拼对了, 还有一道坎: 初始化</h2>
+      <p class="lead">
+        一个刚建好、什么都没学的模型应该在词表上均匀瞎猜，第一步的交叉熵就该是 <span class="mono">ln V</span>。
+        本仓库真出过这个 bug：LLaMA 把 lm_head 和输入嵌入绑权重，嵌入又用了 <span class="mono">nn.Embedding</span> 默认的
+        <span class="mono">N(0, 1)</span> —— 绑权重之后每个 token 都会给「它自己」打一个约 σ·d 的高分，而正确答案几乎从来不是它自己。
+        结果首步 CE 是 <strong class="mono">258</strong>，而 <span class="mono">ln 1000 = 6.91</span>。
+        改法只有一行：把 σ 降到 <span class="mono">0.02</span>，CE 回到 <strong class="mono">7.09</strong>。
+        这类 bug 骗人的地方在于 loss 照样在降 —— 它只是在纠正初始化，不代表模型学会了任务。
+        下面的实验台把 σ 交到你手上。
+      </p>
     </section>
 
     <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
@@ -392,9 +413,9 @@ const ffnParams = computed(() => {
   return '—'
 })
 const ffnNote = computed(() => {
-  if (config.ffn === 'swiglu') return 'd_ff 按 2/3 缩放以保持总参近似 GELU'
-  if (config.ffn.startsWith('moe')) return '总参数大, 每 token 只激活 top-k 个专家'
-  return '标准 FFN (d_ff = 4·d_model)'
+  if (config.ffn === 'swiglu') return '三个线性层, 但中间维缩到 8d/3, 参数量和两层 GELU 持平: 一路当开关, 一路当内容'
+  if (config.ffn.startsWith('moe')) return '总参数很大, 但每个 token 只过 top-k 个专家 — 用显存换算力'
+  return '标准 FFN (d_ff = 4·d_model), 两个线性层'
 })
 const kvNote = computed(() => {
   const d = 4096, h = 32

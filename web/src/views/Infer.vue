@@ -2,17 +2,17 @@
   <div>
     <h1 class="page-title">推理与部署优化 · 从能生成到高吞吐服务</h1>
     <p class="page-subtitle">
-      <RepoLink path="llm_infer/" label="llm_infer/" tiny /> 把训练好的自回归模型放进服务环境:
-      同样是不断生成下一个 token, 但目标从"loss 下降"变成"首 token 快、吞吐高、显存稳、输出可控"。
+      <RepoLink path="llm_infer/" label="llm_infer/" tiny /> 把训练好的自回归模型搬进服务环境:
+      还是一个接一个地生成 token, 但目标从"loss 下降"换成了"首 token 快、吞吐高、显存稳、输出可控"。
     </p>
 
     <ChapterIntro
-      tldr="推理优化的主线是少算、少搬、少等、少浪费。KV cache 少算, PagedAttention 少碎片, continuous batching 少空转, prefix cache 少重复 prefill。"
+      tldr="decode 每出 1 个 token, 都要把整份权重和全部 KV 读一遍 —— 卡住的是带宽, 不是算力。所以这 22 个模块几乎都在省 KV 的搬运和存储: cache 省重算, 分页省碎片, 前缀复用省重复 prefill, 连续批省空转, 量化和 GQA/MLA 省字节。"
       question="为什么训练时最贵的是反向, 推理时最贵的却常常是 KV cache、调度和内存带宽?"
       :goals="[
-        '理解 KV cache / paged attention / prefix cache 各自省什么',
-        '看懂连续批处理 / chunked prefill 怎么把 GPU 喂饱',
-        '能把 mini-vLLM 的主循环对照到真实 vLLM/SGLang 上',
+        '说清 KV cache / 分页 / 前缀复用各自省掉的到底是什么',
+        '看懂连续批和分块 prefill 怎么把 GPU 喂饱, 以及代价落在谁头上',
+        '把 mini-vLLM 的主循环逐行对上真实的 vLLM / SGLang',
       ]"
       :codes="[
         { path: 'llm_infer/core/' },
@@ -27,8 +27,8 @@
     <section class="section">
       <h2>1. 推理优化的递进关系</h2>
       <p class="lead">
-        先把逐步重算改成增量 decode, 再把 KV 显存做成可分配资源, 然后让请求动态组成 batch。
-        后面的 prefix cache、投机解码、量化、结构化输出都挂在这个服务主循环上。
+        先把逐步重算改成增量 decode, 再把 KV 显存做成可分配资源, 然后让请求每步重新组成 batch。
+        后面的前缀复用、投机解码、量化、结构化输出都挂在这条服务主循环上, 顺序拆开读就不会乱。
       </p>
       <EvolutionChain
         title="从朴素 generate 到 mini-vLLM"
@@ -40,24 +40,26 @@
     <section class="section">
       <h2>2. 第一性瓶颈 · 每步重算 vs KV cache</h2>
       <p class="lead">
-        没有 cache 时, 第 t 步要把 prefix+已生成的 t 个 token 全部 prefill 一遍。
-        有 cache 后, prefill 只跑一次, decode 只给新 token 追加 K/V。
+        没有 cache 时, 第 t 步要把 prompt 加上已生成的 t 个 token 整段再 prefill 一遍。
+        有 cache 后 prefill 只跑一次, decode 只给新 token 追加 K/V ——
+        m01 的 demo 里累计过一遍模型的 token 数从 688 掉到 37 (18.6×), 输出 ids 逐个不变。
       </p>
       <div class="grid grid-2" style="gap: 16px;">
         <div class="card">
           <h3>朴素路径 <span class="tag">重复 prefill</span></h3>
           <pre class="code">{{ noCacheCode }}</pre>
           <p class="hint">
-            成本随已生成长度增长。demo 会把这条路径和 cache 路径的输出 ids 对齐,
-            确认优化没有改变生成结果。
+            每一步的成本随已生成长度往上爬。demo 会把这条路径和 cache 路径的输出 ids 对齐,
+            确认优化没有改掉生成结果。
           </p>
         </div>
         <div class="card">
           <h3>增量路径 <span class="tag">KV cache</span></h3>
           <pre class="code">{{ cacheCode }}</pre>
           <p class="hint">
-            首步 prefill 保存每层 K/V, 后续 <code class="inline">decode_step</code>
-            只处理一个新 token。对应 <RepoLink path="llm_infer/m01_kv_cache/demo.py" label="llm_infer/m01_kv_cache/demo.py" tiny />。
+            首步 prefill 存下每层 K/V, 之后每次 <code class="inline">decode_step</code> 只喂一个新 token。
+            省掉的是旧 token 的 K/V 投影和 MLP 重算 —— 新 query 仍要和全部 t 个 key 做点积。
+            对应 <RepoLink path="llm_infer/m01_kv_cache/demo.py" label="llm_infer/m01_kv_cache/demo.py" tiny />。
           </p>
         </div>
       </div>
@@ -66,8 +68,8 @@
     <section class="section">
       <h2>3. 服务端三件套 · 内存、调度、复用</h2>
       <p class="lead">
-        KV cache 让单请求变快, 但服务端还要处理多请求、多长度、共享前缀和显存碎片。
-        这三件套是 vLLM/SGLang 类系统的核心抽象。
+        KV cache 只把单条请求变快。服务端还要面对长度各异的请求、同时到达的并发、共享的 system prompt 和显存碎片。
+        下面三个抽象就是 vLLM / SGLang 这类系统的骨架。
       </p>
       <div class="grid grid-3">
         <div v-for="p in servingPrimitives" :key="p.name" class="card primitive-card">
@@ -82,8 +84,9 @@
     <section class="section">
       <h2>4. 加速、压缩与约束</h2>
       <p class="lead">
-        cache 和调度解决服务骨架, 下面这些模块分别压缩计算、压缩存储、控制采样和约束输出。
-        它们通常可以叠加, 但每一种都会引入自己的正确性边界。
+        cache 和调度搭起骨架, 下面这些模块分别压计算、压存储、控采样、约束输出。
+        它们大多能叠加, 但每一种都有自己的正确性边界: 分页、调度、前缀复用、投机解码是精确的 (输出逐 token 不变),
+        量化、attention sink、稀疏注意力是有损的, 要看误差。
       </p>
       <div class="card" style="padding: 0; overflow-x: auto;">
         <table class="infer-table">
@@ -96,7 +99,7 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="m in allModules" :key="m.id">
+            <tr v-for="m in inferModules" :key="m.id">
               <td class="axis">{{ m.name }}</td>
               <td>{{ m.concept }}</td>
               <td>{{ m.link }}</td>
@@ -110,24 +113,25 @@
     <section class="section">
       <h2>5. full_engine · 把模块接成服务主循环</h2>
       <p class="lead">
-        <RepoLink path="llm_infer/full_engine/engine.py" label="full_engine/engine.py" tiny /> 是最值得对照原始代码读的一页:
-        它不追求完整 vLLM, 但把调度 (m03)、真分页 KV pool (m02)、前缀复用 (m04)、分块 prefill (m06)、抢占和采样 (m10) 串在同一条控制流里,
-        并断言 greedy 输出与朴素生成逐 token 相同 —— 即使 9 个 block 的小 pool 触发了 4 次抢占。
+        <RepoLink path="llm_infer/full_engine/engine.py" label="full_engine/engine.py" tiny /> 是最值得对着源码读的一页。
+        它不是完整的 vLLM, 但把调度 (m03)、真分页 KV pool (m02)、前缀复用 (m04)、分块 prefill (m06)、抢占和采样 (m10)
+        串在同一条控制流上, 并且断言 greedy 输出与朴素生成逐 token 相同 —— 哪怕 9 个 block 的小 pool 逼出了 4 次抢占。
       </p>
       <div class="grid grid-2" style="gap: 16px;">
         <div class="card">
           <h3>Engine.step <span class="tag">混合 batch</span></h3>
           <pre class="code">{{ engineStepCode }}</pre>
           <p class="hint">
-            没有"prefill 步"和"decode 步"之分: 一个 batch 里 n&gt;1 的 prefill chunk 和 n=1 的 decode 混跑, 序列追平了才采样。
+            没有"prefill 步"和"decode 步"之分: 同一个 batch 里 n&gt;1 的 prefill chunk 和 n=1 的 decode 混跑,
+            序列把 prompt 算追平了才有 logits 可采。
           </p>
         </div>
         <div class="card">
           <h3>接纳新请求时发生什么 <span class="tag">资源账本</span></h3>
           <pre class="code">{{ prefillCode }}</pre>
           <p class="hint">
-            命中前缀的 token 真的跳过前向 (KV 在全局分页 pool 里, 经页表读回);
-            demo 里 305 个待算 token = 233 个真前向 + 72 个前缀命中, 账必须对得上。
+            命中前缀的 token 是真的跳过了前向 —— KV 就在全局分页 pool 里, 经页表读回即可。
+            demo 里 305 个待算 token = 233 个真前向 + 72 个前缀命中, 这笔账必须对得上。
           </p>
         </div>
       </div>
@@ -178,8 +182,6 @@ import { inferModules, learningPath } from '@/data/models.js'
 // 上一章从 learningPath 取, 不手写编号 (别的阶段加章后手写的 "4.4" 会过期)
 const prevItem = learningPath[learningPath.findIndex((x) => x.route === 'infer') - 1]
 const prevChapter = { name: prevItem.route, label: `上一章 · ${prevItem.label}` }
-
-const allModules = inferModules
 
 const inferChain = [
   {

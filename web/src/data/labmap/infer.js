@@ -4,6 +4,7 @@ export default {
   'infer-scheduler': ['InferContinuousBatchingLab', 'InferChunkedPrefillLab', 'InferPdDisaggLab'],
   'infer-decode-control': ['InferSpecDecodeLab', 'InferSamplingLab'],
   'infer-compute': ['InferFlashAttnLab'],
+  'infer-engine': ['InferEngineLab'],
   'infer-prefix-radix': ['InferRadixCacheLab'],
   'infer-structured-output': ['InferGrammarLab'],
   'infer-quant-awq': ['InferQuantLab', 'InferKvQuantLab'],

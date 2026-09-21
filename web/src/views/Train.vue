@@ -2,18 +2,19 @@
   <div>
     <h1 class="page-title">规模化训练 · 把单机 loop 拆成分布式系统</h1>
     <p class="page-subtitle">
-      <RepoLink path="llm_train/" label="llm_train/" tiny /> 用 numpy 把真实训练框架里最常见的机制压成小张量演示。
-      重点不是模拟 GPU, 而是看清楚: 同一个 <code class="inline">loss → grad → update</code>
-      如何在多卡、低精度、显存受限和故障恢复下仍然保持数学等价。
+      <RepoLink path="llm_train/" label="llm_train/" tiny /> 用 numpy 把真实训练框架里最常见的机制压成小张量演示,
+      一个 "rank" 就是 Python list 里的一个元素, 所以每一次数据搬运都看得见。
+      每个 demo 的结尾都是一句 <code class="inline">assert</code>: 无论怎么切 batch、切层、切状态、降精度,
+      <code class="inline">loss → grad → update</code> 算出来的东西都得和单卡基线对上。
     </p>
 
     <ChapterIntro
-      tldr="规模化训练不是换一个 optimizer, 而是把 batch、层、状态、激活、精度和通信拆开管理。所有 demo 都在证明: 分布式路径必须和单机基线对齐。"
+      tldr="规模化训练不是换一个 optimizer, 而是学会分别切 batch、切层、切状态、切序列, 并且每切一刀都能证明结果没变。"
       question="什么时候该切 batch, 什么时候该切矩阵, 什么时候该切优化器状态?"
       :goals="[
         '看懂 DDP / TP / PP / ZeRO 各自切的是 batch / 矩阵 / 层 / 状态',
-        '知道为什么混合精度需要 loss scaling、fp32 master、grad clip',
-        '能把 m01..m16 的功能挂回 full_loop 里的对应阶段',
+        '说清混合精度为什么少不了 loss scaling、fp32 master 和 grad clip',
+        '把 m01..m16 各自的功能挂回 full_loop 一步里的对应位置',
       ]"
       :codes="[
         { path: 'llm_train/core/' },
@@ -28,8 +29,9 @@
     <section class="section">
       <h2>1. 训练技术的依赖链</h2>
       <p class="lead">
-        先把大 batch 等价拆开, 再扩到多副本, 再切层内矩阵和层间流水线。
-        当模型状态也放不下时, 才进入 ZeRO/FSDP。混合精度、checkpoint 和稳定性是贯穿所有并行方式的保护层。
+        这个顺序不是随便排的: 每一步都等前一步的瓶颈真的撞上了才出场。
+        先把大 batch 拆开, 再扩到多卡; 模型本身放不下才去切矩阵和层, 优化器状态也放不下才轮到 ZeRO。
+        混合精度、checkpoint 和稳定性横跨所有并行方式。
       </p>
       <EvolutionChain
         title="从单机循环到 full_loop"
@@ -68,8 +70,8 @@
     <section class="section">
       <h2>3. 四个关键等价 · 对照原始代码</h2>
       <p class="lead">
-        这些 demo 的写法都很直接: 先算一个 dense / single-process baseline, 再算并行版本,
-        最后用 <code class="inline">assert</code> 验证输出或梯度一致。
+        这些 demo 的写法都一样: 先算一个单机基线, 再算并行版本, 最后用 <code class="inline">assert</code> 把两者对齐。
+        等价性是所有并行策略的验收标准, 不是锦上添花 —— 一旦对不上, 训出来的就不是同一个模型。
       </p>
 
       <div class="grid grid-2" style="gap: 16px;">
@@ -175,43 +177,43 @@ const trainChain = [
   {
     name: 'Accum',
     year: 'm01',
-    pain: 'batch 想变大, 激活显存先爆。',
-    fix: '拆 micro-batch, 梯度按样本数加权累积, 更新频率降低但数学等价。',
+    pain: 'batch 想开大, 先爆的是激活显存。',
+    fix: '拆成 K 个 micro-batch 依次算, 梯度按样本数加权累加: 激活峰值 ÷K, 梯度一位不差。',
     color: 'var(--left)',
   },
   {
     name: 'DDP',
     year: 'm02',
-    pain: '单卡吞吐不够。',
-    fix: '每卡算本地 grad, all-reduce mean 后所有副本同步更新。',
+    pain: '单卡吞吐不够, 一天训不完。',
+    fix: '每卡算本地梯度, all-reduce(mean) 之后所有副本拿同一个梯度更新, 参数逐位一致。',
     color: 'var(--accent)',
   },
   {
     name: 'TP / PP',
     year: 'm03-m04',
-    pain: '单层太宽或层数太多, 一张卡放不下。',
-    fix: 'TP 切矩阵宽度, PP 切层, 通信分别发生在层内和 stage 间。',
+    pain: '单层太宽或层数太多, 一张卡装不下模型本身。',
+    fix: 'TP 切矩阵宽度 (通信在层内), PP 切层 (通信只在 stage 边界传一份激活)。',
     color: 'var(--eye)',
   },
   {
     name: 'ZeRO',
     year: 'm05',
-    pain: 'DDP 每卡都存完整参数、梯度、Adam 状态。',
-    fix: 'reduce-scatter 梯度, 本地更新 shard, 必要时 all-gather 参数。',
+    pain: 'DDP 每卡都存一整份参数、梯度和 Adam 状态 —— 每参数 16 字节。',
+    fix: 'reduce-scatter 梯度, 每卡只更新自己那一片, 16Ψ 一路降到 16Ψ/N。',
     color: 'var(--right)',
   },
   {
     name: 'AMP + Guard',
     year: 'm06-m10',
-    pain: '低精度更快但容易下溢、溢出和坏 step。',
-    fix: 'loss scaling、fp32 master、grad clip、warmup/cosine、NaN 检测。',
+    pain: '低精度快, 但小梯度会下溢、大激活会溢出、坏 batch 会污染权重。',
+    fix: 'loss scaling、fp32 master、grad clip、warmup/WSD、NaN 检测, 一层层兜住。',
     color: 'var(--warn)',
   },
   {
     name: 'Full Loop',
     year: 'full',
-    pain: '单个技巧不等于可恢复的训练系统。',
-    fix: '把数据切分、累积、同步、裁剪、分片更新和 checkpoint 串成主循环。',
+    pain: '单个技巧凑不成一个能中断重来的训练系统。',
+    fix: '数据切分、累积、同步、裁剪、分片更新、分片 checkpoint 串成一步, 续训逐位一致。',
     color: 'var(--left)',
   },
 ]

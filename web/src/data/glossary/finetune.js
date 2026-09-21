@@ -25,4 +25,7 @@ export default [
   { term: 'on-policy 蒸馏', stage: 'finetune', oneliner: '学生自己采样, 老师逐 token 给分布, 最小化 reverse KL。', number: 'E_{y~π_s} Σ_t KL(π_s ‖ π_t)', route: 'finetune-onpolicy-distill' },
   { term: 'forward / reverse KL', aka: 'mode-covering / mode-seeking', stage: 'finetune', oneliner: '期望在谁的样本上取: 老师的 → 全覆盖; 学生的 → 钻进一个峰。', number: 'KL(p‖q) vs KL(q‖p)', route: 'finetune-onpolicy-distill' },
   { term: 'RLVR', aka: '可验证奖励', stage: 'finetune', oneliner: '用程序判分代替奖励模型; 奖励必须依赖 prompt 才能验证条件行为。', number: '常数基线 = 1/类别数 才算合格', route: 'finetune-rlvr' },
+  { term: 'likelihood displacement', aka: '似然位移', stage: 'finetune', oneliner: 'DPO 的 margin 在变大, chosen 自己的 log π 却在下降。', number: '实测 −4.03 → −4.18, EM 0.332 → 0.137', route: 'finetune-dpo' },
+  { term: '常数基线', aka: 'constant baseline', stage: 'finetune', oneliner: '所有 prompt 都输出同一条答案, 能拿到的最高平均奖励。', number: '区域奖励 1.0; 看题任务 1/类别数', route: 'finetune-rlvr' },
+  { term: 'PairwiseForward', stage: 'finetune', oneliner: '把一步里的多次前向包成一个 Module, 通用 Trainer 就不用改。', number: 'DPO / SimPO / ORPO / RM 共用', route: 'finetune-runs' },
 ]

@@ -2,7 +2,7 @@
 const S = 'infer'
 export default [
   { term: 'KV cache', aka: '键值缓存', stage: S, oneliner: 'prefill 存下每层 K/V, decode 只算新 token。', number: '重算 N·P+N(N−1)/2 → P+N−1 个 token', route: 'infer-kv-memory' },
-  { term: 'Prefill / Decode', aka: '预填充 / 解码', stage: S, oneliner: 'prefill 吃算力、一次多 token; decode 吃带宽、一次 1 个。', number: 'TTFT 看 prefill, TBT 看 decode', route: 'infer-scheduler' },
+  { term: 'Prefill / Decode', aka: '预填充 / 解码', stage: S, oneliner: 'prefill 一次多 token 吃算力; decode 一次 1 个吃带宽。', number: 'TTFT 看 prefill, TBT 看 decode', route: 'infer-scheduler' },
   { term: 'PagedAttention', aka: '分页 KV', stage: S, oneliner: 'KV 切成定长 block, 页表把逻辑位置映射到物理 block。', number: 'pos → (table[pos // bs], pos % bs)', route: 'infer-kv-memory' },
   { term: 'Continuous batching', aka: 'iteration-level scheduling', stage: S, oneliner: '每一步重组 batch, 请求随到随进、随完随出。', number: 'batch = [(seq, n)], n=1 即 decode', route: 'infer-scheduler' },
   { term: 'Chunked prefill', aka: 'Sarathi 混批', stage: S, oneliner: '长 prompt 切块与 decode 混批, token 预算封顶每步耗时。', number: 'TBT 297→52 ms, TTFT 276→445 ms', route: 'infer-scheduler' },
@@ -20,6 +20,8 @@ export default [
   { term: 'AWQ', aka: '激活感知权重量化', stage: S, oneliner: '量化前按激活幅度放大显著通道: XW = (X/s)(s⊙W)。', number: 'INT4 g32 误差 0.0759 → 0.0273 (α=0.4)', route: 'infer-quant-awq' },
   { term: 'KIVI', aka: 'KV cache 量化', stage: S, oneliner: 'K 有固定离群通道 → 按通道分组; V 按 token 分组。', number: 'INT4 K 误差 0.026 vs per-token 0.18', route: 'infer-quant-awq' },
   { term: 'FlashAttention', aka: 'online softmax 分块', stage: S, oneliner: '分块累计 max / 分母 / 输出, 不物化 N×N 矩阵。', number: 'l ← e^(m−m′)·l + Σe^(s−m′)', route: 'infer-compute' },
+  { term: 'CUDA Graph', aka: 'capture / replay', stage: S, oneliner: '固定形状的 decode 录一次图, 之后每步只提交一次。', number: 'host 提交 16 → 1 次', route: 'infer-compute' },
+  { term: 'Multi-LoRA serving', aka: '不合并权重', stage: S, oneliner: '底模 gemm 全 batch 共享, LoRA 按 token 取 A/B。', number: '1000 个 adapter: 24.58 → 2.58 MB', route: 'infer-engine' },
   { term: 'GQA / MQA', aka: '分组 / 多查询注意力', stage: S, oneliner: '多个 query 头共享一个 KV 头, cache 成倍变小。', number: '2·n_kv·d_head·L·bytes: 512 → 128 KiB', route: 'infer-kv-footprint' },
   { term: 'MLA', aka: 'Multi-head Latent Attention', stage: S, oneliner: '只缓存低秩 latent + 解耦 RoPE key, K/V 用时再还原。', number: 'DeepSeek-V3: 68.6 KiB/token, 省 56.9×', route: 'infer-kv-footprint' },
   { term: 'Attention sink', aka: 'StreamingLLM', stage: S, oneliner: '永远保留开头几个 token + 最近窗口, 位置按槽位重编号。', number: 'cache ≤ n_sink + window', route: 'infer-attention-sinks' },

@@ -34,6 +34,19 @@
       </div>
 
       <nav>
+        <!-- 阅读档位: 主干/冲刺时收起扩展章, 当前所在章始终可见 -->
+        <div class="level-bar" role="group" aria-label="阅读档位">
+          <button
+            v-for="l in LEVELS" :key="l.id" type="button"
+            :class="['level-btn', { active: level === l.id }]"
+            :title="l.hint" @click="progress.setLevel(l.id)"
+          >{{ l.label }}</button>
+        </div>
+        <router-link :to="{ name: 'fast-track' }" class="nav-link fast">
+          <span class="idx">→</span>
+          <span>速成路线</span>
+        </router-link>
+
         <!-- 序章 -->
         <div class="section-label">序章</div>
         <router-link :to="{ name: 'home' }" class="nav-link">
@@ -74,16 +87,23 @@
 
               <!-- ready & 阶段内小标题 -->
               <router-link
-                v-for="c in s.chapters || []"
+                v-for="c in shown(s)"
                 :key="c.route"
                 :to="{ name: c.route }"
                 class="nav-link sub"
               >
                 <span class="idx">{{ s.idx }}.{{ subIdx(s, c.route) }}</span>
-                <span>{{ c.label }}</span>
+                <span class="chapter-label">
+                  <span class="tier-dot" :class="tierOf(c.route)" :title="TIER_META[tierOf(c.route)].desc">{{ isSprint(c.route) ? '★' : TIER_META[tierOf(c.route)].mark }}</span>
+                  {{ c.label }}
+                </span>
                 <span v-if="progress.isMastered(c.route)" class="mark done" title="自测全对">✓</span>
                 <span v-else-if="progress.isVisited(c.route)" class="mark" title="已读">•</span>
               </router-link>
+
+              <p v-if="hiddenCount(s)" class="more-hint">
+                还有 {{ hiddenCount(s) }} 章扩展内容, 切到「全部」可见
+              </p>
 
               <!-- planned: 灰显, 不可点击 -->
               <div v-if="s.status === 'planned'" class="nav-link disabled sub">
@@ -118,6 +138,10 @@
       <router-view v-slot="{ Component, route }">
         <div v-if="route.meta.chapter" class="breadcrumb">
           {{ route.meta.chapter }} · {{ route.meta.title }}
+          <span class="crumb-tier" :class="tierOf(route.name)">
+            {{ isSprint(route.name) ? '★ 冲刺' : TIER_META[tierOf(route.name)].label }}
+          </span>
+          <span class="crumb-desc">{{ isSprint(route.name) ? '只有一天也要读的 12 章之一' : TIER_META[tierOf(route.name)].desc }}</span>
         </div>
         <transition name="page" mode="out-in">
           <component :is="Component" :key="route.fullPath" />
@@ -131,6 +155,7 @@
 import { computed, ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { learningPath, stages } from '@/data/models.js'
+import { LEVELS, TIER_META, inLevel, isSprint, tierOf } from '@/data/tiers.js'
 import { repoUrl } from '@/utils/repo.js'
 import { useProgress } from '@/composables/useProgress.js'
 
@@ -140,6 +165,11 @@ const route = useRoute()
 // ── 学习进度 + 窄屏抽屉 ─────────────────────────────────────────────
 const progress = useProgress()
 const navOpen = ref(false)
+const level = computed(() => progress.state.level)
+// 当前所在章即使不在档位里也要显示, 否则筛选会让人丢失位置
+const shown = (s) => (s.chapters || []).filter((c) => inLevel(c.route, level.value) || c.route === route.name)
+const hiddenCount = (s) => (s.chapters || []).length - shown(s).length
+
 const readCount = computed(() => learningPath.filter((p) => progress.isVisited(p.route)).length)
 watch(() => route.name, (name) => { progress.visit(name); navOpen.value = false }, { immediate: true })
 
@@ -218,6 +248,18 @@ const toggleTheme = () => { theme.value = theme.value === 'dark' ? 'light' : 'da
   color: var(--accent);
   border-color: var(--accent);
 }
+.level-bar { display: flex; gap: 4px; padding: 0 24px 10px; }
+.level-btn { flex: 1; min-height: 28px; padding: 3px 0; font-size: 11px; border-radius: var(--radius-sm); }
+.nav-link.fast { color: var(--accent); font-size: 12.5px; }
+.chapter-label { min-width: 0; }
+.tier-dot { font-size: 9px; margin-right: 5px; vertical-align: 1px; }
+.tier-dot.core { color: var(--accent); }
+.tier-dot.ext { color: var(--text-dim); }
+.more-hint { padding: 4px 24px 6px 38px; font-size: 11px; color: var(--text-dim); line-height: 1.6; }
+.crumb-tier { margin-left: 8px; padding: 1px 6px; border-radius: 3px; font-size: 10px; border: 1px solid var(--border-strong); }
+.crumb-tier.core { color: var(--accent); border-color: var(--accent); }
+.crumb-tier.ext { color: var(--text-dim); }
+.crumb-desc { margin-left: 6px; font-size: 11px; color: var(--text-dim); }
 .progress { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 10px; color: var(--text-dim); }
 .progress-bar { flex: 1; height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; }
 .progress-bar span { display: block; height: 100%; background: var(--left); transition: width 0.3s; }

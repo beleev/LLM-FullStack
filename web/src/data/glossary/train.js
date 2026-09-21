@@ -2,6 +2,7 @@
 const t = (term, aka, oneliner, number, route) => ({ term, aka, stage: 'train', oneliner, number, route })
 
 export default [
+  t('梯度累积', 'Gradient Accumulation', '大 batch 拆 K 个 micro 依次算, 梯度按样本数加权累加', '激活峰值 ÷K, 串行时间 ×K, 通信不变', 'train-batch-ddp'),
   t('DDP', 'Distributed Data Parallel', '每卡一份完整模型算不同样本, all-reduce 梯度后同步更新', '每卡每步发 2(N−1)/N·S', 'train-batch-ddp'),
   t('Ring all-reduce', '环形全归约', '张量切 N 块沿环传: 先边传边加, 再传一圈', 'N=8 → 14 步, 每卡发 1.75S', 'train-collectives-loop'),
   t('reduce-scatter', '归约散播', '求和后每卡只留自己那 1/N; ring all-reduce 的前半段', '每卡发 (N−1)/N·S', 'train-collectives-loop'),

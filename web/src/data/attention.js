@@ -1,4 +1,5 @@
-// Attention 演进谱 — 与 layers/attention.py 对应
+// 注意力的四代演进 —— 与 llm_models/layers/core/attention.py 对应。
+// 每一代都是在解上一代留下的账: MHA 的 cache 太大 → GQA 共享 K/V → MLA 压成 latent → DSA 再砍算力。
 
 export const variants = [
   {
@@ -12,9 +13,9 @@ export const variants = [
     cache: ({ T, d_model, n_heads }) => 2 * T * d_model, // K + V, full d_model
     formula: 'Attention(Q,K,V) = softmax(QK^T / √d_k) · V',
     color: '#9ca3af',
-    pros: '表达力满, 每头独立 KV',
-    cons: 'KV cache 最大 (长上下文的显存瓶颈)',
-    description: '每头一对独立的 K/V, 是注意力的原始设计。推理时每个新 token 都要把所有层的 K, V 写进 cache, 随 seq_len 与 n_heads 线性增长。'
+    pros: '每个头有自己的 K/V, 表达力上限最高',
+    cons: 'cache 也最大 —— LLaMA-2-7B 一个 token 要存 512 KiB',
+    description: '每个头配一对自己的 K、V。这是注意力最初的样子, 也是 cache 最贵的样子: 每生成一个 token, 32 层 × 32 个头的 K 和 V 都要写进显存, 之后每一步都要整个读一遍。长上下文推理卡在这里。'
   },
   {
     id: 'gqa',
@@ -26,9 +27,9 @@ export const variants = [
     cache: ({ T, d_model, n_heads, num_kv_heads }) => 2 * T * (d_model / n_heads) * num_kv_heads,
     formula: 'K, V 只有 num_kv_heads 组, 多头 Q 共享它们',
     color: '#60a5fa',
-    pros: 'KV cache ÷ (n_heads / num_kv_heads), 效果 ≈ MHA',
-    cons: '仍需缓存 num_kv_heads × head_dim',
-    description: '把 Q 的 N 个头分成 G 组, 每组共享同一对 K/V head。num_kv_heads=1 退化为 MQA (极小 cache 但掉点), num_kv_heads=n_heads 退化为 MHA。现代开源 LLM 事实标准。'
+    pros: 'cache 除以 n_heads/num_kv_heads, 质量几乎不掉',
+    cons: '还是要按 num_kv_heads × head_dim 存一份',
+    description: '让几个 Q 头共用一对 K/V。LLaMA-3-8B 用 8 组代替 32 个头, 一个 token 的 KV 从 512 KiB 降到 128 KiB, 评测基本没动。两头是极端: num_kv_heads=1 就是 MQA, cache 最小但会掉点; =n_heads 就退回 MHA。现在开源模型基本都用它。'
   },
   {
     id: 'mla',
@@ -41,9 +42,9 @@ export const variants = [
     cache: ({ T, kv_lora_rank, qk_rope_head_dim }) => T * (kv_lora_rank + qk_rope_head_dim),
     formula: 'c_kv = W_DKV·x,  K/V 由 c_kv 升维;  解耦 RoPE 段独立处理',
     color: '#34d399',
-    pros: 'KV cache -93%, 生产推理只缓存 c_kv + 共享 k_rope',
-    cons: '需要解耦 RoPE + up-projection 矩阵吸收',
-    description: 'KV 低秩投到一个小维度 latent c_kv (e.g. 512), 运行时升维还原。单独一段 rope_dim 全头共享, 承载位置信息, 其余 nope 段参与吸收 trick。DeepSeek 报告 671B 模型在长上下文下 KV 压力几乎可忽略。'
+    pros: '只缓存 latent + 共享 rope 段, 每 token 68.6 KiB',
+    cons: '要把 RoPE 解耦出来, 升维矩阵才能被吸收进 Q',
+    description: 'K 和 V 不直接存, 先压成一个低维 latent (比如 512 维) 存起来, 用的时候再升回去。位置信息单独走一小段所有头共享的 RoPE —— 这一步必须解耦, 否则旋转会挡住升维矩阵被吸收进 Q, 解码时就省不下来。DeepSeek-V3 一个 token 68.6 KiB, 比同规模的 MHA 少 56.9 倍。'
   },
   {
     id: 'dsa',
@@ -55,18 +56,9 @@ export const variants = [
     cache: ({ T, kv_lora_rank, qk_rope_head_dim }) => T * (kv_lora_rank + qk_rope_head_dim),
     formula: 'LightningIndexer 选 top-k; MLA 仅在 k 个位置算 softmax · V',
     color: '#f472b6',
-    pros: '算力 O(T²) → O(T·k), 主攻 128K+ 超长上下文',
-    cons: '稀疏选择需避免数据泄漏 (先 mask 再 topk)',
-    description: '在 MLA 之上叠 Lightning Indexer (几个小头 + ReLU 打分) 预选 top-k 关键位置。MLA 解决 cache, DSA 解决算力, 两者解耦组合。'
+    pros: '算力 O(T²) → O(T·k), 冲的是 128K 以上的长上下文',
+    cons: 'top-k 不可导, 必须另给 indexer 一个对齐损失, 否则它拿不到梯度',
+    description: 'MLA 省的是显存, 它省的是算力: 先用几个小头快速给所有位置打个分, 只挑 top-k 个位置做真正的注意力。要先 mask 再 top-k, 否则会选到未来的 token。本仓库实测: 只用语言模型损失时 indexer 的梯度是 None, 加上 KL 对齐后 top-8 召回从 0.450 (等于瞎猜) 升到 0.922。'
   },
 ]
 
-// 复杂度与 cache 计算工具
-export function computeMetrics(variant, params) {
-  const bytesPerToken = variant.cache(params)  // 以 fp16 = 2 bytes/element 估算
-  const totalBytes = bytesPerToken * 2         // fp16
-  const flopsPerToken = variant.id === 'dsa'
-    ? params.T * Math.min(params.sparse_top_k, params.T)
-    : params.T * params.T
-  return { bytesPerToken, totalBytes, flopsPerToken }
-}

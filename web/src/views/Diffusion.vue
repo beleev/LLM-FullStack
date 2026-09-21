@@ -2,18 +2,19 @@
   <div>
     <h1 class="page-title">扩散生成 · DDPM 与 Flow Matching</h1>
     <p class="page-subtitle">
-      扩散模型学 "如何把噪声一步步去掉"。拖动下面的 timestep 滑条, 看 x_0 从清晰到纯噪声的连续过程,
-      并观察 <strong>DDPM (ε-pred, cosine schedule)</strong> 与
-      <strong>Flow Matching (v-pred, linear path)</strong> 两种范式的形状差异。
+      "直接生成一张图"太难，"把一张稍微脏一点的图擦干净"很容易。扩散就是把前者拆成几十次后者。
+      拖下面的 timestep 滑条，看 x₀ 一路糊成纯噪声；再切换调度器，比较
+      <strong>DDPM (ε-pred, cosine 调度)</strong> 和
+      <strong>Flow Matching (v-pred, 直线路径)</strong> 这两条路的形状差别。
     </p>
 
     <ChapterIntro
-      tldr="扩散把生成问题变成「学习去噪函数」。DDPM 学预测噪声 ε, Flow Matching 学预测速度 v=ε−x₀ — 后者把弯路拉成直线。"
-      question="如果训练目标只换了一个 (ε → v), 推理步数为什么能从 50 降到 28? 这跟「直线路径」的几何意义是什么?"
+      tldr="扩散把「生成」换成了「学一个去噪函数」。DDPM 让网络预测噪声 ε, Flow Matching 让它预测速度 v = ε − x₀ — 后者把弯路拉成了直线。"
+      question="训练目标只换了一个符号 (ε → v), 推理步数为什么能从 50 降到 28? 「直线路径」到底直在哪?"
       :goals="[
-        '理解扩散模型把生成问题变成「学习去噪」的完整逻辑',
-        '区分 ε-prediction (DDPM) 与 v-prediction (Flow Matching) 的几何意义',
-        '看懂 DiT + adaLN-Zero 怎么把扩散嫁接到 Transformer 骨架上',
+        '把生成问题翻译成「学去噪」, 并说清训练和采样各在做什么',
+        '讲清 ε-prediction 和 v-prediction 的几何差别, 以及它怎么换成步数',
+        '看懂 DiT 用 adaLN-Zero 把扩散嫁接到 Transformer 骨架上的那一步',
       ]"
       :codes="[
         { path: 'llm_models/layers/diffusion/adaln.py', label: 'adaln.py · AdaLNZeroBlock' },
@@ -56,7 +57,7 @@
     <div class="grid grid-3">
       <div class="card panel">
         <h3>x₀ <span class="tag">clean</span></h3>
-        <p class="desc">ground truth 原图 (教学用的合成环形图案)</p>
+        <p class="desc">真值原图 (教学用的合成环形图案)</p>
         <canvas ref="canvasX0" width="128" height="128" class="canvas" />
         <div class="stat" style="margin-top: 10px;">
           <div class="k">σ(x) · 信号强度</div>
@@ -76,7 +77,7 @@
 
       <div class="card panel">
         <h3>{{ scheduler === 'ddpm' ? 'ε̂' : 'v̂' }} <span class="tag">model pred</span></h3>
-        <p class="desc">模型要学习的目标 (此处用真值 + 小噪声模拟)</p>
+        <p class="desc">网络要回归的目标 (这里用真值加一点噪声模拟, 不是真跑出来的)</p>
         <canvas ref="canvasPred" width="128" height="128" class="canvas" />
         <div class="stat" style="margin-top: 10px;">
           <div class="k">MSE(pred, target)</div>
@@ -89,8 +90,9 @@
     <section class="section">
       <h2>噪声调度曲线</h2>
       <p class="lead">
-        DDPM 用 cosine β 让 <span class="mono">ᾱ_t</span> 的两端更平滑, 相比 linear 能避免 T→1 时过度噪声。
-        Flow Matching 则是直线路径 <span class="mono">x_t = (1-t)·x₀ + t·ε</span>, 训练极简、推理步数更少。
+        这条曲线就是 "在时刻 t, 原图还剩多少"。DDPM 用 cosine β 让 <span class="mono">ᾱ_t</span> 两端更平缓,
+        避开 linear 调度在 t→1 时把图糊得过头。Flow Matching 干脆走直线
+        <span class="mono">x_t = (1-t)·x₀ + t·ε</span>: 训练公式最短, 采样步数也最少。
       </p>
       <div class="card">
         <svg viewBox="0 0 600 240" width="100%" height="240">
@@ -156,15 +158,15 @@ x_{t-Δt} = x_t - Δt·v̂         # 直线反推</pre>
     </section>
 
     <div class="card" style="margin-top: 20px;">
-      <h3>为什么 DiT/MM-DiT/Sora 都换成了 Flow Matching?</h3>
+      <h3>为什么 DiT / MM-DiT / Sora 后来都换成了 Flow Matching?</h3>
       <p class="desc">
-        SD3 / FLUX / HunyuanVideo / Wan 2.2 等 2024 年后的 SOTA 生图/生视频全部从
-        ε-pred 切到 v-pred + Rectified Flow, 原因有三:
+        SD3、FLUX、HunyuanVideo、Wan 2.2 这些 2024 年之后的生图/生视频模型，全部从 ε-pred 切到了 v-pred + Rectified Flow。
+        三个理由：
       </p>
       <ul class="desc" style="padding-left: 20px; list-style: disc; line-height: 1.9; margin-top: 6px;">
-        <li><strong>训练更稳</strong>: 线性路径的 velocity 目标量级始终接近, 不像 ε 在 t 接近 0 时方差剧烈变化</li>
-        <li><strong>推理更快</strong>: 直线路径意味着欧拉法几步就能走完, SD3 推荐 28 步 (vs DDIM 50 步)</li>
-        <li><strong>数学更简洁</strong>: 无 noise schedule 可调, 超参数更少, 复现更可靠</li>
+        <li><strong>训练更稳</strong>：直线路径上速度目标的量级从头到尾差不多，不像 ε 在 t 接近 0 时方差剧烈变化</li>
+        <li><strong>推理更快</strong>：路径是直的，欧拉法几步就走完了 —— SD3 推荐 28 步，DDIM 要 50 步</li>
+        <li><strong>可调的东西更少</strong>：没有 noise schedule 要挑，超参数少一截，别人复现起来也更容易</li>
       </ul>
     </div>
 

@@ -2,19 +2,19 @@
   <div>
     <h1 class="page-title">最小可跑闭环 · 用 numpy 把 Transformer 写穿</h1>
     <p class="page-subtitle">
-      <RepoLink path="llm_basic/" label="llm_basic/" tiny /> 不依赖 PyTorch, 用 numpy 当"会广播的容器",
-      把 forward / backward / Adam / 采样全部肉眼可见地展开。
-      <strong>它的任务只有一个</strong>: 让你看清楚梯度是怎么流过模型的 — 以后再看
-      <RepoLink path="llm_models/" label="llm_models/" tiny /> 里的 PyTorch 代码, 你会知道每一行 autograd 在背后做了什么。
+      <RepoLink path="llm_basic/" label="llm_basic/" tiny /> 不装 PyTorch, 只把 numpy 当一个会广播的数组容器,
+      把 forward / backward / Adam / 采样一行不落地摊开。
+      <strong>它只干一件事</strong>: 让你看清梯度怎么流过模型。之后再读
+      <RepoLink path="llm_models/" label="llm_models/" tiny /> 里的 PyTorch 代码, 你会知道 autograd 在背后替你做了什么。
     </p>
 
     <ChapterIntro
-      tldr="所有现代 LLM 训练循环 = 5 行代码: get_batch → forward → loss → backward → adam_step。把这 5 行用 numpy 摊开, 你就会看到 Transformer 没有黑盒。"
-      question="如果不让你用 autograd, 你能否只凭链式法则把 RMSNorm / softmax / 残差的反向写对?"
+      tldr="现代 LLM 的训练循环就 5 行: get_batch → forward → loss → backward → adam_step。用 numpy 摊开这 5 行, Transformer 里就没有黑盒了。"
+      question="不许用 autograd, 你能只凭链式法则把 RMSNorm / softmax / 残差的反向写对吗?"
       :goals="[
-        '不用 PyTorch, 也能在 2 分钟内把 Transformer 训出降低的 loss',
-        '亲手摸到 forward / backward / Adam / 采样的每一步',
-        '看懂一个反向算错时, gradcheck 是怎么把它揪出来的',
+        '不用 PyTorch, 27 秒把一个 45,568 参数的 GPT 训到 val_loss 1.98',
+        '报得出 ids [B,T] 到 logits [B,T,V] 每一步的形状和 cache',
+        '一个反向算错时, 知道 gradcheck 是怎么把它揪出来的',
       ]"
       :codes="[
         { path: 'llm_basic/model.py' },
@@ -31,9 +31,9 @@
     <section class="section">
       <h2>1. 一张图看完整闭环</h2>
       <p class="lead">
-        左边是数据 / 训练 / 采样三条管道, 右边是支撑它们的 7 个核心函数对。
-        <strong>每个函数对都是 forward + backward 成对出现</strong> —
-        forward 把"反向需要的中间量"塞进 cache, backward 直接取用。
+        左边是数据 / 训练 / 采样三条管道, 右边是撑起它们的 7 个函数对。
+        <strong>每个算子都是 forward + backward 成对写的</strong>:
+        forward 把反向要用的中间量塞进 cache, backward 按逆序取出来用。
       </p>
 
       <div class="grid grid-2" style="gap: 16px;">
@@ -47,7 +47,7 @@
               </tr>
               <tr>
                 <td class="pp-name mono"><RepoLink path="llm_basic/train.py" label="train.py" tiny /></td>
-                <td class="pp-desc">5 行循环: get_batch → forward → loss → backward → adam_step (~2 分钟跑 2000 步, val_loss 4.17 → 1.9)</td>
+                <td class="pp-desc">5 行循环: get_batch → forward → loss → backward → adam_step (2000 步 27 秒, val_loss 4.15 → 1.98)</td>
               </tr>
               <tr>
                 <td class="pp-name mono"><RepoLink path="llm_basic/sample.py" label="sample.py" tiny /></td>
@@ -55,7 +55,7 @@
               </tr>
               <tr>
                 <td class="pp-name mono"><RepoLink path="llm_basic/gradcheck.py" label="gradcheck.py" tiny /></td>
-                <td class="pp-desc">数值梯度 vs 解析梯度, 逐参数验证 backward 写对了 (~1 秒)</td>
+                <td class="pp-desc">中心差分算出的数值梯度 vs 手写解析梯度, 7 个算子逐元素核对 (不到 1 秒)</td>
               </tr>
             </tbody>
           </table>
@@ -72,7 +72,7 @@
               </tr>
             </tbody>
           </table>
-          <p class="hint">关键栏 = 反向最容易出错的那一项, 后面会逐个拆解。</p>
+          <p class="hint">右边一栏是这个算子反向最容易写错的地方, 后面逐个拆。</p>
         </div>
       </div>
     </section>
@@ -81,15 +81,16 @@
     <section class="section">
       <h2>2. 模型结构 · 默认 1 层 1 头, 但麻雀俱全</h2>
       <p class="lead">
-        刻意做到极简: 默认单层 (<code class="inline">--n-layer</code> 可加层, 只是一个 for 循环) + 单头 + ReLU MLP + 学得式位置编码。骨架与现代 LLaMA
-        完全一致 — <strong>差别只在零件选择</strong>, 不在结构。
+        故意做到最小: 默认单层 (<code class="inline">--n-layer</code> 可加层, 加层只是一个 for 循环) + 单头 + ReLU MLP + 学得式位置编码。
+        骨架和现代 LLaMA 一模一样 — <strong>差的只是零件</strong>, 不是结构。
       </p>
 
       <div class="card">
         <pre class="code">{{ modelDiagram }}</pre>
         <p class="hint">
-          形状: <code class="inline">B=batch, T=seq_len, D=dim, V=vocab</code>。
-          完整代码见 <RepoLink path="llm_basic/model.py:transformer_forward" label="llm_basic/model.py:transformer_forward" tiny />。
+          形状记号: <code class="inline">B=batch, T=seq_len, D=dim, H=MLP 中间维, V=vocab</code>。
+          完整代码见 <RepoLink path="llm_basic/model.py:transformer_forward" label="llm_basic/model.py:transformer_forward" tiny />;
+          想逐步看形状和 cache, 去 <router-link :to="{ name: 'basic-forward' }" class="dt-link">阶段 1.2 的形状流水线实验台</router-link>。
         </p>
       </div>
     </section>
@@ -98,7 +99,8 @@
     <section class="section">
       <h2>3. 反向四大坑 · 看清梯度怎么流</h2>
       <p class="lead">
-        autograd 帮你把这些都默认处理了。但"知道它在做什么"才是看懂大模型训练的前提。
+        这四件事 autograd 都替你处理了, 而且处理得悄无声息。手写一遍才知道它在做什么 —
+        也才知道自己写错时为什么不会报错。
       </p>
 
       <div class="grid grid-2" style="gap: 16px;">
@@ -117,8 +119,7 @@
     <section class="section">
       <h2>4. 训练循环 · 5 行代码, 60 行 Adam</h2>
       <p class="lead">
-        这一节是让你彻底看懂 PyTorch 里 <code class="inline">loss.backward(); opt.step()</code>
-        到底等价于什么。
+        看完这一节, PyTorch 里的 <code class="inline">loss.backward(); opt.step()</code> 对你就不再是两个动词。
       </p>
 
       <div class="grid grid-2" style="gap: 16px;">
@@ -126,9 +127,9 @@
           <h3><RepoLink path="llm_basic/train.py" label="train.py" tiny /> 主循环 <span class="tag">5 行而已</span></h3>
           <pre class="code">{{ trainLoopCode }}</pre>
           <p class="hint">
-            没有 <code class="inline">zero_grad()</code> — 因为我们每步都返回新 dict;
-            没有 <code class="inline">requires_grad</code> — 因为我们手写了反向。
-            等你回去看 PyTorch, 会发现它做的就是这 4 件事的工程化版本。
+            没有 <code class="inline">zero_grad()</code>: 每步返回的是新 dict, 旧梯度自然不会残留。
+            没有 <code class="inline">requires_grad</code>: 反向是手写的, 不需要谁去标记。
+            PyTorch 做的就是这 4 件事的工程化版本。
           </p>
         </div>
 
@@ -138,9 +139,10 @@
           <div class="adam-why">
             <p><strong>为什么不用 SGD?</strong></p>
             <p class="hint">
-              Transformer 各层梯度尺度差异大 (lm_head 远大于 embedding),
-              SGD 单一学习率压不住。Adam 用二阶矩 √v̂ 给每个参数自适应缩放,
-              小学习率也能稳定收敛。代码就 30 行 (<RepoLink path="llm_basic/optim.py" label="optim.py" tiny />)。
+              Transformer 各层的梯度尺度差好几个数量级 (lm_head 远大于 embedding), 单一学习率压不住:
+              大到能让平缓方向动起来, 陡的方向就发散了。Adam 除以 √v̂ 把每个坐标归一化,
+              每步位移约等于 lr, 与坡度无关。核心就
+              <RepoLink path="llm_basic/optim.py:adam_step" label="adam_step" tiny /> 里那十来行。
             </p>
           </div>
         </div>
@@ -151,17 +153,20 @@
     <section class="section">
       <h2>5. gradcheck · 用数值梯度反查解析梯度</h2>
       <p class="lead">
-        手写反向最难的不是写, 是<strong>验证写对了</strong>。gradcheck 用最朴素的有限差分
-        把每个参数都核对一遍 — 任何 transpose 写反、sum 维度搞错, 都会立刻报警。
+        手写反向最难的不是写, 是<strong>知道自己写对了</strong>。转置写反、sum 错维度不会让程序崩,
+        loss 也照样下降, 只是降得慢一点。gradcheck 拿最朴素的有限差分逐元素核对一遍, 这些 bug 才现形 —
+        把 <code class="inline">rmsnorm_backward</code> 的耦合项删掉, 它立刻报 dx 相对误差 3.11e-01。
       </p>
 
       <div class="card">
         <pre class="code">{{ gradcheckCode }}</pre>
         <p class="hint">
-          为什么用相对+绝对组合? 单纯绝对容差对大梯度太松, 单纯相对容差对接近 0
-          的梯度太严。所以用 <code class="inline">atol + rtol · max(|g_a|, |g_n|)</code>。
-          eps 取 1e-5 (float64 下 U 形误差曲线的谷底) — 太小舍入误差吃掉信号, 太大又跑出二阶项;
-          下面的实验台可以亲手拖 ε 看这条曲线。gradcheck.py 先逐算子全元素检查 (check_ops), 再对 n_layer = 1 和 2 做端到端抽样检查。
+          判定为什么是相对 + 绝对的组合? 纯绝对容差对大梯度太松, 纯相对容差对接近 0 的梯度太严
+          (抽样常落在 batch 里没出现过的那行 tok_emb 上, 两个 1e-10 的数相对误差能很大)。所以用
+          <code class="inline">atol + rtol · max(|g_a|, |g_n|)</code>。
+          eps 取 1e-5 是 float64 下 U 形误差曲线的谷底: 更小舍入误差吃掉信号, 更大又跑出截断误差 —
+          阶段 1.3 的实验台可以亲手拖这条曲线。
+          gradcheck.py 先逐算子全元素检查 (7 个算子相对误差 1e-11 ~ 2e-10), 再对 n_layer = 1 和 2 做端到端抽样检查。
         </p>
       </div>
     </section>
@@ -170,8 +175,8 @@
     <section class="section">
       <h2>6. 这版本省了什么 · 引出阶段 2</h2>
       <p class="lead">
-        下面每一行的"真模型怎么做"对应 <RepoLink path="llm_models/" label="llm_models/" tiny />
-        下的某个组件。看懂了这张表, 阶段 2 的每个章节都是在补一行。
+        每一行的"真模型怎么做"都对应 <RepoLink path="llm_models/" label="llm_models/" tiny />
+        下的一个组件。阶段 2 的每一章, 就是回来把这张表的某一行补上。
       </p>
       <div class="card" style="padding: 0; overflow-x: auto;">
         <table class="diff-table">
@@ -223,13 +228,13 @@ import ChapterNav from '@/components/ChapterNav.vue'
 import RepoLink from '@/components/RepoLink.vue'
 
 const pairs = [
-  { name: 'embedding',   role: 'token / pos lookup',          key: 'np.add.at 处理重复索引' },
-  { name: 'linear',      role: 'y = x @ W + b',                key: 'dW = x.T @ dy (要 flatten batch)' },
-  { name: 'rmsnorm',     role: '按行能量归一 + 缩放',          key: '反向带"耦合项" — 标准化的副作用' },
-  { name: 'attention',   role: '单头 causal: softmax(QK^T)·V', key: 'softmax 反向: a·(da - Σa·da)' },
-  { name: 'mlp',         role: '两层 + ReLU',                  key: '残差让 dx 走两条路相加' },
-  { name: 'block',       role: 'Pre-LN + Attn + MLP + 残差',   key: '每个残差节点 dx 都要 + 一份' },
-  { name: 'transformer', role: '组合一切, 输出 logits',         key: 'fused CE: dlogits=(probs-onehot)/N' },
+  { name: 'embedding',   role: 'token / pos 查表',             key: '重复 id 要 np.add.at 累加' },
+  { name: 'linear',      role: 'y = x @ W + b',                key: 'dW = x.T @ dy (先把 batch 拍平)' },
+  { name: 'rmsnorm',     role: '按行能量归一 + 缩放',          key: '多一个耦合项 — 归一化的副作用' },
+  { name: 'attention',   role: '单头 causal: softmax(QKᵀ)·V',  key: 'softmax 反向: a·(da − Σa·da)' },
+  { name: 'mlp',         role: '升到 H 过 ReLU 再降回 D',      key: 'ReLU 反向要知道哪些位置曾是负的' },
+  { name: 'block',       role: 'Pre-LN + Attn + MLP + 两个残差', key: '每个残差处 dx 都要加上捷径那份' },
+  { name: 'transformer', role: '拼起来, 输出 logits',           key: 'CE 合并后 dlogits = (p − onehot)/N' },
 ]
 
 const modelDiagram = `ids (B, T)
@@ -254,7 +259,8 @@ lm_head[D,V] → logits (B, T, V)
   ▼
 softmax + cross-entropy → loss
 
-默认: D=64, hidden=128, T=64  →  约 45K 参数`
+默认 V=65, D=64, H=128, T=64, n_layer=1  →  45,568 个参数
+(2 层就是 78,656; 层数直接从参数名 block_{i}_* 数出来)`
 
 const trainLoopCode = `for step in range(MAX_ITERS):
     x, y = get_batch(train_data, BATCH_SIZE, SEQ_LEN, rng)
@@ -297,41 +303,42 @@ const gotchas = [
   {
     title: 'embedding 的反向',
     tag: 'np.add.at',
-    intuition: '同一个 token id 可能在 batch 里出现多次, 每次都贡献一份梯度 — 必须累加, 不是覆盖。',
-    formula: 'dW = zeros((V, D))\nnp.add.at(dW, ids, dout)   # 用 add.at 处理重复索引',
+    intuition: '同一个 token id 在一个 batch 里会出现很多次, 每次都贡献一份梯度。写成 dW[ids] += dout, numpy 的花式索引只保留最后一次 — 高频 token 的梯度就这样悄悄缩水了, 而且不报错。',
+    formula: 'dW = zeros((V, D))\n# 重复索引必须累加, 不是覆盖\nnp.add.at(dW, ids, dout)',
     where: 'model.py: embedding_backward',
   },
   {
     title: 'RMSNorm 的耦合项',
-    tag: '标准化副作用',
-    intuition: '标准化让每行总能量恒为常数 — 改一个 x_i 会"挤压"其它 x_j。所以 dx 不是简单地 dy·g/rms, 还多一项耦合修正。',
-    formula: 'dx_i = (g_i / rms) · dy_i\n     - x_i / (D · rms³) · Σ_j (dy_j · g_j · x_j)\n              ↑ 这一项就是耦合修正',
+    tag: '归一化的副作用',
+    intuition: '归一化让每行的能量恒定, 于是调大一个 x_i 就会挤小其它 x_j。dx 因此不只是 dy·g/rms, 还得减掉这份互相挤压。把第二项删掉跑 gradcheck, 相对误差立刻从 1e-10 跳到 3.11e-01。',
+    formula: 'dx_i = (g_i / rms) · dy_i\n     - x_i / (D · rms³) · Σ_j (dy_j · g_j · x_j)\n              ↑ 删掉这一项, 误差 3.11e-01',
     where: 'model.py: rmsnorm_backward',
   },
   {
     title: 'softmax 的 Jacobian',
-    tag: '不能逐元素',
-    intuition: 'softmax 输出每个分量都依赖所有输入 — 所以反向是个"全连"的耦合, 但有个非常优雅的封闭式。',
-    formula: '设 a = softmax(s),  da 是上游梯度\nds_i = a_i · (da_i - Σ_j a_j · da_j)\n            ↑ 减去整体加权和',
+    tag: '不能逐元素算',
+    intuition: 'softmax 的每个输出都依赖全部输入, 本地导数是一整个矩阵。好在乘上上游梯度后能化简成一行, 而且只用到输出 a — 所以 cache 里存的是 attn, 不是 scores。',
+    formula: '设 a = softmax(s),  da 是上游梯度\nds_i = a_i · (da_i - Σ_j a_j · da_j)\n            ↑ 减去整行的加权和',
     where: 'model.py: attention_backward',
   },
   {
     title: '残差的反向 = 两路相加',
     tag: '梯度高速公路',
-    intuition: 'out = h + m  ⇒  dh = dout, dm = dout — 一份梯度, 两条路径各拿一份, 最后回到 x 的 dx 要把"绕过 MLP 的"和"穿过 MLP 的"两路加起来。',
-    formula: 'h = x + Attn(x)\nout = h + MLP(h)\n\ndh  = dout\ndm  = dout\ndx  = dout (绕过 Attn) + Attn_backward(dout, ...) (穿过 Attn)',
+    intuition: '加法把一份梯度原样复制给两条路。回到 x 时要把"绕过子层的"和"穿过子层的"加起来 — 那个原样的 dout 就是梯度不会在层层相乘中消失的原因。',
+    formula: 'h = x + Attn(RMSNorm(x))\nout = h + MLP(RMSNorm(h))\n\ndh = dout + 穿过 MLP 回来的那份\ndx = dh   + 穿过 Attn 回来的那份',
     where: 'model.py: block_backward',
   },
 ]
 
 const diffs = [
-  { topic: '位置编码',  basic: '学得式 pos_emb',            modern: 'RoPE (旋转, 乘在 Q/K 上)',           route: 'position', routeLabel: '阶段 2.2' },
+  { topic: '位置编码',  basic: '学得式 pos_emb, 卡死在 T_max=64', modern: 'RoPE (旋转, 乘在 Q/K 上)',        route: 'position', routeLabel: '阶段 2.2' },
   { topic: '注意力',    basic: '单头, head_dim = D',        modern: 'MHA / GQA / MLA / DSA',               route: 'attention', routeLabel: '阶段 2.1' },
   { topic: 'FFN 激活',  basic: 'ReLU + 普通两层',           modern: 'GELU → SwiGLU (门控 + 三个 linear)',  route: 'blocks', routeLabel: '阶段 2.3' },
   { topic: '层数',      basic: '默认 1 层 (--n-layer 可调)',   modern: '几十层 + 各种 Block 变体',            route: 'blocks', routeLabel: '阶段 2.3' },
+  { topic: '分词',      basic: '字符级 vocab=65 (bpe.py 另演示)', modern: 'BPE / SentencePiece, 词表几万',    route: 'basic-data', routeLabel: '阶段 1.1' },
   { topic: 'FFN 形态',  basic: '稠密 MLP',                  modern: 'MoE: 一组小 FFN + router top-k',       route: 'moe', routeLabel: '阶段 2.4' },
   { topic: '推理',      basic: '每步重算整段 forward',      modern: 'KV cache: 只算新 token 的 Q, 复用 K/V',  route: 'infer-kv-memory', routeLabel: '阶段 5.1' },
-  { topic: '优化器',    basic: '裸 Adam',                   modern: 'AdamW + warmup + cosine + grad clip',  routeLabel: '参考 trainer.py', file: 'llm_models/training/trainer.py' },
+  { topic: '优化器',    basic: '裸 Adam (三个开关默认全关)', modern: 'AdamW + warmup + cosine + grad clip',  routeLabel: '参考 trainer.py', file: 'llm_models/training/trainer.py' },
   { topic: '精度',      basic: '全 float64 (gradcheck 需要)', modern: 'bf16 / fp16 混合精度 + loss scaling',  route: 'train', routeLabel: '阶段 3' },
 ]
 </script>
