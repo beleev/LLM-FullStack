@@ -1,36 +1,28 @@
 """
-engine.py — mini-vLLM: 集成 paged attention + continuous batching + prefix cache + sampling
+engine.py — mini-vLLM: 把前面的模块接成一个能跑的离线推理引擎
 
-接口:
-    engine = Engine(EngineConfig(...))
-    engine.add_request(prompt: str, sampling: SamplingParams)
-    while engine.has_unfinished():
-        finished_outputs = engine.step()
-
-注意:
-    本实现复用 m02/m03/m04/m10 的代码, 但因为本教学项目的 KV 是按"层"
-    保存 (List[Tuple[K,V]]), 不直接走 paged 的物理 block。这里我们用
-    BlockManager 跟踪"逻辑容量与释放", KV 实际数据仍存在 Sequence 里。
-    做法等价于"分页只管显存配额, 物理 KV 跟在序列上", 教学上更易看懂。
-
-    真实 vLLM 是把 KV 物理放进 pool, 这里若要严格对齐, 需要在 attention 里
-    实现分页 gather, 见 m02/paged_attention.py 已经实现, 可作为练习自己合上。
+是什么: 50 行胶水。每个 step:  scheduler.schedule() → model_runner.run() → sample() → scheduler.postprocess()
+    调度 / 抢占 / 分块 prefill   m03.Scheduler (同一个类, 不是拷贝; chunked_prefill 开关见 m06)
+    block 记账                   m02.BlockManager          物理 KV pool + 分页读写   model_runner.py + m02.paged_attention
+    前缀复用                     m04.PrefixCache           采样                      m10.sample
+盯住: 一步里 batch = [(seq, n)] —— n>1 的 prefill chunk 与 n=1 的 decode 混在同一步;
+      以及 stats 里 prefill_tokens_saved 与 runner.tokens_computed 两个数必须对得上账。
+正确性契约 (demo 里 assert): greedy 下, 无论是否发生前缀共享 / 分块 / 抢占, 每条输出与 TinyLM.generate_greedy 逐 token 相同。
+对应真实系统: vLLM `LLMEngine.step()` / `EngineCore.step()`。
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+
 import numpy as np
 
-from llm_infer.core import TinyLM, ModelConfig, CharTokenizer
+from llm_infer.core import TinyLM, ModelConfig, CharTokenizer, Sequence
 from llm_infer.m02_paged_attention.block_manager import BlockManager
-from llm_infer.m03_continuous_batching.sequence import Sequence, SeqStatus, Stage
+from llm_infer.m03_continuous_batching.scheduler import Scheduler, SchedulerConfig
 from llm_infer.m04_prefix_cache.prefix_cache import PrefixCache
 from llm_infer.m10_sampling.samplers import SamplingParams, sample
+from llm_infer.full_engine.model_runner import ModelRunner
 
-
-# --------------------------------------------------------------------- #
-# 配置                                                                  #
-# --------------------------------------------------------------------- #
 
 @dataclass(frozen=True)
 class EngineConfig:
@@ -39,191 +31,66 @@ class EngineConfig:
     num_blocks: int = 64
     max_batch_seqs: int = 8
     max_batch_tokens: int = 256
+    chunked_prefill: bool = True
+    prefix_caching: bool = True
 
-
-# --------------------------------------------------------------------- #
-# Engine                                                                #
-# --------------------------------------------------------------------- #
 
 class Engine:
-    """mini-vLLM 风格的离线引擎。"""
-
-    def __init__(self, cfg: EngineConfig):
+    def __init__(self, cfg: EngineConfig, lm: Optional[TinyLM] = None):
         self.cfg = cfg
-        self.lm = TinyLM(cfg.model)
+        self.lm = lm or TinyLM(cfg.model)
         self.tok = CharTokenizer()
-        self.bm = BlockManager(num_blocks=cfg.num_blocks, block_size=cfg.block_size)
-        self.prefix_cache = PrefixCache(self.bm)
-
-        self.waiting: List[Sequence] = []
-        self.running: List[Sequence] = []
+        bm = BlockManager(num_blocks=cfg.num_blocks, block_size=cfg.block_size)
+        self.prefix_cache = PrefixCache(bm) if cfg.prefix_caching else None
+        self.scheduler = Scheduler(
+            SchedulerConfig(cfg.max_batch_seqs, cfg.max_batch_tokens, cfg.block_size,
+                            cfg.num_blocks, cfg.chunked_prefill),
+            prefix_cache=self.prefix_cache)
+        self.runner = ModelRunner(self.lm, cfg.num_blocks, cfg.block_size)
         self.sampling_for: Dict[int, SamplingParams] = {}
-        self.finished_outputs: Dict[int, str] = {}
-        self._next_id = 0
+        self.finished: Dict[int, Sequence] = {}
         self._rng = np.random.RandomState(0)
+        self.steps = 0
 
-        # 简易统计
-        self.stats_step = 0
-        self.stats_prefix_hits = 0
-        self.stats_prefill_tokens_saved = 0
-
-    # ------------------------------------------------------------- #
-    # 用户接口                                                      #
-    # ------------------------------------------------------------- #
-
-    def add_request(
-        self,
-        prompt: str,
-        sampling: Optional[SamplingParams] = None,
-        max_new: int = 32,
-    ) -> int:
-        sid = self._next_id
-        self._next_id += 1
-        ids = self.tok.encode(prompt, add_bos=True)
-        seq = Sequence(seq_id=sid, prompt_ids=ids, max_new_tokens=max_new,
-                       eos_id=self.tok.EOS_ID)
-        self.waiting.append(seq)
-        self.sampling_for[sid] = sampling or SamplingParams(temperature=0.0)
-        return sid
+    def add_request(self, prompt, sampling: Optional[SamplingParams] = None, max_new: int = 32) -> int:
+        """prompt: str (走 CharTokenizer) 或现成的 token id 列表。"""
+        ids = self.tok.encode(prompt, add_bos=True) if isinstance(prompt, str) else list(prompt)
+        seq = self.scheduler.add_request(ids, max_new, eos_id=self.tok.EOS_ID)
+        self.sampling_for[seq.seq_id] = sampling or SamplingParams(temperature=0.0)
+        return seq.seq_id
 
     def has_unfinished(self) -> bool:
-        return bool(self.waiting) or bool(self.running)
+        return self.scheduler.has_unfinished()
 
-    # ------------------------------------------------------------- #
-    # 主循环 step: prefill 优先, 否则 decode                        #
-    # ------------------------------------------------------------- #
-
-    def step(self) -> List[Tuple[int, str]]:
-        """跑一步; 返回本步完成的 (seq_id, text)。"""
-        self.stats_step += 1
-        # ---- prefill 优先 ----------------------------------------- #
-        if self.waiting:
-            return self._step_prefill()
-        # ---- decode ---------------------------------------------- #
-        return self._step_decode()
-
-    # ------------------------------------------------------------- #
-    # prefill 阶段                                                  #
-    # ------------------------------------------------------------- #
-
-    def _step_prefill(self) -> List[Tuple[int, str]]:
-        finished: List[Tuple[int, str]] = []
-        token_budget = self.cfg.max_batch_tokens
-        picked: List[Sequence] = []
-        while self.waiting and len(picked) < self.cfg.max_batch_seqs and token_budget > 0:
-            seq = self.waiting[0]
-            n_blocks_needed = (len(seq.prompt_ids) + self.cfg.block_size - 1) // self.cfg.block_size
-
-            # ---- prefix cache 查询 -------------------------------- #
-            hits, n_hit_tokens = self.prefix_cache.match_prefix(seq.prompt_ids)
-            new_blocks_needed = n_blocks_needed - len(hits)
-            if not self.bm.can_allocate(max(new_blocks_needed, 0)):
-                break
-            if len(seq.prompt_ids) > token_budget:
-                break
-
-            # ---- 实际分配: 命中部分 share, 未命中 allocate -------- #
-            self.waiting.pop(0)
-            block_table: List[int] = []
-            for blk in hits:
-                self.bm.share_block(blk)
-                block_table.append(blk)
-            self.stats_prefix_hits += len(hits)
-            self.stats_prefill_tokens_saved += n_hit_tokens
-            for _ in range(new_blocks_needed):
-                blk = self.bm.free_list.popleft()
-                self.bm.ref_count[blk] = 1
-                block_table.append(blk)
-            self.bm.block_tables[seq.seq_id] = block_table
-
-            # ---- 跑 prefill (若全命中, 也得跑一次拿 logits, 简化) - #
-            ids_arr = np.array(seq.prompt_ids, dtype=np.int64)
-            logits, kv_cache = self.lm.prefill(ids_arr)
-            seq.kv_cache = kv_cache
-            seq.status = SeqStatus.RUNNING
-            seq.stage = Stage.DECODE
-
-            # ---- 注册 prefix cache (对完整 block) ----------------- #
-            parent = None
-            for i in range(len(seq.prompt_ids) // self.cfg.block_size):
-                chunk = seq.prompt_ids[i*self.cfg.block_size:(i+1)*self.cfg.block_size]
-                h = self.prefix_cache.register_block(parent, chunk, block_table[i])
-                parent = h
-
-            # ---- 采样首个 token ---------------------------------- #
-            params = self.sampling_for[seq.seq_id]
-            tok_id = sample(logits[-1], params, history=seq.prompt_ids, rng=self._rng)
-            seq.append_token(tok_id)
-            picked.append(seq)
-            token_budget -= len(seq.prompt_ids)
-
-            if seq.is_finished():
-                seq.status = SeqStatus.FINISHED
-                self.bm.free(seq.seq_id)
-                txt = self.tok.decode(seq.output_ids)
-                self.finished_outputs[seq.seq_id] = txt
-                finished.append((seq.seq_id, txt))
-            else:
-                self.running.append(seq)
+    def step(self) -> List[Sequence]:
+        """跑一步, 返回本步完成的序列。self.last_batch 留给 demo 打印。"""
+        self.steps += 1
+        bm = self.scheduler.bm
+        batch = self.last_batch = self.scheduler.schedule()
+        tokens: List[Optional[int]] = []
+        for seq, n in batch:
+            ids = seq.all_ids[:seq.num_computed + n]
+            logits = self.runner.run(ids, bm.block_table(seq.seq_id), seq.num_computed)
+            done_prefill = seq.num_computed + n == seq.num_tokens     # 追平了才有"下一个 token"可采
+            tokens.append(sample(logits, self.sampling_for[seq.seq_id], history=seq.all_ids, rng=self._rng)
+                          if done_prefill else None)
+        finished = self.scheduler.postprocess(batch, tokens)
+        for seq in finished:
+            self.finished[seq.seq_id] = seq
         return finished
 
-    # ------------------------------------------------------------- #
-    # decode 阶段                                                   #
-    # ------------------------------------------------------------- #
-
-    def _step_decode(self) -> List[Tuple[int, str]]:
-        finished: List[Tuple[int, str]] = []
-        # 给每条 running 跑一步 decode
-        survivors: List[Sequence] = []
-        for seq in self.running:
-            try:
-                self.bm.append(seq.seq_id, seq.num_tokens)
-            except MemoryError:
-                # preempt
-                self._preempt(seq)
-                continue
-            last_id = seq.output_ids[-1] if seq.output_ids else seq.prompt_ids[-1]
-            logits, seq.kv_cache = self.lm.decode_step(last_id, seq.kv_cache)
-            params = self.sampling_for[seq.seq_id]
-            tok_id = sample(logits, params, history=seq.all_ids, rng=self._rng)
-            seq.append_token(tok_id)
-            if seq.is_finished():
-                seq.status = SeqStatus.FINISHED
-                self.bm.free(seq.seq_id)
-                txt = self.tok.decode(seq.output_ids)
-                self.finished_outputs[seq.seq_id] = txt
-                finished.append((seq.seq_id, txt))
-            else:
-                survivors.append(seq)
-        self.running = survivors
-        return finished
-
-    def _preempt(self, seq: Sequence) -> None:
-        self.bm.free(seq.seq_id)
-        seq.kv_cache = None
-        seq.prompt_ids = seq.prompt_ids + seq.output_ids
-        seq.output_ids = []
-        seq.status = SeqStatus.WAITING
-        seq.stage = Stage.PREFILL
-        self.waiting.insert(0, seq)
-
-    # ------------------------------------------------------------- #
-    # 一键 generate (类似 vLLM API)                                 #
-    # ------------------------------------------------------------- #
-
-    def generate(
-        self, prompts: List[str], sampling: Optional[SamplingParams] = None,
-        max_new: int = 32,
-    ) -> Dict[int, str]:
-        ids = [self.add_request(p, sampling, max_new=max_new) for p in prompts]
+    def generate(self, prompts, sampling: Optional[SamplingParams] = None, max_new: int = 32) -> Dict[int, List[int]]:
+        """一键跑完 (类似 vLLM `LLM.generate`), 返回 {seq_id: 全部 output token ids}。"""
+        sids = [self.add_request(p, sampling, max_new) for p in prompts]
         while self.has_unfinished():
             self.step()
-        return {i: self.finished_outputs[i] for i in ids}
+        return {i: self.finished[i].output_ids for i in sids}
 
     def report_stats(self) -> dict:
         return {
-            "steps": self.stats_step,
-            "prefix_block_hits": self.stats_prefix_hits,
-            "prefill_tokens_saved": self.stats_prefill_tokens_saved,
-            "pool": self.bm.stats(),
+            "steps": self.steps,
+            "tokens_computed": self.runner.tokens_computed,
+            "prefix_hit_tokens": self.scheduler.prefix_hit_tokens,   # 命中 → 没做前向的 token
+            "preempt": self.scheduler.preempt_count,
+            "pool": self.scheduler.bm.stats(),
         }

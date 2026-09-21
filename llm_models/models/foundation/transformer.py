@@ -1,23 +1,12 @@
 """
-Transformer 模型模块
+Transformer — 原始 Encoder-Decoder 架构 ("Attention Is All You Need", Vaswani et al., 2017)
 
-标准 Encoder-Decoder 架构 (Vaswani et al., 2017, "Attention Is All You Need")。
-
-历史背景:
-    Transformer 诞生于机器翻译任务 (源/目标语言不同),
-    因此天然采用 Encoder-Decoder: Encoder 编码源句, Decoder 自回归生成译文,
-    并通过 Cross-Attention 让译文每一步都"看到"整个源句。
-    这一架构后来分化出两条主线:
-        - Encoder-only (BERT 系): 双向理解类任务
-        - Decoder-only (GPT 系):   生成类任务, 现已统一几乎所有 NLP
-
-教学重点:
-    - Encoder Block 与 GPT Block 本质上相同: Pre-LN(Self-Attn) + FFN
-    - Decoder Block 多了一层 Cross-Attention: Pre-LN(Self-Attn) + Cross-Attn + FFN
-    - Cross-Attention 不应使用 RoPE
-      (RoPE 假设 Q/K 在同一位置空间; 而 Decoder 的 Q 与 Encoder 的 K 来自
-       不同序列, 强行旋转会引入伪位置关系)
-    - 原论文使用 Post-LN, 本实现采用更稳定的 Pre-LN (避免 warmup 强依赖)
+是什么: Encoder 双向读完源句; Decoder 因果地生成目标句, 每层通过 cross-attention 回看整个源句。
+解决了什么: RNN seq2seq 必须逐 token 串行, 且长距离依赖要穿过很多步; attention 让任意两个位置一步直连, 训练可并行。
+关键公式: Attention(Q,K,V) = softmax(QKᵀ/√d_k)·V;  cross-attn 中 Q 来自 decoder, K/V 来自 encoder 输出。
+         x = emb·√d_model + PE  (embedding 用 N(0, 0.02²) 初始化, 乘 √D 后与幅度 ~1 的 sin PE 同量级)
+后来分化成两支: 只留 Encoder → BERT; 只留 Decoder → GPT。与论文的差异: 这里用 Pre-LN (更稳, 不依赖 warmup)。
+读代码时盯住: 三种 mask —— src_mask (源 padding) / tgt_mask (因果 ∧ 目标 padding) / cross-attn 复用 src_mask。
 """
 
 import math
@@ -29,19 +18,12 @@ import torch.nn as nn
 from llm_models.layers.core.attention import MultiHeadAttention
 from llm_models.layers.core.blocks import PreLNBlock, PreLNCrossBlock
 from llm_models.layers.core.feedforward import FeedForward
-from llm_models.layers.core.position_encoding import (
-    RotaryPositionalEncoding,
-    SinPositionalEncoding,
-)
+from llm_models.layers.core.position_encoding import RotaryPositionalEncoding, SinPositionalEncoding
+from llm_models.utils.init import init_weights
 
 
-def _make_encoder_layer(
-    d_model: int, n_heads: int, d_ff: int, dropout: float
-) -> PreLNBlock:
-    """构造一个 Encoder 层: Pre-LN(Self-Attn) + Pre-LN(FFN)。
-
-    使用原始 ReLU FFN 与 LayerNorm, 与论文一致 (GPT 系会换成 GELU/RMSNorm)。
-    """
+def _make_encoder_layer(d_model: int, n_heads: int, d_ff: int, dropout: float) -> PreLNBlock:
+    """self-attn + ReLU-FFN (与论文一致的 ReLU / LayerNorm)。"""
     return PreLNBlock(
         d_model=d_model,
         attn=MultiHeadAttention(d_model, n_heads),
@@ -51,14 +33,8 @@ def _make_encoder_layer(
     )
 
 
-def _make_decoder_layer(
-    d_model: int, n_heads: int, d_ff: int, dropout: float
-) -> PreLNCrossBlock:
-    """构造一个 Decoder 层: Pre-LN(Self-Attn) + Pre-LN(Cross-Attn) + Pre-LN(FFN)。
-
-    Cross-Attention 的 Q 来自目标端 (decoder hidden), K/V 来自源端 (encoder output),
-    这是 seq2seq 任务中"对齐"机制的关键。
-    """
+def _make_decoder_layer(d_model: int, n_heads: int, d_ff: int, dropout: float) -> PreLNCrossBlock:
+    """因果 self-attn + cross-attn (Q=decoder, K/V=encoder 输出) + FFN。"""
     return PreLNCrossBlock(
         d_model=d_model,
         self_attn=MultiHeadAttention(d_model, n_heads),
@@ -69,26 +45,17 @@ def _make_decoder_layer(
     )
 
 
-# 保留旧符号作为别名 (新代码用 PreLNBlock/PreLNCrossBlock, 旧测试/教程仍可 import)
+# 旧名字的别名, 供外部 import
 EncoderLayer = PreLNBlock
 DecoderLayer = PreLNCrossBlock
 
 
 class Transformer(nn.Module):
     """
-    Encoder-Decoder Transformer (原始 "Attention Is All You Need" 架构)
+    src -> src_emb·√D (+PE) -> N × EncoderLayer -> LN ─────────────┐ memory [B, S, D]
+    tgt -> tgt_emb·√D (+PE) -> N × DecoderLayer(cross-attn memory) -> LN -> fc_out -> [B, T, V_tgt]
 
-    架构流程:
-        src_ids -> src_emb * sqrt(d_model) (+Sin-PE) -> EncoderLayer × N -> enc_final_norm
-        tgt_ids -> tgt_emb * sqrt(d_model) (+Sin-PE)
-                -> DecoderLayer × N (cross-attend enc_output)
-                -> dec_final_norm -> fc_out
-
-    设计说明:
-        - 源/目标使用独立 Embedding (词表通常不同, 如 EN→DE)。
-        - emb * sqrt(d_model): 论文做法, 让 embedding 与 PE 量级匹配。
-        - Sin-PE: 绝对位置编码, 训练外推能力弱; 提供 use_rope 选项以支持
-          相对位置编码 (RoPE), 但仅用在 Self-Attn (Cross-Attn 不可用)。
+    use_rope=True 时不加 Sin-PE, 改为在 self-attn 内旋转 Q/K。
     """
 
     def __init__(
@@ -104,19 +71,15 @@ class Transformer(nn.Module):
         use_rope: bool = False,
     ):
         super().__init__()
-
         self.use_rope = use_rope
         self.d_model = d_model
 
         if use_rope:
-            # RoPE 作用在每个注意力头上, 维度为 d_head 而非 d_model
-            d_head = d_model // n_heads
-            self.pos_encoder = RotaryPositionalEncoding(d_head, max_len)
+            self.pos_encoder = RotaryPositionalEncoding(d_model // n_heads, max_len)   # 作用在每个 head 上
         else:
-            # Sin-PE 直接加到 token embedding 上, 维度为 d_model
-            self.pos_encoder = SinPositionalEncoding(d_model, max_len)
+            self.pos_encoder = SinPositionalEncoding(d_model, max_len)                 # 直接加到 embedding 上
 
-        self.src_embedding = nn.Embedding(src_vocab_size, d_model)
+        self.src_embedding = nn.Embedding(src_vocab_size, d_model)     # 源/目标词表不同, 各用各的
         self.tgt_embedding = nn.Embedding(tgt_vocab_size, d_model)
 
         self.encoder_layers = nn.ModuleList(
@@ -125,26 +88,40 @@ class Transformer(nn.Module):
         self.decoder_layers = nn.ModuleList(
             [_make_decoder_layer(d_model, n_heads, d_ff, dropout) for _ in range(num_layers)]
         )
-
         self.enc_final_norm = nn.LayerNorm(d_model)
         self.dec_final_norm = nn.LayerNorm(d_model)
         self.fc_out = nn.Linear(d_model, tgt_vocab_size)
 
-    def _embed(
-        self, ids: torch.Tensor, embedding: nn.Embedding
-    ) -> torch.Tensor:
-        """token id -> 向量 + (可选) Sin 位置编码。
+        init_weights(self)   # 默认 N(0,1) embedding 再乘 √D 会把 Sin-PE 完全淹没
 
-        RoPE 模式下不在此处加位置, 而是在每层 attention 内部对 Q/K 旋转。
-
-        Args:
-            ids:        [B, T] long
-            embedding:  源端或目标端的 nn.Embedding
-        Returns:
-            [B, T, d_model]
-        """
-        emb = embedding(ids) * math.sqrt(self.d_model)
+    def _embed(self, ids: torch.Tensor, embedding: nn.Embedding) -> torch.Tensor:
+        emb = embedding(ids) * math.sqrt(self.d_model)                 # [B, T, D]
         return emb if self.use_rope else self.pos_encoder(emb)
+
+    @property
+    def _rope(self) -> Optional[nn.Module]:
+        return self.pos_encoder if self.use_rope else None
+
+    def encode(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """src [B, S] -> memory [B, S, D]。推理时只需跑一次。"""
+        x = self._embed(src, self.src_embedding)
+        for layer in self.encoder_layers:
+            x = layer(x, mask=src_mask, rope=self._rope)               # 双向 self-attn
+        return self.enc_final_norm(x)
+
+    def decode(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        src_mask: Optional[torch.Tensor] = None,
+        tgt_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """tgt [B, T], memory [B, S, D] -> logits [B, T, V_tgt]"""
+        x = self._embed(tgt, self.tgt_embedding)
+        for layer in self.decoder_layers:
+            # cross-attn 不用 RoPE: Q 与 K 来自两条不同序列, 相对位置没有意义 (PreLNCrossBlock 内部只对 self-attn 传 rope)
+            x = layer(x, context=memory, self_mask=tgt_mask, context_mask=src_mask, rope=self._rope)
+        return self.fc_out(self.dec_final_norm(x))
 
     def forward(
         self,
@@ -154,37 +131,7 @@ class Transformer(nn.Module):
         tgt_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Args:
-            src:      [B, S] 源端 token ids
-            tgt:      [B, T] 目标端 token ids (训练时为 teacher-forcing 输入)
-            src_mask: padding mask (Encoder 与 Cross-Attn 的 K 端共用)
-            tgt_mask: 因果 + padding mask (Decoder Self-Attn 用)
-        Returns:
-            [B, T, tgt_vocab_size] logits
+        src [B, S], tgt [B, T] (teacher forcing 输入);
+        src_mask [B, 1, S] 源 padding; tgt_mask [B, T, T] 因果 ∧ 目标 padding  -> logits [B, T, V_tgt]
         """
-        # rope=None 时 attention 内部走 Sin-PE 已加在 emb 上的路径
-        rope_handler: Optional[nn.Module] = self.pos_encoder if self.use_rope else None
-
-        src_emb = self._embed(src, self.src_embedding)
-        tgt_emb = self._embed(tgt, self.tgt_embedding)
-
-        # Encoder: 双向 self-attn, 对源句做编码
-        enc_output = src_emb
-        for layer in self.encoder_layers:
-            enc_output = layer(enc_output, mask=src_mask, rope=rope_handler)
-        enc_output = self.enc_final_norm(enc_output)
-
-        # Decoder: 因果 self-attn + cross-attn(K/V 来自 enc_output)
-        # context_mask 用 src_mask 是为了在 cross-attn 中屏蔽源端 padding
-        dec_output = tgt_emb
-        for layer in self.decoder_layers:
-            dec_output = layer(
-                dec_output,
-                context=enc_output,
-                self_mask=tgt_mask,
-                context_mask=src_mask,
-                rope=rope_handler,
-            )
-        dec_output = self.dec_final_norm(dec_output)
-
-        return self.fc_out(dec_output)
+        return self.decode(tgt, self.encode(src, src_mask), src_mask, tgt_mask)

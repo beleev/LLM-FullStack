@@ -1,31 +1,14 @@
 """
-LLaMA 模型模块
+LLaMA (Touvron et al., 2023) — 现代开源 LLM 的事实模板
 
-论文出处:
-    "LLaMA: Open and Efficient Foundation Language Models" (Touvron et al., 2023)
-    "Llama 2" / "Llama 3" (Meta, 2023/2024)
-
-历史意义:
-    LLaMA 系列是 **现代开源 LLM 的事实模板**:
-        - GQA (Grouped Query Attention): 减小 KV cache, LLaMA-2 70B / Llama-3 全尺寸启用
-        - SwiGLU FFN: 门控激活, 比 GELU 在同参数预算下更强
-        - RMSNorm (Pre-Norm): 比 LayerNorm 少一次均值, 数值更稳
-        - RoPE: 相对位置, 长度外推友好
-        - 无 bias + 无 dropout (大模型训练惯例)
-        - Weight Tying: lm_head 与 token embedding 共享权重
-
-在本库的演进地图里的位置:
-    GPT-3 (2020, MHA + GELU + LayerNorm + Sin-PE)
-        ↓  把零件全部换成现代版
-    LLaMA (2023, GQA + SwiGLU + RMSNorm + RoPE)
-        ↓  继续稀疏化
-    Mixtral (2023, LLaMA + sparse MoE 替换 FFN)
-        ↓  进一步压缩 KV cache
-    DeepSeek-V3 (2024, MLA + 细粒度 MoE + 共享专家)
-        ↓  稀疏长上下文
-    DeepSeek-V3.2 (2025, MLA + DSA + MoE)
-
-因此本文件几乎是纯组装: 所有零件都已在 layers/ 中, 这里只是按 LLaMA 的方式组合。
+是什么: decoder-only LM, 把 GPT-3 的四个零件全部换成现代版:
+    MHA → GQA (KV cache ÷ 组数) | GELU-FFN → SwiGLU | LayerNorm → RMSNorm | Sin-PE → RoPE
+    外加: 无 bias、无 dropout、lm_head 与 embedding 共享权重。
+关键数字: d_ff ≈ 8/3·d_model (SwiGLU 有 3 个矩阵, 8/3 让参数量与 4·d 的两矩阵 FFN 持平);
+          初始 CE 必须 ≈ ln V (init_weights 保证; 默认 N(0,1) embedding + weight tying 会给出 ~250)。
+演进: GPT-3 → LLaMA → Mistral (换 mask) / Mixtral (FFN 换 MoE) → DeepSeek-V3 (GQA 换 MLA)。
+读代码时盯住: forward 里的 `past` —— 无 cache 时为 0, 有 cache 时它同时平移 RoPE 位置和 mask 行。
+本文件几乎是纯组装, 零件都在 layers/core/。
 """
 
 import math
@@ -33,13 +16,14 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from llm_models.layers.core.attention import GroupedQueryAttention
 from llm_models.layers.core.blocks import PreLNBlock
 from llm_models.layers.core.feedforward import SwiGLUFeedForward
 from llm_models.layers.core.normalization import RMSNorm
 from llm_models.layers.core.position_encoding import RotaryPositionalEncoding
+from llm_models.utils.generation import GenerationMixin, KVCache
+from llm_models.utils.init import init_weights
 from llm_models.utils.masks import build_causal_mask, combine_causal_and_padding_mask
 
 
@@ -49,14 +33,13 @@ def _make_llama_block(
     num_kv_heads: Optional[int],
     d_ff: int,
     dropout: float,
+    qk_norm: bool = False,
 ) -> PreLNBlock:
-    """
-    组装一个 LLaMA Block:  GQA + SwiGLU-FFN + RMSNorm (Pre-Norm)
-    """
+    """一个 LLaMA Block = PreLNBlock(GQA + SwiGLU + RMSNorm)。"""
     return PreLNBlock(
         d_model=d_model,
         attn=GroupedQueryAttention(
-            d_model=d_model, num_heads=n_heads, num_kv_heads=num_kv_heads,
+            d_model=d_model, num_heads=n_heads, num_kv_heads=num_kv_heads, qk_norm=qk_norm,
         ),
         ffn=SwiGLUFeedForward(d_model, d_ff),
         norm_cls=RMSNorm,
@@ -64,37 +47,23 @@ def _make_llama_block(
     )
 
 
-# 对外保留别名: LLaMA 社区常称其为 LlamaDecoderLayer / LlamaBlock
+# 社区常称 LlamaDecoderLayer / LlamaBlock
 LlamaBlock = PreLNBlock
 
 
-class LLaMA(nn.Module):
+class LLaMA(GenerationMixin, nn.Module):
     """
-    LLaMA decoder-only LLM (教学版)
-
-    架构:
-        idx -> TokenEmbed * sqrt(d_model)
-            -> N x PreLNBlock(GQA + SwiGLU + RMSNorm) [RoPE 注入 Q/K]
-            -> RMSNorm
-            -> lm_head  (与 token_embedding 共享权重)
-
-    与 GPT3 的一行差异对照:
-        GPT3:  MHA   + GELU-FFN + LayerNorm + Sin-PE (or RoPE)
-        LLaMA: GQA   + SwiGLU   + RMSNorm   + RoPE
-
-    默认参数对齐 LLaMA-2 7B (d_model=4096, n_heads=32, num_kv_heads=32, layers=32);
-    教学默认缩小到 GPT-Medium 尺寸, 方便 CPU 实验。
+    idx -> Embed·sqrt(D) -> N × PreLNBlock(GQA+SwiGLU+RMSNorm, RoPE 注入 Q/K) -> RMSNorm -> lm_head (tied)
 
     Args:
-        vocab_size:      词表大小 (LLaMA 原版 32000)
-        d_model:         隐藏维度
-        n_heads:         Q head 数
-        num_kv_heads:    K/V head 数, None 时等于 n_heads (退化为 MHA);
-                         LLaMA-2 70B 使用 8 (GQA 压缩 4×)
-        num_layers:      Transformer 层数
-        max_len:         最大上下文 (预构建因果 mask 所需)
-        d_ff:            SwiGLU 隐藏维度, None 时用 int(8/3 * d_model) 对齐 LLaMA
-        dropout:         Dropout (LLaMA 官方训练设 0, 教学保留参数)
+        vocab_size / d_model / n_heads / num_layers: 常规
+        num_kv_heads: K/V head 数; None = n_heads (MHA)。LLaMA-2 70B 用 8。
+        max_len:      最大上下文 (因果 mask 与 RoPE 表的大小)
+        d_ff:         None 时取 8/3·d_model 并向上对齐到 64
+        dropout:      官方训练为 0
+        qk_norm:      Q/K 过 RMSNorm (Qwen3 / OLMo-2 风格), 默认关
+        rope_scaling / rope_factor / rope_original_max_len:
+                      长上下文外推 (None | "ntk" | "yarn"), 见 position_encoding.py
     """
 
     def __init__(
@@ -107,6 +76,10 @@ class LLaMA(nn.Module):
         max_len: int = 4096,
         d_ff: Optional[int] = None,
         dropout: float = 0.0,
+        qk_norm: bool = False,
+        rope_scaling: Optional[str] = None,
+        rope_factor: float = 1.0,
+        rope_original_max_len: Optional[int] = None,
     ):
         super().__init__()
 
@@ -116,31 +89,32 @@ class LLaMA(nn.Module):
 
         self.token_embedding = nn.Embedding(vocab_size, d_model)
 
-        # RoPE 作用在 per-head 维度, 所有层共享同一个 encoder (无参数开销)
-        d_head = d_model // n_heads
-        self.rope = RotaryPositionalEncoding(d_head, max_len)
+        # RoPE 作用在 per-head 维度; 无参数, 所有层共享一份 cos/sin 表
+        self.rope = RotaryPositionalEncoding(
+            d_model // n_heads, max_len,
+            scaling=rope_scaling, factor=rope_factor, original_max_len=rope_original_max_len,
+        )
 
-        # d_ff 默认: LLaMA 官方用 (8/3) * d_model, 圆整到 256 的倍数
         if d_ff is None:
-            d_ff = int(8 / 3 * d_model)
-            # 向上对齐到 64 的整数倍, 让 matmul 对硬件友好
-            d_ff = ((d_ff + 63) // 64) * 64
+            d_ff = ((int(8 / 3 * d_model) + 63) // 64) * 64   # 对齐 64: matmul 对硬件友好
 
         self.layers = nn.ModuleList(
             [
-                _make_llama_block(d_model, n_heads, num_kv_heads, d_ff, dropout)
+                _make_llama_block(d_model, n_heads, num_kv_heads, d_ff, dropout, qk_norm)
                 for _ in range(num_layers)
             ]
         )
 
         self.ln_f = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-        # Weight tying: lm_head 与 token_embedding 共享
-        self.lm_head.weight = self.token_embedding.weight
+        self.lm_head.weight = self.token_embedding.weight     # weight tying
 
-        # 预构建 max_len × max_len 因果 mask
-        causal = build_causal_mask(max_len, torch.device("cpu"))
-        self.register_buffer("causal_mask", causal, persistent=False)
+        self.register_buffer(
+            "causal_mask", build_causal_mask(max_len, torch.device("cpu")), persistent=False
+        )
+
+        # 必须在 weight tying 之后: N(0, 0.02²) 让初始 logits ≈ 0 → CE ≈ ln V
+        init_weights(self)
 
     def _causal_mask(self, seq_len: int) -> torch.Tensor:
         if seq_len <= self.causal_mask.size(-1):
@@ -149,54 +123,29 @@ class LLaMA(nn.Module):
 
     def forward(
         self,
-        idx: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            idx:            [B, T] token IDs
-            attention_mask: [B, T] padding mask, 1=有效 0=pad
-        Returns:
-            logits: [B, T, vocab_size]
-        """
+        idx: torch.Tensor,                              # [B, T]
+        attention_mask: Optional[torch.Tensor] = None,  # [B, past+T], 1=有效 0=pad
+        cache: Optional[KVCache] = None,
+    ) -> torch.Tensor:                                  # [B, T, V]
         B, T = idx.shape
-        if T > self.max_len:
-            raise ValueError(f"序列长度 {T} 超过 max_len={self.max_len}")
+        past = cache.pos if cache is not None else 0    # 已缓存的 token 数
+        if past + T > self.max_len:
+            raise ValueError(f"序列长度 {past + T} 超过 max_len={self.max_len}")
 
-        # * sqrt(d_model) 与 GPT3 一致 (让 embedding 与激活方差匹配)
-        x = self.token_embedding(idx) * math.sqrt(self.d_model)
+        # ·sqrt(D): 抵消 0.02 的小初始化, 让 embedding 与残差分支同量级
+        x = self.token_embedding(idx) * math.sqrt(self.d_model)          # [B, T, D]
 
-        # 因果 mask ∩ padding mask
-        causal = self._causal_mask(T)
+        position_ids = torch.arange(past, past + T, device=idx.device)   # 新 token 的绝对位置
+        # 新 token 是 query (行 past:past+T), 能看到全部历史 (列 :past+T)
+        causal = self._causal_mask(past + T)[:, past:]                   # [1, T, past+T]
         mask = combine_causal_and_padding_mask(causal, attention_mask)
 
-        for layer in self.layers:
-            x = layer(x, mask=mask, rope=self.rope)
+        for i, layer in enumerate(self.layers):
+            x = layer(
+                x, mask=mask, rope=self.rope, position_ids=position_ids,
+                cache=cache.layers[i] if cache is not None else None,
+            )
+        if cache is not None:
+            cache.pos += T
 
-        x = self.ln_f(x)
-        return self.lm_head(x)
-
-    @torch.inference_mode()
-    def generate(
-        self,
-        idx: torch.Tensor,
-        max_new_tokens: int,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-    ) -> torch.Tensor:
-        """
-        朴素自回归生成 (每步重算, 无 KV cache) — 同 GPT3.generate 的教学实现。
-        生产用 KV cache + 连续 batching 能把 O(T^2) 降到 O(T)。
-        """
-        self.eval()
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.max_len else idx[:, -self.max_len :]
-            logits = self(idx_cond)
-            logits = logits[:, -1, :] / temperature
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, idx_next], dim=1)
-        return idx
+        return self.lm_head(self.ln_f(x))

@@ -1,15 +1,14 @@
 """
-m02 demo — Paged Attention 与 BlockManager
+m02 demo — BlockManager 记账 + 分页 KV 上的 attention 与连续 KV 逐元素一致
 
-观察三件事:
-    1) 多序列在同一 pool 下并发分配/释放, 显存被复用
-    2) gather + attention 在分页 KV 上算出的结果与连续 KV 等价
-    3) 池子用满 → can_allocate 返回 False, 触发抢占的契机 (m03 会处理)
+运行: python -m llm_infer.m02_paged_attention.demo
+看什么: block_table 如何增长/归还; pool 用满时的 MemoryError (m03 抢占的触发信号);
+        [5][6] decode 与多 token prefill 两种形状下 paged == dense。
 """
 from __future__ import annotations
 import numpy as np
 
-from llm_infer.core.utils import banner, kv, softmax, causal_mask
+from llm_infer.core.utils import banner, kv, dense_attention
 from llm_infer.m02_paged_attention.block_manager import BlockManager
 from llm_infer.m02_paged_attention.paged_attention import (
     gather_kv, write_kv, paged_attention,
@@ -65,18 +64,28 @@ def main():
     k_pool = np.zeros((bm2.num_blocks, block_size, D), dtype=np.float32)
     v_pool = np.zeros_like(k_pool)
     table = bm2.block_table(1)
-    for pos in range(T):
-        write_kv(k_pool, v_pool, table, pos, K_full[pos], V_full[pos])
+    write_kv(k_pool, v_pool, table, np.arange(T), K_full, V_full)   # 11 个 token 散进 3 个不一定相邻的 block
 
     # paged 路径
     out_paged = paged_attention(Q, k_pool, v_pool, table, ctx_len=T)
     # 连续路径 (m01 风格)
-    scores = (Q @ K_full.T) / np.sqrt(D)
-    out_dense = softmax(scores + causal_mask(1, T), axis=-1) @ V_full
+    out_dense = dense_attention(Q, K_full, V_full)
 
     diff = np.max(np.abs(out_paged - out_dense))
     kv("max |paged - dense|", f"{diff:.2e}")
     assert diff < 1e-6, "paged_attention 实现错误"
+
+    # chunked prefill 形状: 最后 5 个 token 一起当 query, 因果 mask 对齐尾部
+    Q5 = rs.randn(5, D).astype(np.float32)
+    diff5 = np.max(np.abs(paged_attention(Q5, k_pool, v_pool, table, ctx_len=T)
+                          - dense_attention(Q5, K_full, V_full)))
+    kv("[6] T_q=5 (prefill chunk) max diff", f"{diff5:.2e}")
+    assert diff5 < 1e-6
+    K_back, _ = gather_kv(k_pool, v_pool, table, T)
+    assert np.array_equal(K_back, K_full)
+    waste = len(table) * block_size - T
+    kv("内碎片 (末页空槽)", f"{waste} / {len(table) * block_size} slot, 上界 block_size-1={block_size - 1}")
+    assert waste < block_size
     print("  ✓ 数值一致, 分页对外语义透明")
 
 

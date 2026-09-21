@@ -1,169 +1,130 @@
 """
-M13 — FP8 训练 (DeepSeek-V3 同款思路, numpy 模拟)
+M13 — FP8 训练
 
-m06 讲了 FP16/BF16 混合精度; FP8 把"半精度"再砍一半:
-    E4M3 (4 位指数 3 位尾数):  范围 ±448,    精度高  → 权重 / 激活
-    E5M2 (5 位指数 2 位尾数):  范围 ±57344,  范围大  → 梯度 (动态范围更野)
-
-天上不会掉算力: 尾数只剩 2~3 位, 量化误差比 FP16 大一个量级。
-FP8 训练能 work 靠的是三件套 (DeepSeek-V3 公开配方):
-    1. **block-wise scaling**: 不是整个张量共享一个缩放因子, 而是每
-       128 个元素一组各自缩放 —— 单个 outlier 只毁掉自己那一小块,
-       而不是把全张量的有效精度拖下水
-    2. **FP32 master weights + 高精度累加**: 乘法用 FP8, 加法 (GEMM
-       累加 / 梯度累积 / 优化器更新) 留在高精度
-    3. 关键路径 (norm / softmax / 优化器状态) 不量化
-
-说明: numpy 没有原生 fp8 dtype, 本 demo 用 "encode→decode" 假量化
-      (fake quantization) 模拟数值效应, 与真卡上的舍入行为一致。
+是什么: 矩阵乘的输入 (权重 / 激活 / 输出梯度) 量化到 8 位浮点, 累加和参数更新留在高精度。
+解决的瓶颈: 算力 + 显存带宽 (GEMM 约 2× 于 BF16)。代价: 尾数只剩 2~3 位, 动态范围很窄。
+    E4M3: ±448,   最小 normal 2^-6,  相对误差 ~3%   |   E5M2: ±57344, 最小 normal 2^-14, 相对误差 ~6%
+两套公开配方 (不要混为一谈):
+    Transformer Engine: 前向 E4M3 / 反向梯度 E5M2, **per-tensor** scaling (用 E5M2 的范围兜住梯度)
+    DeepSeek-V3:        **全程 E4M3**, 细粒度 scaling —— 激活 1×128 tile, 权重 128×128 block
+                        (用更细的 scale 兜住范围, 于是梯度也能享受 E4M3 的精度)
+共同点: FP32/BF16 master weights + 高精度优化器状态; norm / softmax / embedding / 输出头不量化。
+读代码盯住: `make_quantizer(scaling, fmt)` 的两个旋钮, 以及 `master` 开关 —— 三个消融臂各只动一个变量。
+说明: numpy 无 fp8 dtype, 用 core.fake_quant_float 做 "量化→反量化" 模拟舍入效应。
 """
 from __future__ import annotations
 
 import numpy as np
 
-from llm_train.core import LinearModel, ToyDataStream, banner, kv
+from llm_train.core import adam_update, banner, fake_quant_float, kv, quant_blockwise
+
+F32 = np.float32
+BLOCK = 128
 
 
-# --------------------------------------------------------------------- #
-# FP8 假量化: 把 float64 舍入到 E4M3 / E5M2 可表示的最近值              #
-# --------------------------------------------------------------------- #
-
-FP8_FORMATS = {
-    # (尾数位数, 最大可表示值, 最小 normal 指数)
-    # E4M3: 最小 normal 2^-6 ≈ 0.0156, subnormal 步长 2^-9 ≈ 0.00195
-    # E5M2: 最小 normal 2^-14,         subnormal 步长 2^-16
-    "e4m3": (3, 448.0, -6),
-    "e5m2": (2, 57344.0, -14),
-}
+def make_quantizer(scaling: str, fmt):
+    """scaling ∈ {none, tensor, block}; fmt=None 表示不量化 (FP32 基线)。"""
+    if fmt is None:
+        return lambda t: t
+    if scaling == "none":
+        return lambda t: fake_quant_float(t, fmt).astype(F32)              # 直接舍入到 FP8 原生网格
+    block = BLOCK if scaling == "block" else None
+    return lambda t: quant_blockwise(t, fmt, block or t.size).astype(F32)  # block=整个张量 即 per-tensor
 
 
-def quantize_fp8(x: np.ndarray, fmt: str = "e4m3") -> np.ndarray:
-    """逐元素舍入到 FP8 网格 (含上界饱和、subnormal 区与下溢冲零)。
+def rel_err(a, b) -> float:
+    return float(np.linalg.norm(a - b) / np.linalg.norm(b))
 
-    浮点数的相对精度在 normal 区内与量级无关 (恒为 ~2^-(m+1)),
-    但跌破最小 normal 后进入 subnormal 区: 网格变成**固定步长**,
-    越小的数相对误差越大, 低于半步长直接下溢成 0 —— 这正是
-    "为什么 FP8 必须配 scaling" 的数值根源。
+
+def train(scaling: str, fwd_fmt, bwd_fmt, master: bool = True, steps: int = 200) -> float:
+    """线性回归, FP8 GEMM: Y = Q(X)·Q(W),  dW = Q(X)ᵀ·Q(dY)。返回干净验证集上的相对 loss。
+
+    量级刻意取真实 LLM 的水平: 权重 std 0.004, 逐元素梯度 ~1e-5 —— 都落在 FP8 原生网格的
+    subnormal 区以下, 这正是 "不 scaling 就不能用" 的原因。
     """
-    m_bits, max_val, e_min = FP8_FORMATS[fmt]
-    out = np.clip(x, -max_val, max_val)
+    rs = np.random.RandomState(0)
+    d_in, d_out, B = 128, 32, 128
+    W_true = (rs.randn(d_in, d_out) * 0.004).astype(F32)
+    W = np.zeros((d_in, d_out), dtype=F32)                                # master (真的是 float32)
+    m, v = np.zeros_like(W), np.zeros_like(W)                             # Adam 状态: 始终高精度
+    q_fwd, q_bwd = make_quantizer(scaling, fwd_fmt), make_quantizer(scaling, bwd_fmt)
+    x_val = rs.randn(256, d_in).astype(F32)
+    y_val = x_val @ W_true
 
-    mant, exp = np.frexp(out)                       # x = mant * 2^exp, mant∈[0.5,1)
-    step = 2.0 ** (m_bits + 1)                      # 尾数网格密度
-    q_normal = np.ldexp(np.round(mant * step) / step, exp)
-
-    quantum = 2.0 ** (e_min - m_bits)               # subnormal 固定步长
-    q_subnormal = np.round(out / quantum) * quantum  # 下溢: |x| < quantum/2 → 0
-
-    return np.where(np.abs(out) >= 2.0 ** e_min, q_normal, q_subnormal)
-
-
-def quantize_blockwise(x: np.ndarray, fmt: str = "e4m3", block: int = 128) -> np.ndarray:
-    """block-wise scaling 假量化: 每 block 个元素一组, 缩放到满量程再量化。
-
-    真卡上 scale 以 FP32 单独存储 (DeepSeek-V3: 激活 1x128, 权重 128x128 tile)。
-    """
-    _, max_val, _ = FP8_FORMATS[fmt]
-    flat = x.reshape(-1)
-    pad = (-len(flat)) % block
-    padded = np.concatenate([flat, np.zeros(pad)]) if pad else flat
-    blocks = padded.reshape(-1, block)
-
-    scale = np.abs(blocks).max(axis=1, keepdims=True) / max_val   # 每块一个 scale
-    scale = np.where(scale == 0, 1.0, scale)
-    deq = quantize_fp8(blocks / scale, fmt) * scale               # 量化→反缩放
-    return deq.reshape(-1)[: len(flat)].reshape(x.shape)
-
-
-def rel_err(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-12))
+    for t in range(1, steps + 1):
+        x = rs.randn(B, d_in).astype(F32)                                 # [B, 128]: block=128 恰好是 1×128 per-token tile
+        y = x @ W_true
+        xq, wq = q_fwd(x), q_fwd(W)                                       # GEMM 的两个输入都量化
+        diff = xq @ wq - y                                                # 输出与 loss 留在高精度
+        g = q_bwd((diff * F32(2.0 / diff.size)).astype(F32))              # 输出梯度 [B, 32], 量级 ~1e-5
+        dW = (xq.T @ g).astype(F32)                                       # [128, 32]
+        adam_update(W, dW, m, v, t, lr=4e-4 * (1 - t / steps))
+        if not master:
+            W = q_fwd(W)                                                  # 无 master: 权重只以 FP8 形式存在, 小更新被舍掉
+    return float(np.mean((x_val @ W - y_val) ** 2) / np.mean(y_val ** 2))
 
 
 def main() -> None:
-    banner("M13 - FP8 Training (E4M3 / E5M2 + block scaling)")
-
+    banner("M13 - FP8 Training")
     rs = np.random.RandomState(0)
 
-    # ---- 1) 两种 FP8 格式的取舍: 精度 vs 范围 ----
-    print("\n[1] 格式取舍 (同一正态张量的量化相对误差)")
+    # ---- 1) 格式取舍: 精度 vs 范围 (无 scaling, 看原生网格) ----
+    print("\n[1] E4M3 vs E5M2 (同一个 N(0,1) 张量; 另有 4 个孤立的 3e4 尖峰)")
     x = rs.randn(4096)
-    kv("E4M3 (3 位尾数, ±448)", f"{rel_err(quantize_fp8(x, 'e4m3'), x):.4f}  ← 权重/激活")
-    kv("E5M2 (2 位尾数, ±57344)", f"{rel_err(quantize_fp8(x, 'e5m2'), x):.4f}  ← 梯度")
-    big = x * 1e5                                   # 模拟梯度尖峰
-    kv("E4M3 遇到 1e5 量级尖峰", f"{rel_err(quantize_fp8(big, 'e4m3'), big):.4f}  (饱和截断!)")
-    kv("E5M2 遇到 1e5 量级尖峰", f"{rel_err(quantize_fp8(big, 'e5m2'), big):.4f}")
+    spikes = rs.choice(4096, 4, replace=False)
+    x_spiky = x.copy()
+    x_spiky[spikes] = 3e4                                                 # 只改 4 个元素, 其余不动
+    for fmt in ("e4m3", "e5m2"):
+        body = rel_err(fake_quant_float(x, fmt), x)
+        peak = fake_quant_float(x_spiky, fmt)[spikes][0]
+        kv(f"{fmt}: 主体相对误差 / 尖峰 3e4 →", f"{body:.3f} / {peak:.0f}")
+    assert rel_err(fake_quant_float(x, "e4m3"), x) < rel_err(fake_quant_float(x, "e5m2"), x), "E4M3 多 1 位尾数 → 更准"
+    assert fake_quant_float(x_spiky, "e4m3")[spikes][0] == 448, "E4M3 饱和: 3e4 被截成 448"
+    assert rel_err(fake_quant_float(x_spiky, "e5m2")[spikes], x_spiky[spikes]) < 0.07, "E5M2 装得下"
 
-    # ---- 2) outlier 毁掉 per-tensor scaling, block-wise 救回来 ----
-    print("\n[2] 为什么必须 block-wise scaling (重尾梯度 + 0.1% 尖峰)")
-    # 真实梯度跨多个数量级 (重尾), 偶发尖峰再大 3~4 个数量级
-    grad = rs.randn(4096) * np.exp(rs.randn(4096))
-    grad[rs.choice(4096, 4, replace=False)] = 3e4    # 梯度尖峰
+    # ---- 2) scaling 粒度: 孤立 outlier 越大, per-tensor 越惨; 1×128 tile 不受影响 ----
+    print("\n[2] 3 个孤立 outlier 激活对 **其余 29 个 token** 的 GEMM 输出误差 (X[32,512], 全程 E4M3)")
+    X0 = rs.randn(32, 512)
+    Wm = rs.randn(512, 32) * 0.02
+    rows = np.array([3, 11, 20])
+    bystander = np.setdiff1d(np.arange(32), rows)                         # 自己没有 outlier 的 token
+    print(f"      {'outlier 幅度':<14}{'per-tensor':>12}{'1×128 tile':>12}{'per-tensor 冲零比例':>20}")
+    err = {}
+    for mag in (1e2, 1e3, 1e4, 1e5, 1e6):
+        X = X0.copy()
+        X[rows, [17, 200, 450]] = mag                                     # 只改 3 个元素
+        Y = X @ Wm
+        q_t, q_b = quant_blockwise(X, "e4m3", X.size), quant_blockwise(X, "e4m3", BLOCK)
+        err[mag] = (rel_err((q_t @ Wm)[bystander], Y[bystander]), rel_err((q_b @ Wm)[bystander], Y[bystander]))
+        print(f"      {mag:<14.0e}{err[mag][0]:>12.3f}{err[mag][1]:>12.3f}{np.mean(q_t[bystander] == 0):>20.1%}")
+    assert err[1e2][0] < 1.2 * err[1e2][1], "outlier 不大时两者打平: E4M3 自带 2^15 的动态范围"
+    assert err[1e4][0] < 1.2 * err[1e4][1], "诚实结论: 1e4× 以内 per-tensor 扛得住"
+    assert err[1e5][0] > 4 * err[1e5][1] and err[1e6][0] > 0.9, "再大就把所有人压进 subnormal, 直到全部冲成 0"
+    assert all(e_b < 0.05 for _, e_b in err.values()), "tile scaling: outlier 只影响它自己那 128 个元素"
 
-    # per-tensor: 为容纳尖峰, scale = 3e4/448 ≈ 67 → 普通值被压进
-    # subnormal 区 (固定步长网格), 小梯度直接下溢成 0
-    scale_t = np.abs(grad).max() / FP8_FORMATS["e4m3"][1]
-    per_tensor = quantize_fp8(grad / scale_t, "e4m3") * scale_t
-    per_block = quantize_blockwise(grad, "e4m3", block=128)
+    # ---- 3) 端到端消融: 每个臂只动一个变量 ----
+    print("\n[3] 训练消融 (200 步 Adam; 数值 = 验证 loss / ‖y‖², 越小越好)")
+    arms = {
+        "FP32 基线":                          ("none", None, None, True),
+        "A  无 scaling        + master":      ("none", "e4m3", "e5m2", True),
+        "B  per-tensor (TE 式) + master":     ("tensor", "e4m3", "e5m2", True),
+        "C  block-128 (V3 式)  + master":     ("block", "e4m3", "e4m3", True),
+        "D  block-128 (V3 式), 无 master":    ("block", "e4m3", "e4m3", False),
+    }
+    loss = {name: train(*cfg) for name, cfg in arms.items()}
+    for name, val in loss.items():
+        kv(name, f"{val:.2e}")
+    a, b, c, d = (loss[k] for k in list(arms)[1:])
+    kv("scaling 的收益 A/B", f"{a / b:.0f}x")
+    kv("master 的收益 D/C", f"{d / c:.0f}x")
+    kv("粒度的收益 B/C (本数据无 outlier)", f"{b / c:.2f}x  ← 约等于 1: 粒度只在有 outlier 时才起作用, 见 [2]")
 
-    def elem_err_median(q: np.ndarray) -> float:
-        nz = np.abs(grad) > 0
-        return float(np.median(np.abs(q[nz] - grad[nz]) / np.abs(grad[nz])))
+    assert a > 10 * b, "不 scaling: 权重和梯度都掉进 subnormal/下溢区"
+    assert d > 100 * c, "无 master: 小于 FP8 步长的更新全部丢失"
+    assert 0.8 < b / c < 1.25, "干净数据上 per-tensor 与 block 基本打平 (诚实结论)"
+    assert c < 1e-3, "FP8 的终点 = 量化噪声底 (~5e-4); 无噪声的玩具问题上 FP32 能到 1e-8, 真实 LLM 的 loss 噪声远大于此"
 
-    def flushed(q: np.ndarray) -> float:
-        return float(np.mean((q == 0) & (grad != 0)))
-
-    kv("per-tensor 逐元素中位误差", f"{elem_err_median(per_tensor):.1%}")
-    kv("per-tensor 被冲成 0 的比例", f"{flushed(per_tensor):.1%}")
-    kv("block-wise(128) 中位误差", f"{elem_err_median(per_block):.1%}")
-    kv("block-wise(128) 冲零比例", f"{flushed(per_block):.1%}")
-    assert elem_err_median(per_block) < elem_err_median(per_tensor) / 2
-    assert flushed(per_block) < flushed(per_tensor)
-
-    # ---- 3) 端到端: FP8 训练 vs FP32 基线 ----
-    print("\n[3] 训练对比 (线性回归 60 步, 同一数据流)")
-
-    def train(mode: str, steps: int = 60, lr: float = 0.1) -> list[float]:
-        """mode: fp32 | fp8_block (FP32 master) | fp8_naive (无 master, per-tensor)"""
-        stream = ToyDataStream(d_in=8, d_out=4, batch_size=32, seed=123)
-        model = LinearModel.init(d_in=8, d_out=4, seed=3)
-        master_W = model.W.astype(np.float64).copy()   # FP32 master 权重
-        losses = []
-        for _ in range(steps):
-            x, y = stream.next_batch()
-            if mode != "fp32":
-                blockwise = mode == "fp8_block"
-                q = (lambda t, f: quantize_blockwise(t, f, 128)) if blockwise \
-                    else (lambda t, f: quantize_fp8(t, f))
-                # 前向/反向的乘法输入量化: 权重&激活走 E4M3, 梯度走 E5M2
-                model.W[...] = q(master_W if blockwise else model.W, "e4m3")
-                x = q(x, "e4m3")
-            loss, grads = model.loss_and_grads(x, y)
-            losses.append(loss)
-            if mode == "fp8_block":
-                g = quantize_blockwise(grads["W"], "e5m2", 128)
-                master_W -= lr * g                    # 高精度 master 上更新
-                model.b -= lr * grads["b"]
-            elif mode == "fp8_naive":
-                g = quantize_fp8(grads["W"], "e5m2")
-                model.W -= lr * g                     # 直接在 FP8 权重上更新
-                model.b -= lr * grads["b"]
-            else:
-                model.apply_grads(grads, lr)
-        return losses
-
-    base = train("fp32")
-    fp8_good = train("fp8_block")
-    fp8_naive = train("fp8_naive")
-    kv("FP32 基线  final loss", f"{base[-1]:.6f}")
-    kv("FP8 三件套 final loss", f"{fp8_good[-1]:.6f}  (block scaling + master)")
-    kv("FP8 裸跑   final loss", f"{fp8_naive[-1]:.6f}  (per-tensor, 无 master)")
-    kv("三件套比裸跑好", f"{fp8_naive[-1] / fp8_good[-1]:.0f}x (基本贴住 FP32 曲线)")
-
-    assert abs(fp8_good[-1] - base[-1]) < abs(fp8_naive[-1] - base[-1]), \
-        "带 scaling+master 的 FP8 应显著好于裸跑 FP8"
-
-    print("\n  OK: FP8 不是免费午餐 —— 乘法省一半, 但 scaling 粒度和高精度")
-    print("      累加/master 一个都不能少 (DeepSeek-V3 是首个全程 FP8 的前沿模型)。")
+    print("\n  OK: 三件事各自独立 —— scaling 决定能不能用, master 决定能不能收敛, 粒度决定扛不扛得住 outlier。")
 
 
 if __name__ == "__main__":

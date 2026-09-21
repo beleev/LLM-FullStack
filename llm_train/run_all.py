@@ -1,4 +1,4 @@
-"""Run all llm_train demos in learning-path order."""
+"""按学习路径顺序跑完所有 demo; 任何一个 assert 失败都会让整体失败。"""
 from __future__ import annotations
 
 import importlib
@@ -18,6 +18,9 @@ DEMOS = [
     "llm_train.m11_expert_parallel.demo",
     "llm_train.m12_sequence_parallel.demo",
     "llm_train.m13_fp8_training.demo",
+    "llm_train.m14_muon_optimizer.demo",
+    "llm_train.m15_fp4_microscaling.demo",
+    "llm_train.m16_ulysses_sequence_parallel.demo",
     "llm_train.full_loop.demo",
 ]
 

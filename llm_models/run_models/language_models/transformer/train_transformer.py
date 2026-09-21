@@ -1,78 +1,42 @@
 #!/usr/bin/env python
 """
-Transformer (Encoder-Decoder) 训练示例
+Transformer (Encoder-Decoder) 训练: teacher forcing + 交叉熵
 
-演示使用通用 Trainer 训练标准 Encoder-Decoder Transformer
-(原版 "Attention Is All You Need" 架构，常用于翻译类 seq2seq 任务)。
-
-训练方式：teacher forcing + 标准交叉熵 loss
-- teacher forcing：训练时给 Decoder 的输入是真实的 ground-truth tgt
-  （而非模型自己上一步的预测），收敛更快、训练更稳
-- 因果掩码 + tgt 错位：保证模型只能用过去 token 预测下一个 token
-
-数据为随机 token 对 (src, tgt)，仅用于打通流程并验证 loss 收敛。
+注意: (src, tgt) 是固定的随机 token 对, 两者没有任何对应关系; "loss 下降" = 背下这个 batch, 只验证梯度链路。
 """
 
+import math
+
 import torch
-from llm_models.models import Transformer
-from llm_models.training import (
-    Trainer,
-    TrainingConfig,
-    StandardLMLoss,
-    EncoderDecoderDataGenerator,
-)
+
+from llm_models.models.foundation.transformer import Transformer
+from llm_models.training import Trainer, TrainingConfig, StandardLMLoss, EncoderDecoderDataGenerator
 
 
 def main():
-    # --- 训练配置 ---
     config = TrainingConfig(
-        learning_rate=3e-4,
-        batch_size=2,
-        seq_len=32,
-        num_steps=50,
-        warmup_steps=5,
-        log_interval=10,
-        seed=42,
+        learning_rate=1e-3, batch_size=2, seq_len=32,
+        num_steps=60, warmup_steps=5, log_interval=10, seed=42,
     )
     torch.manual_seed(config.seed)
 
-    # --- 模型配置 ---
-    # src/tgt 词表大小不同，模拟翻译场景（如英→中）
-    src_vocab_size = 800
-    tgt_vocab_size = 1000
+    V_src, V_tgt = 800, 1000
     model = Transformer(
-        src_vocab_size=src_vocab_size,
-        tgt_vocab_size=tgt_vocab_size,
-        d_model=256,
-        n_heads=4,
-        num_layers=2,
-        d_ff=512,                  # FFN 中间层维度，常为 d_model 的 2-4 倍
-        max_len=128,
-        dropout=0.1,
-        use_rope=False,
+        src_vocab_size=V_src, tgt_vocab_size=V_tgt,
+        d_model=256, n_heads=4, num_layers=2, d_ff=512, max_len=128, dropout=0.0,
     )
+    print(f"Transformer | 参数量: {sum(p.numel() for p in model.parameters()):,}")
 
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"Transformer | 参数量: {num_params:,}")
-
-    # --- 数据生成器 + 损失函数 ---
-    # EncoderDecoderDataGenerator 同步生成 (src, tgt) 对，并构造好掩码
     data_gen = EncoderDecoderDataGenerator(
-        src_vocab_size=src_vocab_size,
-        tgt_vocab_size=tgt_vocab_size,
-        batch_size=config.batch_size,
-        src_len=config.seq_len,
-        tgt_len=config.seq_len,
+        src_vocab_size=V_src, tgt_vocab_size=V_tgt,
+        batch_size=config.batch_size, src_len=config.seq_len, tgt_len=config.seq_len,
     )
-    loss_fn = StandardLMLoss()
+    metrics = Trainer(model, config, data_gen, StandardLMLoss()).train()
 
-    # --- 训练 ---
-    trainer = Trainer(model, config, data_gen, loss_fn)
-    metrics = trainer.train()
-
-    # --- 验证 loss 下降 ---
-    assert metrics[-1]["total_loss"] < metrics[0]["total_loss"], "Loss 未下降!"
-    print("Transformer 训练验证通过!")
+    first, last = metrics[0]["total_loss"], metrics[-1]["total_loss"]
+    print(f"初始 loss {first:.3f} (ln V_tgt = {math.log(V_tgt):.3f}) -> 终态 {last:.3f}")
+    assert abs(first - math.log(V_tgt)) < 0.5, "初始 loss 应 ≈ ln V"
+    assert last < 0.5 * first, "固定 batch 上 loss 应明显下降"
 
 
 if __name__ == "__main__":

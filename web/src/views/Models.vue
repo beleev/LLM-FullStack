@@ -71,7 +71,7 @@
 
     <section class="section">
       <h2>模型族谱</h2>
-      <p class="lead">阶段 2 的 20 个模型共享同一套元数据，源码列已全部跳转到 GitHub。</p>
+      <p class="lead">阶段 2 时间线上的 {{ timeline.length }} 个模型共享同一套元数据，源码列已全部跳转到 GitHub。</p>
       <div class="card" style="padding: 0; overflow-x: auto;">
         <table class="models-table">
           <thead>
@@ -94,6 +94,13 @@
       </div>
     </section>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav
       :prev="{ name: 'basic-optim-sample', label: '阶段 1.4 · Adam 与采样', hint: '从最小闭环进入现代模型结构' }"
       :next="{ name: 'attention', label: '阶段 2.1 · 注意力演进', hint: '先拆 KV cache 成本最高的 attention 槽位' }"
@@ -102,6 +109,8 @@
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import { computed } from 'vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'

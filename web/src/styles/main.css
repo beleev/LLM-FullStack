@@ -415,6 +415,61 @@ code.inline {
 .stat .v.accent { color: var(--accent); }
 .stat .hint { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
 
+/* ---- Lab kit: 实验台共用样式, 配合 components/lab/LabFrame.vue ---- */
+.lab { margin-bottom: 16px; }
+.lab-head h3 { margin-bottom: 4px; flex-wrap: wrap; }
+.lab-sub { color: var(--text-muted); font-size: 13px; line-height: 1.6; margin-bottom: 14px; max-width: 900px; }
+.lab-controls { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.lab-controls .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.lab-controls button { font-size: 12px; }
+.ctl { display: grid; grid-template-columns: 130px 1fr 72px; gap: 10px; align-items: center; }
+.ctl label { font-size: 12px; color: var(--text-muted); }
+.ctl .val { font-size: 12px; text-align: right; color: var(--accent); font-variant-numeric: tabular-nums; }
+.lab-body { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(200px, 1fr); gap: 18px; align-items: start; }
+.lab-body.single { grid-template-columns: 1fr; }
+.lab-viz { min-width: 0; overflow-x: auto; }
+.lab-viz svg { display: block; max-width: 100%; height: auto; touch-action: none; user-select: none; -webkit-user-select: none; } /* 拖动图上的点时不要误选文字 */
+.lab-stats { display: flex; flex-direction: column; gap: 10px; font-size: 12px; color: var(--text-muted); line-height: 1.6; }
+.lab-stats .kv { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; border-bottom: 1px dashed var(--border); padding-bottom: 4px; }
+.lab-stats .kv b { font-family: "SF Mono", Menlo, monospace; font-size: 16px; font-weight: 500; color: var(--text); font-variant-numeric: tabular-nums; }
+.lab-stats .kv b.good { color: var(--left); }
+.lab-stats .kv b.bad { color: var(--danger); }
+.lab-note { font-size: 12px; color: var(--text-dim); line-height: 1.7; border-left: 2px solid var(--accent-soft); padding-left: 10px; }
+.lab-challenge { margin-top: 14px; font-size: 13px; border: 1px dashed var(--border-strong); border-radius: var(--radius-sm); padding: 8px 12px; }
+.lab-challenge summary { cursor: pointer; color: var(--text); }
+.lab-challenge p { margin-top: 8px; color: var(--text-muted); line-height: 1.7; }
+.lab-run { margin-top: 10px; font-size: 12px; color: var(--text-dim); }
+.step-player { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.step-player button { min-height: 32px; padding: 4px 10px; }
+.step-player input[type="range"] { flex: 1; min-width: 120px; }
+.step-player select { min-height: 32px; background: var(--bg-elev); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0 6px; }
+.step-label { font-size: 12px; color: var(--accent); min-width: 64px; text-align: right; }
+/* 小方格: block 表 / KV 槽 / 时间表 / 热力图 都用它 */
+.cells { display: grid; gap: 3px; }
+.cell { min-width: 22px; height: 22px; border-radius: 3px; border: 1px solid var(--border); display: grid; place-items: center; font-size: 10px; font-family: "SF Mono", Menlo, monospace; color: var(--text-muted); transition: opacity 0.15s; }
+.cell.on { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+.cell.hot { background: color-mix(in srgb, var(--warn) 30%, transparent); border-color: var(--warn); color: var(--text); }
+.cell.ok { background: color-mix(in srgb, var(--left) 25%, transparent); border-color: var(--left); color: var(--text); }
+.cell.bad { background: color-mix(in srgb, var(--danger) 25%, transparent); border-color: var(--danger); color: var(--text); }
+.cell.dim { opacity: 0.35; }
+.draggable { cursor: grab; touch-action: none; }
+.draggable:active { cursor: grabbing; }
+
+/* ---- 窄屏顶栏 + 抽屉 ---- */
+.topbar, .backdrop { display: none; }
+@media (max-width: 900px) {
+  .app { grid-template-columns: 1fr; }
+  .topbar { display: flex; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 20; padding: 8px 16px; background: var(--bg-elev); border-bottom: 1px solid var(--border); }
+  .topbar-title { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hamburger { width: 40px; padding: 0; font-size: 16px; }
+  .sidebar { position: fixed; z-index: 40; left: 0; top: 0; width: min(300px, 86vw); transform: translateX(-100%); transition: transform 0.2s ease-out; box-shadow: var(--shadow); }
+  .nav-open .sidebar { transform: none; }
+  .nav-open .backdrop { display: block; position: fixed; inset: 0; z-index: 30; background: rgba(0, 0, 0, 0.5); }
+  .lab-body { grid-template-columns: 1fr; }
+  .ctl { grid-template-columns: 1fr auto; }
+  .ctl input[type="range"] { grid-column: 1 / -1; grid-row: 2; }
+}
+
 /* ---- Scroll ---- */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }

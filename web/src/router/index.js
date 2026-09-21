@@ -1,4 +1,6 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
+import { extraChapters } from '@/data/topics/index.js'
+import { stageBy } from '@/data/models.js'
 
 // meta.stage 用于侧栏分组与面包屑；meta.title 是章节名。
 const routes = [
@@ -76,7 +78,7 @@ const routes = [
     path: '/models/swa-mtp',
     name: 'models-mtp',
     component: () => import('@/views/StageTopic.vue'),
-    meta: { title: 'SWA 与 MTP', stage: 'models', chapter: '阶段 2 · llm_models' },
+    meta: { title: 'SWA · MTP · 混合线性', stage: 'models', chapter: '阶段 2 · llm_models' },
   },
   {
     path: '/diffusion',
@@ -134,7 +136,7 @@ const routes = [
     path: '/finetune',
     name: 'finetune',
     component: () => import('@/views/Finetune.vue'),
-    meta: { title: 'SFT / LoRA / DPO', stage: 'finetune', chapter: '阶段 4 · llm_finetune' },
+    meta: { title: 'SFT · LoRA · DPO · GRPO · 蒸馏', stage: 'finetune', chapter: '阶段 4 · llm_finetune' },
   },
   {
     path: '/finetune/sft',
@@ -256,7 +258,27 @@ const routes = [
     component: () => import('@/views/Compare.vue'),
     meta: { title: '总览对照表', stage: 'outro', chapter: '终章' },
   },
+  {
+    path: '/glossary',
+    name: 'glossary',
+    component: () => import('@/views/Glossary.vue'),
+    meta: { title: '术语速查', stage: 'outro', chapter: '终章' },
+  },
 ]
+
+// data/topics/*.js 里声明的扩展章节 -> 自动生成路由: 'train-muon' => /train/muon
+for (const [stage, chapters] of Object.entries(extraChapters)) {
+  for (const c of chapters) {
+    if (routes.some((r) => r.name === c.route)) continue
+    const st = stageBy[stage]
+    routes.push({
+      path: '/' + c.route.replace('-', '/'),
+      name: c.route,
+      component: () => import('@/views/StageTopic.vue'),
+      meta: { title: c.label, stage, chapter: `阶段 ${st.idx} · ${st.code.replace('/', '')}` },
+    })
+  }
+}
 
 export default createRouter({
   history: createWebHashHistory(),

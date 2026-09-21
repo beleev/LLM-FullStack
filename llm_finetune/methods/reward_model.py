@@ -1,97 +1,57 @@
 """
-Reward Model — 奖励模型 (RLHF 三阶段的第二步)
-=================================================
+Reward Model — RLHF 的第二步 (InstructGPT, 2022)
 
-历史背景:
-    InstructGPT / ChatGPT (2022) 的对齐配方是三阶段:
-        SFT → **Reward Model (RM)** → PPO
-    人类标注的是 "A 回复比 B 回复好" 这种**相对偏好** (绝对打分太难对齐标注员),
-    RM 的任务是把相对偏好蒸馏成一个**绝对标量分数** r(x, y), 之后的 RL 阶段
-    才有可优化的奖励信号。
-
-结构 (业界标准做法):
-    把 LLM 的 lm_head ([D] → [V]) 换成 value head ([D] → [1]):
-        r(x, y) = value_head( h_最后一个token )
-    读完整条 (prompt, response) 后, 最后位置的 hidden state 聚合了全部信息,
-    它的标量投影就是这条回复的分数。backbone 通常从 SFT 模型初始化。
-
-损失 (Bradley-Terry 偏好模型):
-    人类只说了 "chosen 比 rejected 好", 于是最大化:
-        P(chosen ≻ rejected) = σ(r_chosen - r_rejected)
-        L = -log σ(r_chosen - r_rejected)
-    只关心分差, 不关心绝对值 —— 所以 RM 的分数没有客观量纲, 只有序关系。
-
-与 DPO 的关系 (对照 methods/dpo.py):
-    DPO 把 "训 RM + RL" 两步解析地合并成一步; 但显式 RM 仍是
-    GRPO / PPO / 拒绝采样 / Best-of-N 等在线方法的前置依赖。
+是什么: LM 主干 + 一个标量头, 读完 (prompt, response) 给出一个分数 r(x, y)。
+解决什么: 人只能稳定地标 "A 比 B 好", 给不出绝对分; 在线 RL (PPO / GRPO / best-of-N) 却需要一个可调用的标量奖励。
+核心公式:  P(y_w ≻ y_l) = σ(r_w − r_l)        L = − log σ(r_w − r_l)        (Bradley-Terry; 只有分差有意义)
+           r(x, y) = value_head( h[最后一个**非 pad** token] )
+读代码时盯住: `last = attention_mask.sum(1) − 1` —— 右 pad 时 h[:, −1] 是 pad 位置的隐状态, 读它等于给 pad 打分。
+与 DPO 的关系: 同一份偏好数据、同一个 Bradley-Terry; DPO 把 r 写成 β·log π/π_ref 从而跳过这一步。
 """
 
-import math
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from llm_models.models.language_models.llama import LLaMA
-from llm_models.utils.masks import combine_causal_and_padding_mask
+from llm_models.training.loss import LossComputer
 
 
 class RewardModel(nn.Module):
     """
-    LLaMA backbone + 标量 value head。
+    backbone: 任何 `forward(idx, attention_mask) → [B, T, V]` 且最后一层叫 `lm_head` 的 LM (本库 LLaMA 满足)。
 
-    forward 返回每条序列的标量分数 [B] (取最后一个位置的 hidden 投影)。
-
-    实现说明:
-        复用传入的 LLaMA 的 embedding / layers / ln_f, 但**不走 lm_head**。
-        这正是业界做法: RM 与 policy 共享同一套骨架, 只换输出头。
-
-    Args:
-        backbone: LLaMA 实例 (通常应从 SFT checkpoint 初始化)。
+    取隐状态的办法: 把 lm_head 换成 Identity, backbone 的 forward 就直接返回 ln_f 之后的 h [B, T, D] ——
+    只依赖公开的 forward 约定, 不用手抄一遍主干 (mask / RoPE / cache 怎么变都不受影响)。
+    注意这会**原地改掉**传进来的 backbone: RM 拿走它的所有权, 还要当 policy 用就先 deepcopy。
     """
 
-    def __init__(self, backbone: LLaMA) -> None:
+    def __init__(self, backbone: nn.Module) -> None:
         super().__init__()
+        backbone.lm_head = nn.Identity()          # embedding 权重不受影响 (tied 的只是同一个 Parameter 的引用)
         self.backbone = backbone
-        # 标量打分头: 业界常用无 bias 的线性层, 初始化小一点让训练初期分差温和
         self.value_head = nn.Linear(backbone.d_model, 1, bias=False)
-        nn.init.normal_(self.value_head.weight, std=0.01)
+        nn.init.normal_(self.value_head.weight, std=0.01)             # 小初始化: 起步时 r_w − r_l ≈ 0, loss ≈ ln 2
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            input_ids: [B, T]  prompt + response 拼接后的完整序列
-        Returns:
-            rewards: [B]  每条序列一个标量分
-        """
-        B, T = input_ids.shape
-        bb = self.backbone
-
-        # 与 LLaMA.forward 相同的主干前向, 唯一区别是最后不过 lm_head
-        x = bb.token_embedding(input_ids) * math.sqrt(bb.d_model)
-        causal = bb._causal_mask(T)
-        mask = combine_causal_and_padding_mask(causal, attention_mask)
-        for layer in bb.layers:
-            x = layer(x, mask=mask, rope=bb.rope)
-        h = bb.ln_f(x)                       # [B, T, D]
-
-        scores = self.value_head(h).squeeze(-1)   # [B, T] 每个前缀都有一个分
-        return scores[:, -1]                      # 读完全文后的最终分 [B]
+    def forward(self, input_ids: torch.Tensor,                        # [B, T] 右 pad
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:   # → [B]
+        h = self.backbone(input_ids, attention_mask)                  # [B, T, D]
+        scores = self.value_head(h).squeeze(-1)                       # [B, T] 每个前缀一个分
+        if attention_mask is None:
+            return scores[:, -1]
+        last = attention_mask.long().sum(dim=1) - 1                   # [B] 最后一个真 token 的下标 (右 pad 假设)
+        return scores.gather(1, last.unsqueeze(1)).squeeze(1)         # [B]
 
 
-def bradley_terry_loss(
-    reward_chosen: torch.Tensor,
-    reward_rejected: torch.Tensor,
-) -> torch.Tensor:
-    """
-    L = -log σ(r_chosen - r_rejected)
+class BradleyTerryLoss(LossComputer):
+    """model_output = PairwiseForward(RewardModel) 的输出 {"chosen": [B], "rejected": [B]}; labels 不用。"""
 
-    用 F.logsigmoid 而非 log(sigmoid(...)): 分差很大时 σ 饱和到 1,
-    log(1-ε) 会数值下溢, logsigmoid 内部做了稳定化。
-    """
-    return -F.logsigmoid(reward_chosen - reward_rejected).mean()
+    def compute(self, model_output: Dict[str, torch.Tensor], labels=None, **kwargs) -> Dict[str, torch.Tensor]:
+        r_w, r_l = model_output["chosen"], model_output["rejected"]
+        loss = -F.logsigmoid(r_w - r_l).mean()
+        return {
+            "total_loss": loss,
+            "reward_margin": (r_w - r_l).detach().mean(),
+            "accuracy": (r_w > r_l).float().mean(),
+        }

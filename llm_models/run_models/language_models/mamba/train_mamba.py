@@ -1,44 +1,40 @@
 #!/usr/bin/env python
 """
-Mamba 训练示例 (SSM 替代 attention, 无需 mask)
+Mamba 训练: 初始 loss ≈ ln V, 并能背下一个固定 batch
 
-教学注意: Mamba 的 scan 用纯 Python for-loop 实现, 序列越长越慢。
-本示例把 seq_len 压到 16 秒级跑完。
+注意: 数据是固定的随机 token (无规律可学), "loss 下降" = 记忆, 只验证梯度链路通。
 """
 
+import math
+
 import torch
+
 from llm_models.models.language_models.mamba import Mamba
-from llm_models.training import (
-    Trainer, TrainingConfig, StandardLMLoss, DecoderOnlyDataGenerator,
-)
+from llm_models.training import Trainer, TrainingConfig, StandardLMLoss, DecoderOnlyDataGenerator
 
 
 def main():
     cfg = TrainingConfig(
-        learning_rate=3e-4, batch_size=2, seq_len=16,
-        num_steps=30, warmup_steps=3, log_interval=5, seed=42,
+        learning_rate=3e-3, batch_size=2, seq_len=16,
+        num_steps=60, warmup_steps=3, log_interval=10, seed=42,
     )
     torch.manual_seed(cfg.seed)
 
-    vocab_size = 500
-    model = Mamba(
-        vocab_size=vocab_size, d_model=64, num_layers=2, d_state=8, d_conv=3,
-    )
+    V = 500
+    model = Mamba(vocab_size=V, d_model=64, num_layers=2, d_state=8, d_conv=3)
     print(f"Mamba Mini | 参数量: {sum(p.numel() for p in model.parameters()):,}")
 
-    data_gen = DecoderOnlyDataGenerator(
-        vocab_size=vocab_size, batch_size=cfg.batch_size, seq_len=cfg.seq_len,
-    )
-    loss_fn = StandardLMLoss()
+    # Δ 的专用初始化没有被 init_weights 清掉: softplus(bias) ∈ [1e-3, 1e-1]
+    dt = torch.nn.functional.softplus(model.layers[0].layer.ssm.dt_proj.bias)
+    assert 1e-3 * 0.99 <= dt.min() and dt.max() <= 1e-1 * 1.01
 
-    trainer = Trainer(model, cfg, data_gen, loss_fn)
-    metrics = trainer.train()
+    data_gen = DecoderOnlyDataGenerator(vocab_size=V, batch_size=cfg.batch_size, seq_len=cfg.seq_len)
+    metrics = Trainer(model, cfg, data_gen, StandardLMLoss()).train()
 
-    # Mamba 在合成随机数据 + 30 步的规模上 loss 通常在 ~log(vocab) 附近抖动,
-    # 不强制严格下降; 仅验证训练链路 (数值不崩 + loss 有限) 可用。
-    assert not (metrics[-1]["total_loss"] != metrics[-1]["total_loss"]), "Loss 变成 nan!"
-    print(f"初始 loss: {metrics[0]['total_loss']:.4f} | 终态: {metrics[-1]['total_loss']:.4f}")
-    print("Mamba 训练链路验证通过!")
+    first, last = metrics[0]["total_loss"], metrics[-1]["total_loss"]
+    print(f"初始 loss {first:.3f} (ln V = {math.log(V):.3f}) -> 终态 {last:.3f}")
+    assert abs(first - math.log(V)) < 0.5, "初始 loss 应 ≈ ln V"
+    assert last < 0.5 * first, "固定 batch 上 loss 应明显下降"
 
 
 if __name__ == "__main__":

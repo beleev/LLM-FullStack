@@ -1,86 +1,70 @@
 """
-m09 demo — Tensor Parallelism
+m09 demo — Tensor Parallel: 一个完整 block (多头 attention + SwiGLU MLP), tp ∈ {1,2,4}
 
-模拟 4 张 GPU 跑 attention block:
-    1) QKV  : column-parallel
-    2) attn : 各 rank 独立算 (头维切)
-    3) Out  : row-parallel (一次 all-reduce)
-数值结果应与单卡完全一致。
+验证 (全部 assert):
+    0) 两个恒等式: 列切 = concat, 行切 = sum
+    1) tp_block 输出 vs 不切分的 dense_block: max-abs-diff < 1e-5
+    2) 每个 block 恰好 2 次 all-reduce; 每卡权重 ≈ 1/tp
+    3) 反例: 不按 head 边界切 (把单头硬切 4 份) 结果就错了
+all-reduce 是单进程求和模拟, 只统计次数与字节, 不含真实通信耗时。
 """
 from __future__ import annotations
 import numpy as np
 
-from llm_infer.core.utils import banner, kv, softmax, causal_mask
+from llm_infer.core.utils import banner, kv
 from llm_infer.m09_tensor_parallel.parallel_linear import (
-    split_column, split_row, split_x_for_row,
-    column_parallel_linear, row_parallel_linear, all_gather,
+    Comm, split_column, split_row, mha, dense_block, shard_weights, tp_block,
 )
+
+TOL = 1e-5
 
 
 def main():
-    banner("M09 - Tensor Parallel (4-way)")
-
+    banner("M09 - Tensor Parallel (MHA + SwiGLU, tp=1/2/4)")
     rs = np.random.RandomState(0)
-    B, T, D = 2, 6, 32
-    N = 4              # 4 张卡
+    T, D, n_head, d_mlp = 16, 64, 8, 192
+    rand = lambda *s: (rs.randn(*s) * 0.1).astype(np.float32)
+    W = {"q": rand(D, D), "k": rand(D, D), "v": rand(D, D), "o": rand(D, D),
+         "gate": rand(D, d_mlp), "up": rand(D, d_mlp), "down": rand(d_mlp, D),
+         "ln1": 1 + rand(D), "ln2": 1 + rand(D)}
+    x = rs.randn(T, D).astype(np.float32)
+    kv("配置", f"T={T} D={D} n_head={n_head} (d_head={D // n_head}) d_mlp={d_mlp}")
 
-    # --- 单卡 baseline ------------------------------------------- #
-    Wq = rs.randn(D, D).astype(np.float32) * 0.05
-    Wk = rs.randn(D, D).astype(np.float32) * 0.05
-    Wv = rs.randn(D, D).astype(np.float32) * 0.05
-    Wo = rs.randn(D, D).astype(np.float32) * 0.05
-    x = rs.randn(B, T, D).astype(np.float32)
+    print("\n[0] 两个恒等式 (tp=4)")
+    col = np.concatenate([x @ Wr for Wr in split_column(W["up"], 4)], axis=-1)       # 4×(T,d_mlp/4) → (T,d_mlp)
+    act = rand(T, d_mlp)
+    row = sum(a @ Wr for a, Wr in zip(np.split(act, 4, axis=-1), split_row(W["down"], 4)))   # Σ (T,d_mlp/4)@(d_mlp/4,D)
+    d_col, d_row = np.max(np.abs(col - x @ W["up"])), np.max(np.abs(row - act @ W["down"]))
+    kv("列切: concat_r(X@W_r) vs X@W", f"{d_col:.2e}")
+    kv("行切: Σ_r X_r@W_r    vs X@W", f"{d_row:.2e}")
+    assert d_col < TOL and d_row < TOL
 
-    def single_gpu(x):
-        # QKV proj
-        Q = x @ Wq; K = x @ Wk; V = x @ Wv
-        # attention
-        scores = (Q @ K.transpose(0, 2, 1)) / np.sqrt(D)
-        attn = softmax(scores + causal_mask(T, T)[None], axis=-1)
-        H = attn @ V
-        # output proj
-        return H @ Wo
+    print("\n[1][2] tp_block vs dense_block")
+    ref = dense_block(x, W, n_head)
+    mat_bytes = sum(W[k].nbytes for k in W if W[k].ndim == 2)
+    print(f"  {'tp':>3} {'max|Δ|':>10} {'all-reduce/block':>17} {'载荷 bytes':>11} {'ring 每卡发送':>13} {'每卡权重 bytes':>15} {'每卡头数':>8}")
+    for tp in (1, 2, 4):
+        ranks, comm = shard_weights(W, tp), Comm()
+        out = tp_block(x, ranks, n_head, comm)
+        diff = np.max(np.abs(out - ref))
+        rank_bytes = sum(v.nbytes for v in ranks[0].values())
+        ring = comm.payload_bytes * 2 * (tp - 1) // tp    # ring all-reduce: 每卡发送 2(tp-1)/tp × 载荷
+        print(f"  {tp:>3} {diff:>10.2e} {comm.n_allreduce:>17} {comm.payload_bytes:>11,} {ring:>13,} {rank_bytes:>15,} {n_head // tp:>8}")
+        assert diff < TOL
+        assert comm.n_allreduce == (2 if tp > 1 else 0)
+        assert comm.payload_bytes == comm.n_allreduce * T * D * 4         # 每次载荷 = 整个 (T,D) 激活
+        assert rank_bytes == mat_bytes // tp + 2 * D * 4                  # 矩阵 1/tp, 两个 gamma 复制
+    kv("不切分的权重 bytes", f"{mat_bytes + 2 * D * 4:,}")
 
-    out_single = single_gpu(x)
+    print("\n[3] 反例: 列切不落在 head 边界 → 单头被硬切成 4 个 '头', 各自 softmax")
+    one_head = mha(x, W["q"], W["k"], W["v"], W["o"], n_head=1)
+    cut_in_4 = mha(x, W["q"], W["k"], W["v"], W["o"], n_head=4)          # 等价于 tp=4 每卡对 D/4 维各做 softmax
+    d_bad = np.max(np.abs(one_head - cut_in_4))
+    kv("max|单头 - 硬切 4 份|", f"{d_bad:.2e}  ← softmax 不能跨 rank 拆开")
+    assert d_bad > 100 * TOL
 
-    # --- TP=4 模拟 ----------------------------------------------- #
-    print(f"\n[1] 切分: Wq/Wk/Wv 列切成 {N} 份, Wo 行切成 {N} 份")
-    Wq_s = split_column(Wq, N); Wk_s = split_column(Wk, N); Wv_s = split_column(Wv, N)
-    Wo_s = split_row(Wo, N)
-
-    # 每个 rank 独立算 Q/K/V 的"自己那部分" (头维切)
-    Q_shards = column_parallel_linear(x, Wq_s)        # list of (B,T,D/N)
-    K_shards = column_parallel_linear(x, Wk_s)
-    V_shards = column_parallel_linear(x, Wv_s)
-
-    # 每个 rank 独立算 attention (头切, 头之间无通信)
-    H_shards = []
-    for r in range(N):
-        Q, K, V = Q_shards[r], K_shards[r], V_shards[r]
-        d_local = Q.shape[-1]
-        scores = (Q @ K.transpose(0, 2, 1)) / np.sqrt(d_local)
-        attn = softmax(scores + causal_mask(T, T)[None], axis=-1)
-        H_shards.append(attn @ V)
-
-    # output proj: row-parallel, 输入 H_shards 已经按 D 维切好
-    out_tp = row_parallel_linear(H_shards, Wo_s)
-
-    # --- 数值对比 ------------------------------------------------- #
-    print("\n[2] TP 输出 vs 单卡 baseline")
-    diff = np.max(np.abs(out_single - out_tp))
-    kv("max |single - tp|", f"{diff:.2e}")
-    # 注意: attention 切头本质上等价于"单头注意力 + concat"; 数值上等价
-    # 但本 demo 用单头模拟 head-切, 所以会有微小差异 (因 sqrt(d_local) ≠ sqrt(D))
-    # 真实 multi-head 实现里, 每个 head 自己 sqrt(head_dim), 结果完全等价
-
-    # --- 通信成本 -------------------------------------------------- #
-    print("\n[3] 通信成本统计")
-    kv("column-parallel QKV 通信", "0 次 (无 gather)")
-    kv("row-parallel Out  通信", "1 次 all-reduce, 数据量 (B*T*D)")
-    kv("每 block 总通信", "1 次 all-reduce / sub-layer × 2 sub-layers = 2 次")
-    print("\n  ✓ 4 张卡只需 weight 显存 1/4, 仅多 2 次 all-reduce/block")
-    print("  ⚠ 数值差异源于本 demo 把 attention 当单头处理 sqrt 系数差异;")
-    print("    真实 multi-head 实现 (每 head sqrt(head_dim)) 与单卡完全等价。")
+    print(f"\n  ✓ tp=1/2/4 输出与单卡一致 (< {TOL:g}, 差异只来自浮点求和顺序)")
+    print("  ✓ 每 block 2 次 all-reduce, 载荷与 tp 无关 (都是 T×D 激活); 每卡权重 ≈ 1/tp")
 
 
 if __name__ == "__main__":

@@ -1,33 +1,15 @@
 """
-Mixture-of-Experts (MoE) 稀疏前馈模块 — 经典 Mixtral 风格
+Mixtral 风格稀疏 MoE 前馈层 — 把一个大 FFN 换成 E 个小 FFN, 每 token 只走其中 K 个
 
-历史脉络:
-    - Switch Transformer (Fedus et al., 2021): 首次在 transformer 上大规模上 MoE,
-      单专家路由 (top-1) + auxiliary loss 做负载均衡
-    - Mixtral 8x7B (Jiang et al., 2024): softmax + top-2 专家, 每层 8 个专家,
-      成为"经典稀疏 MoE"的事实模板
-    - DeepSeek-V3 (2024): fine-grained + shared experts + aux-loss-free bias
-      (见 models/deepseekV3.py::DeepSeekMoE)
-
-本文件提供 Mixtral 风格的 **最简版** MoE:
-    - softmax(router_logits) → top-k → 选中分数归一化
-    - 没有共享专家 (所有专家都是 routed)
-    - 没有 aux-loss-free bias (路由均衡通过外部 Switch-style aux loss 实现)
-
-与 DeepSeekMoE 的差异一目了然 (教学对照):
-              Mixtral (本文件)           DeepSeek-V3 (deepseekV3.py)
-    路由打分   softmax                    sigmoid (各专家独立)
-    归一化     softmax 本身即归一         top-k 后再 renormalize
-    共享专家   无                         有 (始终激活)
-    负载均衡   依赖外部 aux loss          aux-loss-free bias + 可选 aux loss
-
-返回约定与 DeepSeekMoE 一致:
-    (output, routing_info)
-    routing_info 字段:
-        router_logits:    [N, E] 未 detach, 便于外部 aux loss 回传
-        selected_experts: [N, K]
-        routing_weights:  [N, K] (softmax 归一化后)
-        routing_probs:    [N, E] (softmax 原始分布)
+解决什么: dense FFN 的参数量和算力绑死; MoE 让容量 (E 个专家) 与每 token 算力 (K 个) 解耦。
+    probs   = softmax(router(x))              [N, E]
+    topk    = top-K(probs)                    [N, K]
+    weights = topk_probs / Σ topk_probs       K 个权重和为 1
+    y       = Σ_{i∈topk} weights_i · expert_i(x)
+关键数字: Mixtral 8x7B: E=8, K=2 → 总参 47B, 每 token 激活 ~13B。
+与 DeepSeekMoE (models/moe/deepseekV3.py) 对照: 那边是 sigmoid 打分 + 共享专家 + aux-loss-free bias;
+这边没有 bias, 负载均衡全靠外部 aux loss (training/loss.py::MoELMLoss)。
+读代码时盯住: selected_experts [N, K] —— 它决定了谁干活, 且不可导 (梯度只走 routing_weights)。
 """
 
 from typing import Dict, Tuple
@@ -41,26 +23,15 @@ from llm_models.layers.core.feedforward import SwiGLUFeedForward
 
 class MixtralMoE(nn.Module):
     """
-    Mixtral 风格稀疏 MoE 层
-
-    公式:
-        logits = router(x)                               # [N, E]
-        probs  = softmax(logits, dim=-1)                 # [N, E]
-        topk_probs, topk_idx = topk(probs, k)            # [N, K]
-        weights = topk_probs / topk_probs.sum(dim=-1)    # 再归一化, 保证权重和=1
-        y = Σ_{i in topk} weights_i · expert_i(x)
-
-    工程要点:
-        - 专家用 SwiGLU FFN (与 Mixtral 8x7B 官方实现一致)
-        - 教学实现按专家 for-loop 聚合, 简单直观;
-          生产实现会用 grouped GEMM / 专家并行
-
     Args:
-        d_model: 模型维度
-        d_ff:    每个专家的 SwiGLU 隐藏维度
-        num_experts: 专家数量 (Mixtral 8x7B 是 8)
-        top_k:       每 token 激活的专家数 (Mixtral 8x7B 是 2)
-        dropout:     残差 dropout
+        d_model / d_ff: 模型维度 / 每个专家的 SwiGLU 隐藏维度
+        num_experts:    E (Mixtral 8x7B 是 8)
+        top_k:          K (Mixtral 8x7B 是 2)
+
+    不含 dropout: 残差 dropout 统一由外层 Block 做一次 (以前这里和 Block 各做一次 = 两次)。
+    forward 返回 (output, routing_info):
+        router_logits [N, E] (未 detach, aux loss 要回传) / selected_experts [N, K] /
+        routing_weights [N, K] / routing_probs [N, E]
     """
 
     def __init__(
@@ -69,7 +40,6 @@ class MixtralMoE(nn.Module):
         d_ff: int,
         num_experts: int = 8,
         top_k: int = 2,
-        dropout: float = 0.1,
     ):
         super().__init__()
 
@@ -84,18 +54,10 @@ class MixtralMoE(nn.Module):
         self.experts = nn.ModuleList(
             [SwiGLUFeedForward(d_model, d_ff) for _ in range(num_experts)]
         )
-        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Args:
-            x: [B, T, D]
-        Returns:
-            output: [B, T, D]
-            routing_info: 见模块 docstring
-        """
         B, T, D = x.shape
         x_flat = x.view(-1, D)  # [N, D], N = B*T
 
@@ -121,7 +83,7 @@ class MixtralMoE(nn.Module):
             w = routing_weights[token_idx, nth].unsqueeze(-1)  # [m, 1]
             output.index_add_(0, token_idx, expert(x_flat[token_idx]) * w)
 
-        output = self.dropout(output).view(B, T, D)
+        output = output.view(B, T, D)
 
         routing_info = {
             "router_logits": router_logits,          # 未 detach, 可回传 aux loss

@@ -1,30 +1,14 @@
 """
-掩码（Mask）工具模块
+注意力掩码 — "谁能看见谁" 的全部规则都在这里
 
-注意力机制中常用的两类掩码：
-1. Padding Mask（填充掩码）：屏蔽 batch 内填充位置（pad token），避免模型把 pad
-   当成有效 token 参与注意力计算 —— 否则不仅浪费算力，还会让真实 token 的表示
-   被无意义的 pad 信息污染（信息泄露）。
-2. Causal Mask / Subsequent Mask（因果掩码 / 下三角掩码）：用于自回归语言模型
-   （如 Decoder、GPT）。每个位置只能"看到"自己及之前的 token，不能看未来的
-   token —— 否则训练时模型可以直接抄答案（next token），丧失泛化能力。
-
-实现细节：
-- 本模块的掩码使用 bool 语义：True = 保留 / 可见，False = 屏蔽。
-- 在注意力打分（QK^T）阶段，会把 False 位置的分数加上 -inf；
-  这样 softmax 后该位置权重 ≈ 0，从而真正"看不到"被屏蔽位置。
-- 用 -inf 而不是直接置 0 的原因：softmax 是对所有位置归一化的，
-  必须先把屏蔽位置压到 -inf，归一化后才会得到 0。
-
-提供函数：
-- get_pad_mask: 由 token id 序列生成 padding mask
-- get_subsequent_mask: 由 token id 序列生成因果掩码
-- build_causal_mask: 因果掩码的通用版本（接受 seq_len + device，
-  当只有 embedding 没有 token id 时使用）
-- build_sliding_window_mask: 带状因果掩码（滑动窗口注意力 SWA，Mistral / Gemma /
-  GPT-OSS），可选保留开头 sink token（StreamingLLM / GPT-OSS attention sink）
-- combine_causal_and_padding_mask: 合并因果掩码与 padding mask
-- combine_masks: 通用的两个掩码 AND 合并
+约定: bool 张量, True = 可见, False = 屏蔽。attention 在 softmax 之前把 False 处的分数填 -inf
+      (不能直接把权重置 0: softmax 要对所有位置归一化, 必须先压到 -inf 才会得到真正的 0)。
+三类: padding mask (屏蔽 pad key)  |  因果 mask (下三角, 自回归不看未来)
+      |  滑动窗口 mask (带状下三角, Mistral/Gemma/GPT-OSS; 可选保留开头 sink token)
+坑:   某个 query 行全为 False (左 padding 时的 pad 行) → softmax 一整行 -inf → NaN, 并经残差污染整个 batch。
+      两个 combine_* 函数都经过 `_unmask_empty_rows` 兜底: 让这种行只看自己。
+KV cache 解码时 mask 不是方阵: 行 = 新 query [past:past+T], 列 = 全部 key [:past+T]。
+读代码时盯住: 形状 —— pad [B, 1, S], causal [1, T, S], 广播 AND 后 [B, T, S]。
 """
 
 import torch
@@ -176,6 +160,20 @@ def build_sliding_window_mask(
     return visible.unsqueeze(0)
 
 
+def _unmask_empty_rows(mask: torch.Tensor) -> torch.Tensor:
+    """
+    整行全 False 的 query (典型: 左 padding 时的 pad 位置, 因果 ∩ padding 后一个 key 都不剩)
+    会让 softmax 对一整行 -inf 归一化 → NaN, 并经残差污染整个 batch 的梯度。
+    修法: 让这种行只看自己 (对角线)。它的输出本来就没人用 (pad 是被屏蔽的 key, loss 也忽略它),
+    所以不改变任何真实位置的结果, 只是把 NaN 换成有限值。
+    """
+    T, S = mask.shape[-2:]
+    empty = ~mask.any(dim=-1, keepdim=True)                                   # [..., T, 1]
+    # "自己" 在非方阵 (KV cache: S = past + T) 里是偏移 S-T 的对角线
+    diag = torch.ones(T, S, dtype=torch.bool, device=mask.device).tril(S - T).triu(S - T)
+    return mask | (empty & diag)
+
+
 def combine_causal_and_padding_mask(
     causal_mask: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
@@ -193,17 +191,17 @@ def combine_causal_and_padding_mask(
             （None 表示 batch 内没有 pad，例如推理或定长输入）
 
     Returns:
-        combined_mask: [B, T, T] 或 [1, T, T]（当 attention_mask 为 None 时）
+        combined_mask: [B, T, T] 或 [1, T, T]（当 attention_mask 为 None 时）。
+        保证没有全 False 的行（见 _unmask_empty_rows），左 padding 也不会产生 NaN。
     """
     if attention_mask is None:
         return causal_mask
 
     attention_mask = attention_mask.bool()
-    # 注意：只屏蔽 key（被关注侧）即可。query 侧若是 pad，对应位置的输出
-    # 本来就会在 loss 里被忽略（label=-100），不必再额外屏蔽。
-    # key_mask: [B, T] -> [B, 1, T] -> [B, T, T]
-    key_mask = attention_mask.unsqueeze(1).expand(-1, causal_mask.size(1), -1)
-    return key_mask & causal_mask
+    # 只屏蔽 key 侧; pad query 的输出本来就会在 loss 里被忽略 (label=-100)。
+    # 列数取自 causal_mask: KV cache 解码时它是 [1, T, past+T], attention_mask 相应为 [B, past+T]
+    key_mask = attention_mask.unsqueeze(1)             # [B, 1, S]
+    return _unmask_empty_rows(key_mask & causal_mask)  # [B, T, S]
 
 
 def combine_masks(pad_mask: torch.Tensor, subsequent_mask: torch.Tensor) -> torch.Tensor:
@@ -228,4 +226,4 @@ def combine_masks(pad_mask: torch.Tensor, subsequent_mask: torch.Tensor) -> torc
         >>> tgt_subsequent_mask = get_subsequent_mask(tgt)
         >>> tgt_mask = combine_masks(tgt_pad_mask, tgt_subsequent_mask)
     """
-    return pad_mask & subsequent_mask
+    return _unmask_empty_rows(pad_mask & subsequent_mask)

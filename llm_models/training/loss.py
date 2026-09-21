@@ -8,13 +8,14 @@ Trainer 持有一个 LossComputer 实例，每步训练调用 `compute(model_out
 
 提供的策略:
     - StandardLMLoss : 标准下一 token 预测交叉熵 (GPT-3 / Transformer / LLaMA / Mamba / Whisper)
+    - MTPLoss        : 主 CE + λ·多 token 预测 CE (MTPLLaMA / DeepSeek-V3 MTP)
     - MoELMLoss      : 交叉熵 + Switch-Transformer 风格的负载均衡 aux loss
                        (DeepSeekV3 / V3.2 / Mixtral)
     - OmniLoss       : 文本 (Thinker) + 音频 (Talker) 双分支加权 loss (Qwen2.5-Omni)
     - MaskedLMLoss   : BERT 风格 MLM 交叉熵 (只对被 mask 的位置算 loss)
     - ContrastiveLoss: CLIP 对称对比 loss (image↔text 双向 CE)
     - VAELoss        : 重建 (MSE) + KL(q || N(0, I))
-    - VARLoss        : next-token 交叉熵 + VQ-VAE commitment (若在联合训练)
+    - VARLoss        : next-scale 交叉熵 (整级 token 并行预测) + 多尺度 VQ commitment
     - DiffusionLoss  : 见 training/diffusion.py
 
 通用约定:
@@ -60,74 +61,99 @@ class LossComputer(ABC):
 
 class StandardLMLoss(LossComputer):
     """
-    标准语言模型 (next-token prediction) 损失。
+    next-token 交叉熵: 所有 (batch, 位置) 的平均 NLL。未训练模型应 ≈ ln V (均匀瞎猜)。
 
-    适用模型: GPT-3, 经典 Transformer (decoder 端)。
-
-    实现:
-        loss = cross_entropy(
-            logits.view(-1, V),       # 把 (B, T, V) 展平为 (B*T, V)
-            labels.view(-1),          # (B*T,)
-            ignore_index=-100,        # 跳过 pad 位置, 避免污染 loss
-        )
-
-    为什么要 reshape？
-        nn.functional.cross_entropy 期望输入维度为 (N, C)；展平 batch 与时间维
-        即可一次性算出所有 token 的平均 NLL，避免 Python for-loop。
-
-    为什么用 -100 作为 ignore？
-        PyTorch 的 cross_entropy 默认就把 target=-100 跳过。约定俗成，
-        让数据生成端只需把 pad / 模态前缀位置填 -100 即可。
+    labels == -100 的位置被跳过 (PyTorch cross_entropy 的默认 ignore_index):
+    数据侧只需把 pad / 多模态前缀位置填 -100。
     """
 
     def compute(
         self,
-        model_output: torch.Tensor,
-        labels: torch.Tensor,
+        model_output: torch.Tensor,     # logits [B, T, V]
+        labels: torch.Tensor,           # [B, T]
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        # model_output: logits, 形状 [B, T, V]
         logits = model_output
         loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
+            logits.reshape(-1, logits.size(-1)),   # [B*T, V]  cross_entropy 要 (N, C)
+            labels.reshape(-1),                    # [B*T]
             ignore_index=-100,
         )
         # lm_loss 与 total_loss 此处相同，但保留两个键便于日志接口统一
         return {"total_loss": loss, "lm_loss": loss}
 
 
+class MTPLoss(LossComputer):
+    """
+    Multi-Token Prediction 联合损失 (配 models/language_models/mtp.py::MTPLLaMA):
+
+        L = CE(main) + λ · mean_k CE(mtp_k)          DeepSeek-V3: λ = 0.3 → 0.1
+
+    标签对齐 (labels[i] = t_{i+1} 是标准 next-token 标签):
+        MTP-k 在位置 i 预测 t_{i+1+k} = labels[i+k]
+        → labels 左移 k 位作第 k 级目标, 末尾 k 个位置没有未来 token, 置 -100
+    """
+
+    def __init__(self, mtp_lambda: float = 0.3, ignore_index: int = -100) -> None:
+        self.mtp_lambda = mtp_lambda
+        self.ignore_index = ignore_index
+
+    def _ce(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),   # [B*T, V]
+            labels.reshape(-1),                    # [B*T]
+            ignore_index=self.ignore_index,
+        )
+
+    def compute(
+        self,
+        model_output: Dict[str, Any],   # {"logits": [B,T,V], "mtp_logits": List[[B,T,V]]}
+        labels: torch.Tensor,           # [B, T]
+        **kwargs,
+    ) -> Dict[str, torch.Tensor]:
+        main_loss = self._ce(model_output["logits"], labels)
+
+        mtp_losses: List[torch.Tensor] = []
+        for k, logits_k in enumerate(model_output["mtp_logits"], start=1):
+            labels_k = torch.full_like(labels, self.ignore_index)
+            labels_k[:, :-k] = labels[:, k:]       # 目标整体左移 k 位
+            mtp_losses.append(self._ce(logits_k, labels_k))
+
+        mtp_loss = torch.stack(mtp_losses).mean()
+        return {
+            "total_loss": main_loss + self.mtp_lambda * mtp_loss,
+            "main_loss": main_loss.detach(),
+            "mtp_loss": mtp_loss.detach(),
+        }
+
+
 class MoELMLoss(LossComputer):
     """
-    MoE (Mixture-of-Experts) 语言模型损失。
+    MoE 语言模型损失 (Mixtral / DeepSeekV3 / V3.2):
 
-    适用模型: DeepSeekV3, DeepSeekV3_2
+        total = lm_loss + aux_loss_weight · aux_loss  [+ index_loss_weight · index_loss]
 
-    总损失:
-        total_loss = lm_loss + aux_loss_weight * aux_loss
+    aux_loss (Switch-Transformer 负载均衡), 每层:
+        f_i = 专家 i 被选中的次数 / token 数        # 不可导; top-K 下 Σ_i f_i = K
+        P_i = mean_t p_t[i]                         # 可导; p_t 是归一化到行和为 1 的路由概率
+        aux = E · Σ_i f_i · P_i
+      完全均衡时 f_i = K/E, P_i = 1/E → aux = E·E·(K/E)(1/E) = **K** (不是 1; top-1 时才是 1)。
+      路由坍塌到固定 K 个专家时 → aux ≈ E。梯度只经 P_i 回到 router, 所以 router_logits 不能 detach。
+      p_t 取自 routing_info["routing_probs"]: Mixtral 是 softmax (本来就归一),
+      DeepSeek 是 sigmoid 分数, 这里除以行和 (与 V3 论文的 s'_i = s_i / Σ_j s_j 一致),
+      而不是拿 router_logits 另算一遍与模型实际路由无关的 softmax。
 
-    为什么需要 aux loss (负载均衡)？
-        MoE 通过 router 把每个 token 分发给少量专家 (top-k)。若不加约束，
-        router 会迅速 "坍塌"——只把 token 送给少数明星专家，其余专家拿不到
-        梯度永远不被训练。这既浪费参数容量，又损害模型表达力。
-        Switch Transformer 提出的辅助 loss 鼓励 token 在专家间均匀分布。
-
-    为什么 router_logits 不能 detach？
-        aux loss 的目的就是更新 router 参数；若 detach，梯度无法回传到
-        router 的线性层，aux loss 等于白算。同时 router 也通过 top-k 加权
-        的 expert 输出从主 LM loss 拿到梯度，两者协同。
-
-    aux_loss_weight 的取值权衡:
-        - 太大: 模型为 "均衡" 牺牲表达力，主任务退化；
-        - 太小: 路由仍会坍塌；
-        - 经验: ~0.01 (DeepSeek / Switch Transformer 常用)。
+    index_loss: DeepSeek-V3.2 的 indexer 对齐 KL, 由模型放在 routing_info["index_loss"];
+      没有这个键的模型 (Mixtral / V3) 该项为 0, 不出现在返回 dict 里。
 
     Args:
-        aux_loss_weight: 辅助 loss 在总损失中的权重。
+        aux_loss_weight:   经验值 ~0.01; 太大牺牲主任务, 太小路由坍塌。
+        index_loss_weight: indexer 与主模型参数不相交 (输入/目标都 detach), 取 1.0 即可。
     """
 
-    def __init__(self, aux_loss_weight: float = 0.01):
+    def __init__(self, aux_loss_weight: float = 0.01, index_loss_weight: float = 1.0):
         self.aux_loss_weight = aux_loss_weight
+        self.index_loss_weight = index_loss_weight
 
     def compute(
         self,
@@ -135,82 +161,46 @@ class MoELMLoss(LossComputer):
         labels: torch.Tensor,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        # 模型输出: (logits, all_routing_info)
-        # all_routing_info 是每个 MoE 层的 router 中间量列表
-        logits, all_routing_info = model_output
+        logits, all_routing_info = model_output  # [B, T, V], 每层一个 routing_info dict
 
-        # 1) 主任务: 标准 next-token 交叉熵
         lm_loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             labels.reshape(-1),
             ignore_index=-100,
         )
 
-        # 2) 辅助任务: 鼓励 token 在专家间均匀分配
-        aux_loss = self._compute_load_balancing_loss(all_routing_info)
-
+        # 没有 MoE 层时返回与 logits 同设备的 0 (以前是 CPU 标量, GPU 上相加会报错)
+        aux_loss = (
+            self._compute_load_balancing_loss(all_routing_info)
+            if all_routing_info else logits.new_zeros(())
+        )
+        out = {"lm_loss": lm_loss, "aux_loss": aux_loss}
         total_loss = lm_loss + self.aux_loss_weight * aux_loss
-        return {
-            "total_loss": total_loss,
-            "lm_loss": lm_loss,
-            "aux_loss": aux_loss,
-        }
 
+        index_losses = [info["index_loss"] for info in all_routing_info if "index_loss" in info]
+        if index_losses:
+            out["index_loss"] = torch.stack(index_losses).mean()
+            total_loss = total_loss + self.index_loss_weight * out["index_loss"]
+
+        return {"total_loss": total_loss, **out}
+
+    @staticmethod
     def _compute_load_balancing_loss(
-        self, all_routing_info: List[Dict[str, torch.Tensor]]
+        all_routing_info: List[Dict[str, torch.Tensor]]
     ) -> torch.Tensor:
-        """
-        计算 Switch-Transformer 风格负载均衡 loss。
-
-        定义:
-            f_i = (被路由到专家 i 的 token 数) / (token 总数)        # 离散统计量
-            P_i = mean_t softmax(router_logits[t])[i]               # 平均路由概率
-            aux = N * Σ_i (f_i * P_i),  N 为专家总数
-
-        直觉:
-            - f_i 反映 "实际分配比例" (但来自 argmax/top-k, 不可微)；
-            - P_i 反映 "router 的偏好"        (来自 softmax, 可微)；
-            - 二者相乘并按专家求和，再乘 N：完美均匀分配时 f_i = P_i = 1/N，
-              和为 N * N * (1/N)^2 = 1，即理想下界为 1；
-            - 任何不均衡都会让该乘积之和增大，从而推动 router 学习更均衡的偏好。
-
-        梯度路径:
-            f_i 不可微 (含 argmax/scatter)，但 P_i 可微，最终梯度通过 P_i
-            反传更新 router 权重。
-        """
-        # 模型可能未启用 MoE / 没有 routing 记录, 安全返回 0
-        if not all_routing_info:
-            return torch.tensor(0.0)
-
-        # 累加各 MoE 层的 aux loss, 最后取均值
-        total_aux = torch.tensor(0.0, device=all_routing_info[0]["router_logits"].device)
-
+        """跨层平均的 E·Σ f_i·P_i; 完全均衡 = K, 完全坍塌 = E。all_routing_info 非空。"""
+        layer_losses = []
         for info in all_routing_info:
-            router_logits = info["router_logits"]      # [total_tokens, num_experts]
-            selected_experts = info["selected_experts"]  # [total_tokens, top_k]
-            num_experts = router_logits.size(-1)
-            num_tokens = router_logits.size(0)
+            probs = info["routing_probs"].float()              # [N, E] float32 防 fp16 溢出
+            probs = probs / probs.sum(dim=-1, keepdim=True)    # sigmoid 分数 → 行和为 1
+            num_experts = probs.size(-1)
 
-            # P_i: 各专家平均路由概率 (可微分量, 梯度从这里回传)
-            # 升 float32 计算 softmax, 防止 fp16 溢出导致 NaN
-            routing_probs = F.softmax(router_logits.float(), dim=-1)  # [T, E]
-            mean_prob = routing_probs.mean(dim=0)                     # [E]
+            # f_i: one-hot 计数后按 token 求均值 (统计量, 无梯度)
+            fraction = F.one_hot(info["selected_experts"], num_experts).sum(dim=1).float().mean(dim=0)  # [E]
+            mean_prob = probs.mean(dim=0)                                                               # [E]
+            layer_losses.append(num_experts * (fraction * mean_prob).sum())
 
-            # f_i: 被选中的 token 比例 (统计量, 不参与梯度)
-            # 用 scatter_ 把 selected_experts 索引位置置 1，再按列求均值
-            expert_mask = torch.zeros(
-                num_tokens, num_experts,
-                device=router_logits.device, dtype=routing_probs.dtype,
-            )
-            expert_mask.scatter_(1, selected_experts, 1.0)
-            fraction = expert_mask.mean(dim=0)  # [E]
-
-            # 单层 aux loss
-            layer_aux = num_experts * (fraction * mean_prob).sum()
-            total_aux = total_aux + layer_aux
-
-        # 跨层取均值, 让 aux_loss_weight 的物理含义不随层数变化
-        return total_aux / len(all_routing_info)
+        return torch.stack(layer_losses).mean()
 
 
 class OmniLoss(LossComputer):
@@ -402,15 +392,13 @@ class VAELoss(LossComputer):
 
 class VARLoss(LossComputer):
     """
-    VAR (next-token autoregressive image) loss
+    VAR (next-scale prediction) loss: 对 token 金字塔全部 L=Σs² 个位置做交叉熵。
 
-    VAR 的 tokenizer 通常单独预训练并冻结, 此处只对 GPT 分支算 next-token 交叉熵。
+    tokenizer 已冻结, 只训 Transformer。没有 shift-by-one —— 第 k 级位置的输入来自
+    更粗的级, label 是本级 token, 对齐由 VARModel.forward 完成:
+        logits: [B, L, K]   labels: [B, L]   (K = 码本大小, 初始 CE ≈ ln K)
 
-    model_output 是 VARModel.forward 返回的 dict:
-        logits: [B, N, vocab]
-        labels: [B, N]
-
-    Trainer 接口: 传入的 labels 参数可被忽略 (由 model_output 自带)。
+    Trainer 传入的 labels 参数被忽略 (token 要经 tokenizer 才有, 由 model_output 自带)。
     """
 
     def compute(

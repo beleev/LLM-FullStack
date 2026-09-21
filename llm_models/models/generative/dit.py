@@ -1,33 +1,17 @@
 """
-Diffusion Transformer (DiT) — 图像扩散生成的 SOTA 骨架
+DiT — 用 Transformer 取代 UNet 做扩散去噪骨架 (Peebles & Xie, 2023); SD3 / FLUX / Sora 的共同祖先
 
-论文出处:
-    "Scalable Diffusion Models with Transformers" (Peebles & Xie, ICCV 2023)
+解决的问题: UNet 的卷积归纳偏置难以按 scaling law 放大; DiT 把 latent 当 token 序列, 直接吃 LLM 的扩展经验。
 
-在本库中的位置:
-    生成模型主线. 是 Stable Diffusion 3 / FLUX / Sora / Hunyuan Video / Wan 2.2
-    等 SOTA 生图生视频模型的共同骨架:
-        UNet 时代 (SD 1.5) → DiT 时代 (SD3, FLUX, Sora)
+    x_t [B,C,H,W] ─patchify→ [B,N,D] (+pos) ─N × AdaLNZeroBlock(c)→ FinalLayer(c) ─unpatchify→ [B,C,H,W]
+    c = TimestepEmbedding(t) + ClassEmbedding(y)          # 全局条件, 经 adaLN 调制每一层
+    loss = MSE(pred, target), target 是 ε 还是 velocity 由 scheduler 决定 (training/diffusion.py)
 
-核心设计三件套:
-    1) Patchify: 把 latent 张量 [B, C, H, W] 切成 patch token [B, N, D]
-       (与 ViT 完全相同, 但作用在 VAE 潜空间)
-    2) 条件注入 adaLN-Zero (见 layers/adaln.py):
-       时间步 t + 可选类别/文本 c → 6 段 (γ, β, α), 每个 block 做 FiLM 调制
-    3) FinalLayer: adaLN + Linear 到 patch_size² * C, 再 unpatchify 还原
-
-训练:
-    输入: 含噪 latent x_t + 时间步 t + 条件 c
-    输出: 预测的噪声 ε 或 velocity v (由 scheduler 决定)
-    loss: MSE(pred, target)
-
-本库对扩散采样的完整链:
-    layers/adaln.py       — 条件注入机制
-    models/dit.py         — 这里: 网络骨架
-    training/diffusion.py — scheduler + sampler + loss + CFG
+关键数字: N = (H/p)², patch_size 减半 → token ×4 → 注意力算力 ×16 (DiT-XL/2 优于 /4 /8 的代价)。
+CFG: 训练时以 class_dropout 概率把 y 换成 null 类, 推理时 pred = uncond + s·(cond - uncond)。
+读代码时盯住: c 怎么来 (_make_condition), 以及 unpatchify 的 permute 顺序。
 """
 
-import math
 from typing import Optional
 
 import torch
@@ -39,13 +23,7 @@ from llm_models.layers.core.feedforward import GeLUFeedForward
 
 
 class PatchifyConv(nn.Module):
-    """
-    图像 → patch token 的 Conv2d 实现 (与 PatchEmbed2D 同机制, 但不做 shape 校验,
-    便于 DiT 在训练 / 推理时接受不同分辨率 latent)。
-
-    [B, C, H, W] → Conv2d(kernel=stride=patch_size) → [B, D, H/p, W/p]
-                → flatten(2).transpose → [B, N, D]
-    """
+    """[B, C, H, W] → Conv2d(kernel=stride=p) → [B, D, H/p, W/p] → [B, N, D] (与 ViT 的 patch embed 同机制)。"""
 
     def __init__(self, in_channels: int, embed_dim: int, patch_size: int):
         super().__init__()
@@ -60,17 +38,7 @@ class PatchifyConv(nn.Module):
 
 class DiT(nn.Module):
     """
-    DiT 图像扩散 Transformer
-
-    架构:
-        x_t  -> PatchifyConv -> tokens
-        t    -> TimestepEmbedding ── +
-        y    -> Embedding(num_classes) ──┘── c (条件向量)
-        tokens + pos_embed -> N x AdaLNZeroBlock(attn + FFN, 受 c 调制)
-                          -> FinalLayer(c) -> [B, N, p²·C]
-                          -> unpatchify -> [B, C, H, W]  (预测噪声 / velocity)
-
-    默认配置近似 DiT-B/2 (DiT-Base, patch_size=2), 教学可按需缩小。
+    DiT 图像扩散 Transformer (默认配置近似 DiT-B/2 的缩小版)。
 
     Args:
         latent_channels: VAE 潜空间通道 (SD 1.5 为 4)
@@ -151,11 +119,7 @@ class DiT(nn.Module):
         )
 
     def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        [B, N, p²·C] → [B, C, H, W]
-
-        N = (H/p) * (W/p); 按行优先 reshape, 与 PatchifyConv 的 flatten 顺序一致。
-        """
+        """[B, N, p²·C] → [B, C, H, W]; token 按行优先排列, 与 PatchifyConv 的 flatten 一致。"""
         B, N, _ = x.shape
         C = self.latent_channels
         p = self.patch_size
@@ -188,7 +152,7 @@ class DiT(nn.Module):
         """
         Args:
             x: [B, C, H, W] 含噪 latent (来自 VAE 潜空间)
-            t: [B] 时间步 (可连续可离散, 由 scheduler 传入)
+            t: [B] 时间步, [0, 1000) 量纲 (用 AddNoiseResult.t_norm, 不要直接传 t∈[0,1])
             y: [B] 类别 id (可选)
         Returns:
             [B, C, H, W] 预测的噪声 / velocity (由训练目标决定语义)

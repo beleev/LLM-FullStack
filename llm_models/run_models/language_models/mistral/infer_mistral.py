@@ -1,58 +1,60 @@
 #!/usr/bin/env python
 """
-Mistral 前向示例 — 滑动窗口注意力 (SWA)
+Mistral 推理示例 — 滑动窗口注意力 (SWA)
 
-重点观察三件事:
-    1. Mistral 与 LLaMA 参数量完全相同 (SWA 只是换 mask, 不加参数)
-    2. mask 可见格子数: 全因果 O(T^2/2) vs 带状 O(T·W)
-    3. 推理 KV cache 上限: LLaMA O(T) vs Mistral O(W) (rolling buffer)
+    1. 与 LLaMA 参数量逐个相同 (SWA 只换 mask)
+    2. mask 可见格子: 全因果 T(T+1)/2  vs  带状 ≈ T·W
+    3. 窗口真的生效: 单层模型里改位置 0, 只有位置 0..W-1 的输出变 (多层会跨层接力, 所以用 1 层验证)
+    4. rolling KV cache: 每层 cache 长度封顶 W, 且有/无 cache 输出逐 token 相同
 """
 
 import torch
 
 from llm_models.models.language_models.llama import LLaMA
 from llm_models.models.language_models.mistral import Mistral
+from llm_models.utils.generation import KVCache, benchmark_kv_cache
 from llm_models.utils.masks import build_causal_mask, build_sliding_window_mask
 
 
+@torch.inference_mode()
 def main():
     torch.manual_seed(42)
-
     vocab_size, T, W = 1000, 64, 8
-    common = dict(
-        vocab_size=vocab_size, d_model=256, n_heads=8, num_kv_heads=2,
-        num_layers=4, max_len=128, dropout=0.0,
-    )
-    llama = LLaMA(**common).eval()
-    mistral = Mistral(**common, window_size=W).eval()
+    common = dict(vocab_size=vocab_size, d_model=256, n_heads=8, num_kv_heads=2,
+                  num_layers=4, max_len=256, dropout=0.0)
+    llama, mistral = LLaMA(**common).eval(), Mistral(**common, window_size=W).eval()
 
+    # ---- 1) 参数量 ----
     n_llama = sum(p.numel() for p in llama.parameters())
     n_mistral = sum(p.numel() for p in mistral.parameters())
-    print(f"LLaMA   参数量: {n_llama:,}")
-    print(f"Mistral 参数量: {n_mistral:,} (窗口 W={W})")
     assert n_llama == n_mistral, "SWA 只换 mask, 参数量必须一字不差"
+    print(f"[1] 参数量 LLaMA = Mistral = {n_mistral:,}")
 
-    # ---- mask 对比: 可见格子数就是注意力计算量 ----
-    full = build_causal_mask(T, torch.device("cpu"))
-    band = build_sliding_window_mask(T, W, torch.device("cpu"))
-    print(f"\nT={T} 时 mask 可见格子数:")
-    print(f"  全因果 (LLaMA):   {int(full.sum()):>5}  (= T(T+1)/2)")
-    print(f"  带状   (Mistral): {int(band.sum()):>5}  (≈ T·W)")
+    # ---- 2) 计算量 ----
+    full = int(build_causal_mask(T, torch.device("cpu")).sum())
+    band = int(build_sliding_window_mask(T, W, torch.device("cpu")).sum())
+    assert full == T * (T + 1) // 2 and band == W * (W + 1) // 2 + (T - W) * W
+    print(f"[2] T={T} 可见格子: 全因果 {full}  vs  带状 {band} (W={W})")
 
-    idx = torch.randint(0, vocab_size, (2, T))
-    with torch.inference_mode():
-        logits = mistral(idx)
-    print(f"\n输入: {tuple(idx.shape)}  输出: {tuple(logits.shape)}")
+    # ---- 3) 窗口生效 (单层: 没有跨层接力) ----
+    one = Mistral(**{**common, "num_layers": 1}, window_size=W).eval()
+    idx = torch.randint(1, vocab_size, (1, T))
+    changed = idx.clone()
+    changed[:, 0] = (idx[:, 0] % (vocab_size - 1)) + 1            # 只改位置 0
+    same = (one(idx) - one(changed)).abs().amax(dim=(0, 2)) == 0  # [T] 每个位置是否完全不变
+    assert not same[:W].any() and same[W:].all(), "位置 0 只应影响 [0, W) 内的 query"
+    print(f"[3] 单层: 改位置 0 只影响位置 0..{W - 1}; "
+          f"{mistral.num_layers} 层时感受野 ≈ {mistral.receptive_field()}")
 
-    # ---- 感受野与 KV cache 上限 ----
-    print(f"\n理论感受野: {mistral.num_layers} 层 × W={W} ≈ {mistral.receptive_field()} token")
-    print("KV cache 需要保留的位置数 (rolling buffer):")
-    for t in (16, 64, 4096, 131072):
-        print(f"  T={t:>7}:  LLaMA 存 {t:>7} 个  vs  Mistral 封顶 {mistral.kv_cache_entries(t)} 个")
-
-    gen = mistral.generate(idx[:1, :4], max_new_tokens=8, temperature=1.0, top_k=10)
-    assert gen.shape == (1, 12)
-    print("\n✅ Mistral 前向 + generate 通过 (Mistral-7B: W=4096, 32 层感受野 ≈ 131K)")
+    # ---- 4) rolling KV cache ----
+    cache = KVCache(len(mistral.layers))
+    mistral(idx[:, :20], cache=cache)                             # prefill 20 个 token
+    mistral(idx[:, 20:21], cache=cache)                           # 再 decode 1 个
+    lens = {c["k"].size(2) for c in cache.layers}
+    assert lens == {W} and cache.pos == 21
+    speedup = benchmark_kv_cache(mistral, idx[:, :8], max_new_tokens=200)
+    print(f"[4] 已读 {cache.pos} 个 token, 每层 cache 只有 {W} 个; "
+          f"生成 200 token 有/无 cache 输出一致, 加速 {speedup:.1f}x")
 
 
 if __name__ == "__main__":

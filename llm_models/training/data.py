@@ -1,27 +1,15 @@
 """
-合成数据生成模块
-================
+合成数据生成器 — 零依赖的 "假" 训练数据
 
-为不同模型架构提供 "假" 训练数据生成器，用于教学/集成测试。
-真实训练中应替换为读取 tokenized 语料的 DataLoader，但教学代码用合成数据
-有几个好处：
-    1. 零依赖，不需下载/预处理大规模语料；
-    2. 可控的形状和词表，便于快速验证 forward / backward / loss 通路；
-    3. 可保证模型 forward 不抛 shape 错误，方便对照学习。
-
-每个生成器实现 `generate_batch()` 返回一个 dict，dict 中既包含
-模型 `forward(**batch)` 所需的输入张量，也包含 "labels" (以及音频标签等)
-供 LossComputer 使用。Trainer 会从 dict 中弹出 labels，剩余字段直接展开
-传给 model。这种 "数据生成 + 损失" 解耦的策略让 Trainer 对模型类型保持中立。
-
-生成器对照模型：
-    - DecoderOnlyDataGenerator   : GPT-3, DeepSeekV3 / V3.2
-    - EncoderDecoderDataGenerator: 经典 Transformer (Vaswani et al. 2017)
-    - VisionLanguageDataGenerator: Qwen2-VL
-    - OmniDataGenerator          : Qwen2.5-Omni (文本 + 图像 + 音频 + 视频)
+是什么: 每种模型形态一个生成器, `generate_batch()` 返回 dict = model.forward 的全部 kwargs + "labels"。
+        Trainer 弹出 labels 交给 LossComputer, 其余 **展开喂给模型 → Trainer 对模型类型保持中立。
+关键约定: 默认 `fixed = True` —— 第一次采样的 batch 被缓存, 之后每步都返回同一个。
+        随机 token 没有可学的规律, 每步换新 batch 时 loss 只会停在 ln V;
+        固定后 "loss 下降" = "模型背下了这一个 batch", 检验的是 forward/backward/优化器通路, 不是泛化。
+怎么扩展: 库内子类实现 `_sample()`; 库外子类直接覆写 `generate_batch()` 也仍然有效 (不走缓存)。
+读代码时盯住: 每个 `_sample()` 返回的 dict 的 key —— 它们必须与对应模型 forward 的形参名一一对应。
 """
 
-from abc import ABC, abstractmethod
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -29,51 +17,42 @@ import torch
 from llm_models.utils.masks import get_pad_mask, get_subsequent_mask, combine_masks
 
 
-class SyntheticDataGenerator(ABC):
+class SyntheticDataGenerator:
     """
-    合成数据生成器基类 (策略模式中的 "策略" 接口)。
+    合成数据生成器基类。Trainer 每步调用一次 `generate_batch()`。
 
-    Trainer 持有一个 SyntheticDataGenerator 实例，每步训练调用一次
-    `generate_batch()`，无需关心具体是哪种模态/架构。
+    fixed=True (默认): 第一次 `_sample()` 的结果被缓存, 之后每步都返回同一个 batch。
+        随机 token 没有可学的规律, 每步换新 batch 时 loss 只会停在 ln V;
+        固定 batch 后 "loss 下降" 的含义是 "模型能背下这一个 batch" —— 这是对
+        forward / backward / 优化器通路的诚实检验, 不代表泛化。
+    fixed=False: 每步重新采样 (用于真有规律的任务, 或想看 ln V 平台时)。
+
+    内部子类实现 `_sample()`; 外部子类直接覆写 `generate_batch()` 也仍然有效。
     """
 
-    @abstractmethod
-    def generate_batch(self) -> Dict[str, torch.Tensor]:
-        """
-        生成一个训练 batch。
+    fixed: bool = True
+    _cache: Optional[Dict[str, torch.Tensor]] = None
 
-        Returns:
-            dict, 必须满足:
-              - 包含模型 `forward()` 所需的全部关键字参数；
-              - 至少包含一个 "labels" 字段供 loss 计算；
-              - 多模态模型可附加 "audio_labels" 等额外标签。
-        """
+    def _sample(self) -> Dict[str, torch.Tensor]:
+        """采一个新 batch: 含 model.forward 的全部 kwargs + "labels"。"""
         raise NotImplementedError
+
+    def generate_batch(self) -> Dict[str, torch.Tensor]:
+        if not self.fixed:
+            return self._sample()
+        if self._cache is None:
+            self._cache = self._sample()
+        # 浅拷贝: Trainer 会 pop("labels"), 不能弄坏缓存
+        return dict(self._cache)
 
 
 class DecoderOnlyDataGenerator(SyntheticDataGenerator):
     """
-    Decoder-Only (因果 LM) 模型的合成数据生成器。
+    因果 LM (GPT-3 / LLaMA / Mistral / DeepSeek …) 的数据: teacher forcing + 标签右移一位。
 
-    适用模型: GPT-3, DeepSeekV3, DeepSeekV3_2
-
-    Teacher Forcing 与 shift-by-one 标签:
-        语言模型本质是 P(x_t | x_<t)，即给定前 t-1 个 token 预测第 t 个。
-        训练时使用 "teacher forcing"：每个位置都喂入真实历史 (而非模型自己的预测)，
-        并将 labels 设为输入右移一位。
-        实现技巧：先生成长度 seq_len + 1 的序列 X，再切片：
-            input  = X[:, :-1]   # 长度 seq_len
-            labels = X[:,  1:]   # 长度 seq_len，每个位置的目标恰好是输入下一位
-
-    为什么 token 从 1 开始 randint(1, vocab)？
-        约定 0 通常作为 pad 索引；从 1 开始可避免合成数据中误生成 pad token，
-        让所有位置都参与 loss 计算。
-
-    Args:
-        vocab_size: 词表大小。
-        batch_size: 批次大小。
-        seq_len:    输入序列长度。
-        device:     张量所在设备。
+    先采长度 seq_len+1 的序列 X, 再切: idx = X[:, :-1], labels = X[:, 1:]
+    → 位置 t 的目标恰好是输入的第 t+1 个 token。
+    token 从 1 开始采: 0 约定为 pad, 避开它让所有位置都参与 loss。
     """
 
     def __init__(
@@ -88,14 +67,13 @@ class DecoderOnlyDataGenerator(SyntheticDataGenerator):
         self.seq_len = seq_len
         self.device = device
 
-    def generate_batch(self) -> Dict[str, torch.Tensor]:
-        # 多生成 1 个 token，便于切片得到对齐的 input / shifted labels。
-        tokens = torch.randint(
+    def _sample(self) -> Dict[str, torch.Tensor]:
+        tokens = torch.randint(                                  # [B, seq_len + 1]
             1, self.vocab_size, (self.batch_size, self.seq_len + 1), device=self.device
         )
         return {
-            "idx": tokens[:, :-1],     # 模型输入
-            "labels": tokens[:, 1:],   # 标签 = 输入右移一位 (next-token prediction)
+            "idx": tokens[:, :-1],     # [B, seq_len]
+            "labels": tokens[:, 1:],   # [B, seq_len] 输入右移一位
         }
 
 
@@ -149,7 +127,7 @@ class EncoderDecoderDataGenerator(SyntheticDataGenerator):
         self.pad_idx = pad_idx
         self.device = device
 
-    def generate_batch(self) -> Dict[str, torch.Tensor]:
+    def _sample(self) -> Dict[str, torch.Tensor]:
         # 源序列从 1 开始，避开 pad_idx=0，保证全部位置有效。
         src = torch.randint(
             1, self.src_vocab_size, (self.batch_size, self.src_len), device=self.device
@@ -225,7 +203,7 @@ class VisionLanguageDataGenerator(SyntheticDataGenerator):
         self.num_vision_tokens = num_vision_tokens
         self.device = device
 
-    def generate_batch(self) -> Dict[str, torch.Tensor]:
+    def _sample(self) -> Dict[str, torch.Tensor]:
         # 文本 token: 多生成 1 个用于 shift
         text_tokens = torch.randint(
             1, self.vocab_size, (self.batch_size, self.seq_len + 1), device=self.device
@@ -313,7 +291,7 @@ class OmniDataGenerator(SyntheticDataGenerator):
         self.num_video_tokens = num_video_tokens
         self.device = device
 
-    def generate_batch(self) -> Dict[str, torch.Tensor]:
+    def _sample(self) -> Dict[str, torch.Tensor]:
         # ---- 文本分支 ----
         text_tokens = torch.randint(
             1, self.vocab_size, (self.batch_size, self.seq_len + 1), device=self.device
@@ -400,7 +378,7 @@ class MaskedLMDataGenerator(SyntheticDataGenerator):
         self.mask_token_id = mask_token_id if mask_token_id is not None else vocab_size - 1
         self.device = device
 
-    def generate_batch(self) -> Dict[str, torch.Tensor]:
+    def _sample(self) -> Dict[str, torch.Tensor]:
         input_ids = torch.randint(
             1, self.vocab_size - 1, (self.batch_size, self.seq_len), device=self.device,
         )
@@ -460,7 +438,7 @@ class CLIPDataGenerator(SyntheticDataGenerator):
         self.eos_token_id = eos_token_id if eos_token_id is not None else vocab_size - 1
         self.device = device
 
-    def generate_batch(self) -> Dict[str, torch.Tensor]:
+    def _sample(self) -> Dict[str, torch.Tensor]:
         text = torch.randint(
             1, self.vocab_size - 1, (self.batch_size, self.text_len), device=self.device,
         )
@@ -510,7 +488,7 @@ class WhisperDataGenerator(SyntheticDataGenerator):
         self.t_mel = t_mel
         self.device = device
 
-    def generate_batch(self) -> Dict[str, torch.Tensor]:
+    def _sample(self) -> Dict[str, torch.Tensor]:
         mel = torch.randn(self.batch_size, self.n_mels, self.t_mel, device=self.device)
 
         tokens = torch.randint(
@@ -527,7 +505,9 @@ class ImageDataGenerator(SyntheticDataGenerator):
     """
     通用图像合成数据生成器 (给 VAE / Tokenizer / VAR 用)。
 
-    生成 [B, 3, H, W] 的随机像素图 (高斯噪声); labels = 同一张图 (VAE 自监督目标)。
+    生成 [B, C, H, W] 的低频色块 (4×4 随机图双线性放大, tanh 压到 [-1, 1], 与 decoder 的
+    tanh 输出同值域); labels = 同一张图 (自监督重建目标)。
+    不用白噪声: 白噪声不可压缩, VAE 的瓶颈 / VQ 的 "粗尺度管轮廓" 都无从学起。
 
     Args:
         batch_size:      batch 大小
@@ -547,11 +527,11 @@ class ImageDataGenerator(SyntheticDataGenerator):
         self.image_channels = image_channels
         self.device = device
 
-    def generate_batch(self) -> Dict[str, torch.Tensor]:
-        x = torch.randn(
-            self.batch_size, self.image_channels, self.image_size, self.image_size,
-            device=self.device,
-        )
+    def _sample(self) -> Dict[str, torch.Tensor]:
+        coarse = torch.randn(self.batch_size, self.image_channels, 4, 4, device=self.device)
+        x = torch.nn.functional.interpolate(
+            coarse, size=self.image_size, mode="bilinear", align_corners=False,
+        ).tanh()                                                  # [B, C, H, W]
         return {"x": x, "labels": x}
 
 
@@ -559,14 +539,17 @@ class DiffusionDataGenerator(SyntheticDataGenerator):
     """
     扩散训练的合成数据生成器 (Image DiT / MM-DiT)
 
-    每步:
-        1) 采 x_0 (真实样本; 这里合成用随机 latent 代替)
+    一次 _sample:
+        1) 采 x_0 (真实训练来自 VAE.encode; 这里用随机 latent 代替)
         2) 采 t, 用 scheduler.add_noise 得 (x_t, target)
         3) 同时提供 y (类别) 或 text_embeds (MM-DiT)
 
     约定:
-        batch 里的 "x" 为含噪 latent, "t" 为时间步, "labels" 为 target (noise / velocity);
-        可选 "y", "text_embeds", "text_pooled" 等按需字段。
+        "x" = 含噪 latent, "t" = AddNoiseResult.t_norm (统一 [0, 1000) 量纲, Flow Matching 已 ×1000),
+        "labels" = target (noise / velocity); 可选 "y", "text_embeds", "text_pooled"。
+
+    注意 fixed=True 时 (x_0, t, ε) 整个被缓存: loss 下降 = 背下这一批的 ε, 不是学会去噪。
+    真实扩散训练每步都重采 t 和 ε (设 fixed=False, 此时 x_0~N(0,I) 下 DDPM loss 的理论下界是 E_t[ᾱ_t] ≈ 0.5)。
     """
 
     def __init__(
@@ -589,7 +572,7 @@ class DiffusionDataGenerator(SyntheticDataGenerator):
         self.text_dim = text_dim
         self.device = device
 
-    def generate_batch(self) -> Dict[str, torch.Tensor]:
+    def _sample(self) -> Dict[str, torch.Tensor]:
         # 1) 模拟一批 "x_0" (真实训练应来自 VAE.encode)
         x0 = torch.randn(
             self.batch_size, self.latent_channels, self.latent_size, self.latent_size,
@@ -641,7 +624,7 @@ class VideoDiffusionDataGenerator(SyntheticDataGenerator):
         self.num_classes = num_classes
         self.device = device
 
-    def generate_batch(self) -> Dict[str, torch.Tensor]:
+    def _sample(self) -> Dict[str, torch.Tensor]:
         T, H, W = self.latent_size
         x0 = torch.randn(
             self.batch_size, self.latent_channels, T, H, W, device=self.device,
@@ -672,9 +655,8 @@ class VARImageDataGenerator(SyntheticDataGenerator):
         self.image_size = image_size
         self.device = device
 
-    def generate_batch(self) -> Dict[str, torch.Tensor]:
-        images = torch.randn(
-            self.batch_size, 3, self.image_size, self.image_size, device=self.device,
-        )
+    def _sample(self) -> Dict[str, torch.Tensor]:
+        # 与 ImageDataGenerator 同款低频色块, 只是字段名对齐 VARModel.forward(images)
+        images = ImageDataGenerator(self.batch_size, self.image_size, device=self.device)._sample()["x"]
         # VARLoss 从 model_output 里读 labels, 这里只是 Trainer 接口占位
         return {"images": images, "labels": images}

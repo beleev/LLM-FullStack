@@ -220,6 +220,13 @@
       <InspectorPanel :config="config" :tab="inspectorTab" @update:tab="inspectorTab = $event" />
     </section>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav
       :prev="{ name: 'position', label: '位置编码 & RoPE', hint: '本章 pos 槽位的所有候选项的来历' }"
       :next="{ name: 'moe', label: 'MoE 路由', hint: '把 ffn 槽位拆成多专家 — Mixtral / DeepSeek 的两条路' }"
@@ -228,6 +235,8 @@
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import { ref, reactive, computed } from 'vue'
 import { tracks } from '@/data/models.js'
 import InspectorPanel from '@/components/InspectorPanel.vue'

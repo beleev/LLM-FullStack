@@ -1,36 +1,12 @@
 """
-Mistral 模型模块
+Mistral-7B (Jiang et al., 2023) — LLaMA + 滑动窗口注意力 (SWA)
 
-论文出处:
-    "Mistral 7B" (Jiang et al., 2023, arXiv:2310.06825)
-
-历史意义:
-    Mistral-7B 用 7B 参数打平/超过 Llama-2 13B, 架构上它对 LLaMA 只做了一处
-    "减法" —— **Sliding Window Attention (SWA, 滑动窗口注意力)**:
-
-        - 每个位置只看最近 W 个 token (Mistral-7B: W = 4096)
-        - 注意力计算量从 O(T^2) 降到 O(T·W)
-        - 推理 KV cache 用 rolling buffer (环形缓冲覆写), 显存从 O(T) 封顶到 O(W)
-        - 感受野并没有被掐断: 信息可以跨层接力传播,
-          L 层 × 窗口 W 的理论感受野 ≈ L·W (Mistral: 32 × 4096 ≈ 131K token)
-
-    这条"局部注意力"路线被后来者广泛继承:
-        Gemma 2/3 (2024-25)  全局层与 SWA 层交替堆叠 (5:1)
-        GPT-OSS  (2025)      SWA + 可学习 attention sink, 层间交替
-        Character/MiniMax 等 线性注意力 + 全注意力的混合也属于同一思想谱系
-
-在本库的演进地图里的位置:
-    LLaMA (2023, GQA + SwiGLU + RMSNorm + RoPE, 因果全注意力)
-        ↓  把注意力矩阵从"下三角"裁成"带状"  ← 改 mask, 省计算/显存
-    Mistral (2023, = LLaMA + 滑动窗口 mask)
-        ↓  另一条压缩 KV 的路线: 改投影而不是改 mask
-    DeepSeek-V3 (2024, MLA 低秩压缩 KV)
-
-实现说明 (本文件的教学重点):
-    SWA **不需要新的注意力类** —— 它只是换了一张 mask。
-    注意力本体 (QKV 投影 + softmax + 加权和) 与 LLaMA 完全相同, 谁能看见谁
-    完全由 mask 决定。因此本文件复用 GroupedQueryAttention, 仅把
-    build_causal_mask 换成 build_sliding_window_mask, 参数量与 LLaMA 一字不差。
+是什么: 与 LLaMA 逐参数相同, 只把因果 mask 从 "下三角" 裁成 "带状": 位置 t 只看 (t-W, t]。
+解决什么: 全注意力计算 O(T²)、KV cache O(T); SWA 降到 O(T·W) 与 O(W) (rolling buffer)。
+关键数字: 感受野没被掐断 —— 信息跨层接力, L 层 × 窗口 W ≈ L·W (Mistral: 32×4096 ≈ 131K)。
+后继: Gemma 2/3 (全局层 : SWA 层交替)、GPT-OSS (SWA + attention sink)。
+读代码时盯住: `window_mask` 与 forward 里的 `kept` —— SWA 不需要新的注意力类, 只是换了一张 mask;
+             有 KV cache 时 cache 被滚动裁到 W, mask 的列要跟着只取最后 kept+T 列。
 """
 
 import math
@@ -38,13 +14,14 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from llm_models.layers.core.attention import GroupedQueryAttention
 from llm_models.layers.core.blocks import PreLNBlock
 from llm_models.layers.core.feedforward import SwiGLUFeedForward
 from llm_models.layers.core.normalization import RMSNorm
 from llm_models.layers.core.position_encoding import RotaryPositionalEncoding
+from llm_models.utils.generation import GenerationMixin, KVCache
+from llm_models.utils.init import init_weights
 from llm_models.utils.masks import (
     build_sliding_window_mask,
     combine_causal_and_padding_mask,
@@ -77,7 +54,7 @@ def _make_mistral_block(
 MistralBlock = PreLNBlock
 
 
-class Mistral(nn.Module):
+class Mistral(GenerationMixin, nn.Module):
     """
     Mistral decoder-only LLM (教学版)
 
@@ -150,6 +127,8 @@ class Mistral(nn.Module):
         )
         self.register_buffer("window_mask", banded, persistent=False)
 
+        init_weights(self)   # weight tying 之后; 初始 CE ≈ ln V
+
     def _window_mask(self, seq_len: int) -> torch.Tensor:
         if seq_len <= self.window_mask.size(-1):
             return self.window_mask[:, :seq_len, :seq_len]
@@ -171,50 +150,34 @@ class Mistral(nn.Module):
 
     def forward(
         self,
-        idx: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            idx:            [B, T] token IDs
-            attention_mask: [B, T] padding mask, 1=有效 0=pad
-        Returns:
-            logits: [B, T, vocab_size]
-        """
+        idx: torch.Tensor,                              # [B, T]
+        attention_mask: Optional[torch.Tensor] = None,  # [B, past+T], 1=有效 0=pad
+        cache: Optional[KVCache] = None,
+    ) -> torch.Tensor:                                  # [B, T, V]
         B, T = idx.shape
-        if T > self.max_len:
-            raise ValueError(f"序列长度 {T} 超过 max_len={self.max_len}")
+        past = cache.pos if cache is not None else 0
+        if past + T > self.max_len:
+            raise ValueError(f"序列长度 {past + T} 超过 max_len={self.max_len}")
 
-        x = self.token_embedding(idx) * math.sqrt(self.d_model)
+        x = self.token_embedding(idx) * math.sqrt(self.d_model)          # [B, T, D]
+        position_ids = torch.arange(past, past + T, device=idx.device)
 
-        # 带状因果 mask ∩ padding mask
-        banded = self._window_mask(T)
+        # 带状 mask 的行 past:past+T (新 query) × 列 :past+T (全部历史), 再 ∩ padding
+        banded = self._window_mask(past + T)[:, past:]                   # [1, T, past+T]
         mask = combine_causal_and_padding_mask(banded, attention_mask)
+        # rolling buffer: cache 里只留了最近 kept 个 key, mask 的列要对齐到这 kept+T 个
+        kept = min(past, self.window_size)
+        mask = mask[..., -(kept + T):]                                   # [*, T, kept+T]
 
-        for layer in self.layers:
-            x = layer(x, mask=mask, rope=self.rope)
+        for i, layer in enumerate(self.layers):
+            layer_cache = cache.layers[i] if cache is not None else None
+            x = layer(x, mask=mask, rope=self.rope, position_ids=position_ids, cache=layer_cache)
+            if layer_cache is not None:
+                # 窗口外的 K/V 永远不会再被看到 → 丢掉。K 已带 RoPE (绝对位置), 裁剪不影响正确性
+                layer_cache["k"] = layer_cache["k"][:, :, -self.window_size:]
+                layer_cache["v"] = layer_cache["v"][:, :, -self.window_size:]
+                assert layer_cache["k"].size(2) <= self.window_size
+        if cache is not None:
+            cache.pos += T
 
-        x = self.ln_f(x)
-        return self.lm_head(x)
-
-    @torch.inference_mode()
-    def generate(
-        self,
-        idx: torch.Tensor,
-        max_new_tokens: int,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-    ) -> torch.Tensor:
-        """朴素自回归生成 (教学实现, 同 LLaMA.generate)。"""
-        self.eval()
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.max_len else idx[:, -self.max_len :]
-            logits = self(idx_cond)
-            logits = logits[:, -1, :] / temperature
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, idx_next], dim=1)
-        return idx
+        return self.lm_head(self.ln_f(x))

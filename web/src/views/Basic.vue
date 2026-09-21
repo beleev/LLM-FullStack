@@ -79,9 +79,9 @@
 
     <!-- ── 2. 模型结构 + 数据流 ───────────────────────────────────── -->
     <section class="section">
-      <h2>2. 模型结构 · 1 层 1 头, 但麻雀俱全</h2>
+      <h2>2. 模型结构 · 默认 1 层 1 头, 但麻雀俱全</h2>
       <p class="lead">
-        刻意做到极简: 单层 + 单头 + ReLU MLP + 学得式位置编码。骨架与现代 LLaMA
+        刻意做到极简: 默认单层 (<code class="inline">--n-layer</code> 可加层, 只是一个 for 循环) + 单头 + ReLU MLP + 学得式位置编码。骨架与现代 LLaMA
         完全一致 — <strong>差别只在零件选择</strong>, 不在结构。
       </p>
 
@@ -160,7 +160,8 @@
         <p class="hint">
           为什么用相对+绝对组合? 单纯绝对容差对大梯度太松, 单纯相对容差对接近 0
           的梯度太严。所以用 <code class="inline">atol + rtol · max(|g_a|, |g_n|)</code>。
-          eps 取 1e-4 是经验最优 — 太小数值误差吃掉信号, 太大又跑出二阶项。
+          eps 取 1e-5 (float64 下 U 形误差曲线的谷底) — 太小舍入误差吃掉信号, 太大又跑出二阶项;
+          下面的实验台可以亲手拖 ε 看这条曲线。gradcheck.py 先逐算子全元素检查 (check_ops), 再对 n_layer = 1 和 2 做端到端抽样检查。
         </p>
       </div>
     </section>
@@ -200,6 +201,13 @@
       </div>
     </section>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav
       :prev="{ name: 'home', label: '主线总览', hint: '回到六阶段地图' }"
       :next="{ name: 'basic-data', label: '阶段 1.1 · 数据与 tokenizer', hint: '先把 input.txt 变成可复现的训练张量' }"
@@ -208,6 +216,8 @@
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import RepoLink from '@/components/RepoLink.vue'
@@ -318,7 +328,7 @@ const diffs = [
   { topic: '位置编码',  basic: '学得式 pos_emb',            modern: 'RoPE (旋转, 乘在 Q/K 上)',           route: 'position', routeLabel: '阶段 2.2' },
   { topic: '注意力',    basic: '单头, head_dim = D',        modern: 'MHA / GQA / MLA / DSA',               route: 'attention', routeLabel: '阶段 2.1' },
   { topic: 'FFN 激活',  basic: 'ReLU + 普通两层',           modern: 'GELU → SwiGLU (门控 + 三个 linear)',  route: 'blocks', routeLabel: '阶段 2.3' },
-  { topic: '层数',      basic: '1 层',                      modern: 'N 层 (一个 for 循环就够)',            route: 'blocks', routeLabel: '阶段 2.3' },
+  { topic: '层数',      basic: '默认 1 层 (--n-layer 可调)',   modern: '几十层 + 各种 Block 变体',            route: 'blocks', routeLabel: '阶段 2.3' },
   { topic: 'FFN 形态',  basic: '稠密 MLP',                  modern: 'MoE: 一组小 FFN + router top-k',       route: 'moe', routeLabel: '阶段 2.4' },
   { topic: '推理',      basic: '每步重算整段 forward',      modern: 'KV cache: 只算新 token 的 Q, 复用 K/V',  route: 'infer-kv-memory', routeLabel: '阶段 5.1' },
   { topic: '优化器',    basic: '裸 Adam',                   modern: 'AdamW + warmup + cosine + grad clip',  routeLabel: '参考 trainer.py', file: 'llm_models/training/trainer.py' },

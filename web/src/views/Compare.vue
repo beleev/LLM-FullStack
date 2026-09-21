@@ -10,7 +10,7 @@
       tldr="竖着读模型表 = 一个组件维度的演进史; 横着读六阶段表 = 一个 LLM 从公式到可行动系统的工程闭环。"
       question="遇到一个真实大模型系统, 你能快速判断问题发生在结构、训练、微调、推理还是 Agent harness 层吗?"
       :goals="[
-        '快速对照 20 种主流模型的零件配置 (attn / ffn / norm / pos)',
+        `快速对照 ${timeline.length} 种主流模型的零件配置 (attn / ffn / norm / pos)`,
         '看清「早期 → 现代」每个维度的演进轨迹',
         '把六阶段闭环放回同一张地图: 哪一层出问题该读哪个目录',
       ]"
@@ -170,6 +170,13 @@
       </div>
     </section>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav
       :prev="{ name: 'agent-full-loop', label: '阶段 6.6 · mini Agent harness', hint: '从应用层闭环回到全局地图' }"
       :next="{ name: 'home', label: '返回主线总览', hint: '六阶段地图全景重看一遍' }"
@@ -178,6 +185,8 @@
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import { ref, computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { tracks, timeline } from '@/data/models.js'

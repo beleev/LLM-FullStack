@@ -17,10 +17,21 @@
 </template>
 
 <script setup>
-defineProps({
+// 上一章 / 下一章 一律从 learningPath 推导 —— 手写的 prev/next 容易在插入新章后过期。
+// 传入的 props 只在当前路由不在 learningPath 里时兜底。
+import { computed } from 'vue'
+import { useRoute } from 'vue-router'
+import { learningPath } from '@/data/models.js'
+
+const props = defineProps({
   prev: { type: Object, default: null },
   next: { type: Object, default: null },
 })
+const route = useRoute()
+const at = computed(() => learningPath.findIndex((p) => p.route === route.name))
+const toNav = (p) => (p ? { name: p.route, label: p.label } : null)
+const prev = computed(() => (at.value >= 0 ? toNav(learningPath[at.value - 1]) : props.prev))
+const next = computed(() => (at.value >= 0 ? toNav(learningPath[at.value + 1]) : props.next))
 </script>
 
 <style scoped>

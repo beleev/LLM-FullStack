@@ -1,23 +1,13 @@
 """
-Mixtral 模型模块
+Mixtral (Mistral AI, 2024) — LLaMA 骨架 + 每层 FFN 换成稀疏 MoE
 
-论文出处:
-    "Mixtral of Experts" (Jiang et al., Mistral AI, 2024)
-    8x7B: 总参 47B, 每 token 激活 ~13B, 首个主流开源稀疏 MoE。
-
-在本库中的位置:
-    - LLaMA (dense) 的稀疏化版本: 把每层 SwiGLU FFN 换成 MixtralMoE (8 专家, top-2)
-    - 与 DeepSeek-V3 的对照教学:
-        Mixtral: softmax + top-k, 无共享专家, 无 aux-loss-free bias
-        DeepSeekV3: sigmoid + top-k + renormalize, 有共享专家, aux-free bias
-      二者都用 LLaMA-风格骨架 (GQA + SwiGLU 专家 + RMSNorm + RoPE)
-
-教学重点:
-    - MoE 并未改变 attention 或 norm 结构, 纯粹是 FFN 稀疏化
-    - routing_info 的返回形态与 DeepSeekMoE 保持一致, 训练端可以复用同一个
-      MoELMLoss (Switch-Transformer 风格 aux loss)
-    - Mixtral 的 attention 是 GQA (LLaMA 同款); 本教学版不加 SWA (sliding window),
-      保持简单; 真实 Mixtral 还有 window=4096 的 SWA
+解决什么: dense LLaMA 想加容量只能整体加宽加深, 算力同步上涨。Mixtral 只把 FFN 换成
+    8 个专家、每 token 选 2 个: 8x7B 总参 47B, 每 token 激活 ~13B。attention/norm/RoPE 一律不变。
+路由: softmax → top-2 → 选中权重再归一 (layers/sparse/moe.py::MixtralMoE)。
+负载均衡: 没有 DeepSeek 那样的 bias, 全靠 aux loss (training/loss.py::MoELMLoss, 均衡时 = K)。
+forward 返回 (logits, all_routing_info), 与 DeepSeekV3 同接口。
+读代码时盯住: MixtralBlock.forward 里 moe 返回的 routing_info —— 它一路传到 loss。
+教学省略: 真实 Mixtral 的 sliding-window attention (window=4096)。
 """
 
 import math
@@ -27,24 +17,16 @@ import torch
 import torch.nn as nn
 
 from llm_models.layers.core.attention import GroupedQueryAttention
-from llm_models.layers.core.feedforward import SwiGLUFeedForward
 from llm_models.layers.sparse.moe import MixtralMoE
 from llm_models.layers.core.normalization import RMSNorm
 from llm_models.layers.core.position_encoding import RotaryPositionalEncoding
+from llm_models.utils.generation import GenerationMixin, KVCache
+from llm_models.utils.init import init_weights
 from llm_models.utils.masks import build_causal_mask, combine_causal_and_padding_mask
 
 
 class MixtralBlock(nn.Module):
-    """
-    Mixtral Block: GQA + MixtralMoE + RMSNorm (Pre-Norm)
-
-    数据流:
-        x -> RMSNorm -> GQA           -> Add
-          -> RMSNorm -> MixtralMoE    -> Add  (同时返回 routing_info)
-
-    由于 MoE 层返回 (out, routing_info) 而非单张量, 本 Block 不能直接复用 PreLNBlock;
-    逻辑与 DeepSeekBlock 完全一致, 只是把 MLA→GQA, DeepSeekMoE→MixtralMoE。
-    """
+    """Pre-RMSNorm Block:  x → norm → GQA → +  → norm → MixtralMoE → +  (顺带返回 routing_info)"""
 
     def __init__(
         self,
@@ -63,21 +45,23 @@ class MixtralBlock(nn.Module):
         )
         self.moe = MixtralMoE(
             d_model=d_model, d_ff=d_ff,
-            num_experts=num_experts, top_k=top_k, dropout=dropout,
+            num_experts=num_experts, top_k=top_k,
         )
         self.norm1 = RMSNorm(d_model)
         self.norm2 = RMSNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)  # 残差 dropout, 每个子层恰好一次 (MoE 内部不再做)
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor,                       # [B, T, D]
         mask: Optional[torch.Tensor] = None,
         rope: Optional[nn.Module] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        cache: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         # 子层 1: GQA self-attention
         h = self.norm1(x)
-        h = self.attn(q=h, k=h, v=h, mask=mask, rope=rope)
+        h = self.attn(q=h, mask=mask, rope=rope, position_ids=position_ids, cache=cache)
         x = x + self.dropout(h)
 
         # 子层 2: 稀疏 MoE
@@ -87,29 +71,12 @@ class MixtralBlock(nn.Module):
         return x, routing_info
 
 
-class Mixtral(nn.Module):
+class Mixtral(GenerationMixin, nn.Module):
     """
-    Mixtral 教学版 (sparse MoE decoder-only)
+    idx → Embed·sqrt(D) → N × MixtralBlock → RMSNorm → lm_head (与 embedding 共享权重)
 
-    架构:
-        idx -> TokenEmbed * sqrt(d_model)
-            -> N x MixtralBlock(GQA + MixtralMoE + RMSNorm)   [RoPE 注入 Q/K]
-            -> RMSNorm
-            -> lm_head  (与 token_embedding 共享)
-
-    forward 返回 (logits, all_routing_info), 与 DeepSeekV3 对齐, 可复用 MoELMLoss。
-
-    Args:
-        vocab_size:    词表大小
-        d_model:       隐藏维度 (Mixtral 8x7B 为 4096)
-        n_heads:       Q head 数 (Mixtral 8x7B 为 32)
-        num_kv_heads:  K/V head 数 (Mixtral 8x7B 为 8)
-        num_layers:    Transformer 层数 (Mixtral 8x7B 为 32)
-        num_experts:   每层专家数 (Mixtral 8x7B 为 8)
-        top_k:         每 token 激活专家数 (Mixtral 8x7B 为 2)
-        max_len:       最大上下文
-        d_ff:          专家 SwiGLU 隐藏维度, 默认 int(8/3 * d_model)
-        dropout:       Dropout
+    默认参数即 Mixtral 8x7B: d_model=4096, 32 头 / 8 KV 头, 32 层, 8 专家 top-2。
+    d_ff 默认 int(8/3·D) 向上对齐到 64。generate() 来自 GenerationMixin (GQA KV cache)。
     """
 
     def __init__(
@@ -158,8 +125,11 @@ class Mixtral(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight
 
-        causal = build_causal_mask(max_len, torch.device("cpu"))
+        causal = build_causal_mask(max_len, torch.device("cpu"))  # [1, L, L]
         self.register_buffer("causal_mask", causal, persistent=False)
+
+        # 默认 N(0,1) embedding + tying + ·sqrt(D) 会让初始 CE ≈ 127; N(0, 0.02²) 后 ≈ ln V
+        init_weights(self)
 
     def _causal_mask(self, seq_len: int) -> torch.Tensor:
         if seq_len <= self.causal_mask.size(-1):
@@ -168,30 +138,30 @@ class Mixtral(nn.Module):
 
     def forward(
         self,
-        idx: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        idx: torch.Tensor,                              # [B, T]
+        attention_mask: Optional[torch.Tensor] = None,  # [B, past+T], 1=有效 0=pad
+        cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, List[Dict[str, torch.Tensor]]]:
-        """
-        Args:
-            idx:            [B, T] token IDs
-            attention_mask: [B, T] padding mask (可选)
-        Returns:
-            logits:           [B, T, vocab_size]
-            all_routing_info: 每层一份 routing_info 的列表, 供外部算 Switch aux loss
-        """
+        """返回 (logits [B, T, V], 每层一份 routing_info)。"""
         B, T = idx.shape
-        if T > self.max_len:
-            raise ValueError(f"序列长度 {T} 超过 max_len={self.max_len}")
+        past = cache.pos if cache is not None else 0  # 已缓存 token 数: 同时平移 RoPE 位置和 mask 行
+        if past + T > self.max_len:
+            raise ValueError(f"序列长度 {past + T} 超过 max_len={self.max_len}")
 
-        x = self.token_embedding(idx) * math.sqrt(self.d_model)
+        x = self.token_embedding(idx) * math.sqrt(self.d_model)  # [B, T, D]
 
-        causal = self._causal_mask(T)
+        position_ids = torch.arange(past, past + T, device=idx.device)
+        causal = self._causal_mask(past + T)[:, past:]  # [1, T, past+T]
         mask = combine_causal_and_padding_mask(causal, attention_mask)
 
         all_routing_info: List[Dict[str, torch.Tensor]] = []
-        for layer in self.layers:
-            x, routing_info = layer(x, mask=mask, rope=self.rope)
+        for i, layer in enumerate(self.layers):
+            x, routing_info = layer(
+                x, mask=mask, rope=self.rope, position_ids=position_ids,
+                cache=cache.layers[i] if cache is not None else None,
+            )
             all_routing_info.append(routing_info)
+        if cache is not None:
+            cache.pos += T
 
-        x = self.ln_f(x)
-        return self.lm_head(x), all_routing_info
+        return self.lm_head(self.ln_f(x)), all_routing_info

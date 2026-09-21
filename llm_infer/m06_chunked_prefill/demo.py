@@ -1,79 +1,55 @@
 """
-m06 demo — Chunked Prefill 与 full prefill 数值等价性
+m06 demo — Chunked Prefill: (1) 数值上与整段 prefill 等价; (2) 与 decode 混批后 TBT 尖刺消失
 
-我们直接调 TinyLM 的 block_forward, 手工拼装 chunked 路径,
-然后与 lm.prefill(full) 对比。
+运行: python -m llm_infer.m06_chunked_prefill.demo
+[1][2] 用真 TinyLM 对拍; [3] 用 m03 的真调度器 + 代价模型 (CostModel, 非实测) 算延迟。
 """
 from __future__ import annotations
-from typing import List, Tuple
 import numpy as np
 
 from llm_infer.core import TinyLM, ModelConfig
-from llm_infer.core.utils import banner, kv, rms_norm
-from llm_infer.core.tiny_model import block_forward
-
-
-def chunked_prefill(
-    lm: TinyLM, prompt_ids: np.ndarray, chunk_size: int
-) -> Tuple[np.ndarray, list]:
-    """把 prompt 切成 chunk_size 段, 顺序 prefill, 累积 KV cache。
-
-    返回 (last_logits, kv_cache list)。
-    """
-    T = len(prompt_ids)
-    kv_cache: List = [None] * lm.cfg.n_layer
-    start_pos = 0
-    last_logits = None
-    for s in range(0, T, chunk_size):
-        e = min(T, s + chunk_size)
-        chunk = prompt_ids[s:e]
-        x = lm.w.tok_emb[chunk]
-        for li, layer in enumerate(lm.w.layers):
-            x, kv_cache[li] = block_forward(
-                x, layer, lm.cos, lm.sin,
-                kv_cache=kv_cache[li],   # 传入历史 KV → block_forward 会拼接
-                start_pos=start_pos,
-            )
-        x = rms_norm(x, lm.w.norm_f_g)
-        last_logits = x @ lm.w.lm_head    # (chunk_len, V)
-        start_pos += len(chunk)
-    return last_logits, kv_cache
+from llm_infer.core.utils import banner, kv
+from llm_infer.m06_chunked_prefill.chunked_prefill import chunked_prefill, simulate, CostModel
 
 
 def main():
-    banner("M06 - Chunked Prefill")
-
-    cfg = ModelConfig(d_model=64, d_mlp=128, n_layer=4, vocab_size=128, max_seq_len=512)
-    lm = TinyLM(cfg)
-
-    rs = np.random.RandomState(0)
+    banner("M06 - Chunked Prefill (Sarathi)")
+    lm = TinyLM(ModelConfig(d_model=64, d_mlp=128, n_layer=4, vocab_size=128))
     T = 64
-    prompt = rs.randint(3, cfg.vocab_size, size=T).astype(np.int64)
-
-    # ---- baseline: full prefill ---------------------------------- #
+    prompt = np.random.RandomState(0).randint(3, 128, size=T)
     logits_full, kv_full = lm.prefill(prompt)
 
-    # ---- 不同 chunk_size 对比数值 -------------------------------- #
-    print(f"\n[1] 不同 chunk_size 输出与 full prefill 的差异 (T={T})")
-    print(f"  {'chunk_size':>12}  {'last_logit_max_abs_diff':>26}  {'KV[0] max_diff':>16}")
-    for chunk_size in [8, 16, 32, 64]:
-        logits_c, kv_c = chunked_prefill(lm, prompt, chunk_size)
-        n = logits_c.shape[0]
-        d_logits = np.max(np.abs(logits_full[-n:] - logits_c))
-        d_kv = np.max(np.abs(kv_full[0][0] - kv_c[0][0]))
-        print(f"  {chunk_size:>12}  {d_logits:>26.2e}  {d_kv:>16.2e}")
+    print(f"\n[1] 分块 vs 整段 prefill 的数值差 (T={T})")
+    print(f"  {'chunk':>6}  {'logits max|Δ|':>14}  {'KV max|Δ|':>12}  {'attn 分数矩阵峰值':>18}")
+    for chunk in [8, 16, 32, 64]:
+        logits_c, kv_c = chunked_prefill(lm, prompt, chunk)
+        d_logits = np.max(np.abs(logits_full[-len(logits_c):] - logits_c))
+        d_kv = max(np.max(np.abs(a[0] - b[0])) for a, b in zip(kv_full, kv_c))
+        peak = chunk * T                                   # 最后一块: chunk 行 × T 列
+        print(f"  {chunk:>6}  {d_logits:>14.2e}  {d_kv:>12.2e}  {peak:>10} (整段 {T * T})")
+        assert d_logits < 1e-4 and d_kv < 1e-4
 
-    # ---- 显存峰值估算 (用 attn 矩阵 element 数代理) -------------- #
-    print(f"\n[2] 显存峰值代理: max(Q×K) attn 矩阵元素数")
-    for chunk_size in [8, 16, 32, 64]:
-        peak = 0
-        for s in range(0, T, chunk_size):
-            qlen = min(chunk_size, T - s)
-            klen = s + qlen
-            peak = max(peak, qlen * klen)
-        kv(f"chunk={chunk_size:>3}", f"{peak:>6} elems  (full = {T*T} elems)")
+    print("\n[2] 负载: 4 条请求在 decode, 第 10 步来了一条 1024-token 的长 prompt")
+    cost = CostModel()
+    kv("代价模型 (非实测)", f"step_ms = {cost.fixed_ms} + {cost.per_token_ms} × batch_tokens")
+    arrivals = [(0, 16, 40)] * 4 + [(10, 1024, 8)]
+    res = {}
+    for name, chunked, budget in [("prefill 优先 (不分块)", False, 2048), ("分块混批 B=128", True, 128),
+                                  ("分块混批 B=512", True, 512)]:
+        r = res[name] = simulate(chunked, budget, arrivals, cost)
+        tbt = np.concatenate([r["tbt"][s] for s in range(4)])          # 只看那 4 条 decode 用户
+        r["max_tbt"], r["p50_tbt"], r["long_ttft"] = tbt.max(), np.median(tbt), r["ttft"][4]
+        print(f"  {name:<22} 每步最大 token={max(r['step_tokens']):>5}  TBT p50={r['p50_tbt']:6.1f}ms  "
+              f"max={r['max_tbt']:6.1f}ms  长请求 TTFT={r['long_ttft']:6.1f}ms  总耗时={r['total_ms']:.0f}ms")
 
-    print("\n  ✓ chunked 输出与 full 数值等价, 显存峰值显著降低")
+    base, c128, c512 = res["prefill 优先 (不分块)"], res["分块混批 B=128"], res["分块混批 B=512"]
+    print(f"\n  decode 用户最大卡顿: {base['max_tbt']:.0f}ms → {c128['max_tbt']:.0f}ms "
+          f"({base['max_tbt'] / c128['max_tbt']:.1f}x); 代价: 长请求 TTFT {base['long_ttft']:.0f}ms → {c128['long_ttft']:.0f}ms")
+    assert max(c128["step_tokens"]) <= 128 and max(c512["step_tokens"]) <= 512   # 预算即每步上限
+    assert c128["max_tbt"] < c512["max_tbt"] < base["max_tbt"]                  # 预算越小, 卡顿越小
+    assert c128["max_tbt"] <= cost.step_ms(128) + 1e-9                          # TBT 被预算封顶
+    assert c128["long_ttft"] > base["long_ttft"]                                # 没有免费午餐
+    print("  ✓ 分块数值等价; TBT 上限 = step_ms(token 预算); 预算是 TBT 与 TTFT 之间的旋钮")
 
 
 if __name__ == "__main__":

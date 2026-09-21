@@ -110,7 +110,7 @@
       <h2>5. full_loop · mini-Claude-Code-style harness</h2>
       <p class="lead">
         <RepoLink path="llm_agent/full_loop/demo.py" label="full_loop/demo.py" tiny /> 把所有机制接到同一个 Agent 中:
-        search、note、weather、shell、delegate 五类工具共用一条执行面。
+        检索、笔记、skill、fetch、shell、delegate 与 MCP 工具共用一条执行面。
       </p>
       <div class="grid grid-2" style="gap: 16px;">
         <div class="card">
@@ -118,7 +118,7 @@
           <pre class="code">{{ fullLoopCode }}</pre>
         </div>
         <div class="card">
-          <h3>运行现象 <span class="tag">四个任务</span></h3>
+          <h3>运行现象 <span class="tag">五个场景</span></h3>
           <div class="run-list">
             <div v-for="r in runRows" :key="r.title" class="run-row">
               <span class="pill">{{ r.step }}</span>
@@ -136,6 +136,13 @@
       </div>
     </section>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav
       :prev="{ name: 'infer-engine', label: '阶段 5.5 · mini-vLLM 引擎', hint: '推理服务提供 token, Agent harness 编排动作' }"
       :next="{ name: 'agent-loop', label: '阶段 6.1 · Agent loop', hint: '先看最小 while-loop 闭环' }"
@@ -144,6 +151,8 @@
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import EvolutionChain from '@/components/EvolutionChain.vue'
@@ -170,21 +179,21 @@ const agentChain = [
     name: 'Permission',
     year: 'm03',
     pain: '能行动后就有破坏面。',
-    fix: 'deny-first + ask/default/auto 模式, 风险可控地放权。',
+    fix: 'deny > ask > allow + 六种模式兜底, 风险可控地放权。',
     color: 'var(--warn)',
   },
   {
     name: 'Context',
     year: 'm04',
     pain: '历史和记忆会挤爆窗口。',
-    fix: '文件记忆检索 + 头尾保留 + 中间摘要压缩。',
+    fix: '文件记忆检索 + 清旧工具结果 + 模型摘要压缩。',
     color: 'var(--eye)',
   },
   {
     name: 'Extensible',
     year: 'm05',
     pain: '所有能力都写进 prompt 会越来越贵。',
-    fix: 'Hooks / Skills / MCP-like tools 分层接入。',
+    fix: 'Hooks / 渐进披露的 Skills / MCP 工具分层接入。',
     color: 'var(--right)',
   },
   {
@@ -200,11 +209,11 @@ const primitives = [
   {
     name: 'Transcript',
     tag: 'messages',
-    desc: '用户、工具、助手输出都进入同一条消息流, 供下一轮模型决策。',
+    desc: '用 Messages API 同款 content block: assistant 发 tool_use, 结果以 tool_result 放进下一条 user 消息, 靠 id 配对。',
     file: 'llm_agent/core/schema.py',
-    code: `Message(role="user", content=prompt)
-Message(role="tool", name="calculator", content="2+2=4")
-Message(role="assistant", content=final)`,
+    code: `Message("user", prompt)
+Message("assistant", [{"type": "tool_use", "id": "toolu_0001", ...}])
+Message("user", [{"type": "tool_result", "tool_use_id": "toolu_0001", ...}])`,
   },
   {
     name: 'Tool Pool',
@@ -220,19 +229,21 @@ Message(role="assistant", content=final)`,
   {
     name: 'Permission',
     tag: 'guard',
-    desc: '权限门在工具执行前做 deny-first 判断。',
+    desc: '权限门在工具执行前裁决: deny > ask > allow > 模式兜底, 评估的是 hook 改写后的最终调用。',
     file: 'llm_agent/core/permissions.py',
-    code: `outcome = permissions.evaluate(call)
+    code: `final = pre_hook.updated_call or call
+outcome = permissions.evaluate(final, tool)  # 评估改写后的调用
 if not outcome.allowed:
     return ToolResult(call.name, "DENIED", ok=False)`,
   },
   {
     name: 'Memory',
     tag: 'context',
-    desc: '透明文件记忆按需检索进入上下文, 历史超预算时压缩。',
+    desc: '透明文件记忆按需检索进入上下文; 超预算先清旧工具结果, 不够再让模型写摘要。',
     file: 'llm_agent/core/memory.py',
-    code: `base.extend(memory_messages(memory, prompt))
-context = compact_messages(base + messages, max_chars=budget)`,
+    code: `base += memory_messages(memory, prompt)
+view = clear_tool_results(messages, keep_last=1)
+if total_chars(view) > budget: compact()   # 模型写摘要`,
   },
   {
     name: 'Hooks',
@@ -261,35 +272,36 @@ if "计算" in prompt:
 if last_message_is_tool_result:
     return ModelAction.final(summary)`
 
-const harnessSide = `action = llm.next(context, tools.names())
-outcome = permissions.evaluate(action.tool_call)
+const harnessSide = `action = llm.next(context, tools.schemas())
+final = hooks.on_pre_tool_use(call).updated_call or call
+outcome = permissions.evaluate(final, tool)
 if outcome.allowed:
-    result = tools.execute(action.tool_call)
+    result = tools.execute(final)      # 先 validate_args
 else:
     result = ToolResult(name, "DENIED", ok=False)
 
-messages.append(tool_result_message(result))
+messages.append(Message("user", [result.to_block()]))
 store.append(message)`
 
 const fullLoopCode = `tools = ToolRegistry([
-    SearchDocsTool(DOCS), WriteNoteTool(notes),
-    WeatherTool(), ShellTool(), DelegateTool(DOCS),
+    VectorSearchTool(index), WriteNoteTool(notes), SkillTool(skills),
+    FetchDocTool(PAGES), ShellTool(), delegate, *mcp_tools(mcp),
 ])
 
 agent = Agent(
     llm=RuleBasedLLM(),
     tools=tools,
-    permissions=PermissionGate(mode="auto", rules=deny_rules),
-    hooks=build_hooks(),
-    memory=FileMemory(...),
-    store=JsonlSessionStore(...),
+    permissions=PermissionGate(mode="auto", rules=rules),
+    hooks=hooks, memory=memory, store=store,
+    guardrails=Guardrails(),
 )`
 
 const runRows = [
-  { step: '1', title: 'gather → act → persist', body: '搜索文档后把结果写入笔记, 展示多步工具调用。' },
+  { step: '1', title: 'skill → 检索 → 写笔记', body: '先按需加载 SKILL.md 正文, 再 TF-IDF 检索, 把结果写入笔记。' },
   { step: '2', title: 'delegate isolated research', body: '父 Agent 调子 Agent, 父级只收到 summary。' },
-  { step: '3', title: 'external MCP-like tool', body: 'Fake MCP server 暴露 weather 工具。' },
-  { step: '4', title: 'denied dangerous action', body: 'rm -rf 被 deny-first 规则拒绝。' },
+  { step: '3', title: 'MCP 工具 (真实子进程)', body: 'stdio JSON-RPC server 暴露 mcp__weather__* 工具, 由 allow 规则放行。' },
+  { step: '4', title: '危险命令被拒', body: 'rm -fr 换了 flag 顺序, 归一化后仍命中 deny 规则。' },
+  { step: '5', title: '文档夹带指令和密钥', body: '不可信输出被标记、密钥被脱敏, 污点规则锁住高风险工具。' },
 ]
 </script>
 

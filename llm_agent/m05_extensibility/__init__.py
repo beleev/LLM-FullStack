@@ -1,2 +1,1 @@
-"""m05: hooks, skills, and MCP-like tools."""
-
+"""m05: hooks 与 skills (渐进式披露)。"""

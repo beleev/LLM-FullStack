@@ -49,6 +49,20 @@ def causal_mask(t_q: int, t_k: int) -> np.ndarray:
     return mask
 
 
+def dense_attention(q: np.ndarray, K: np.ndarray, V: np.ndarray,
+                    mask: np.ndarray | None = None) -> np.ndarray:
+    """朴素 attention 基线: softmax(q·Kᵀ/√d + mask)·V, 全库唯一一份。
+
+    q (..., Tq, d), K (..., Tk, d), V (..., Tk, dv) → (..., Tq, dv); 前导维 (如 n_head) 自动广播。
+    mask: 加性 (Tq, Tk), 0=可见 / -inf=屏蔽; None → 因果 (query 对齐 K 的尾部)。
+    各模块 (paged / flash / TP / 量化 / 树形 mask) 都拿它当"正确答案"对拍。
+    """
+    if mask is None:
+        mask = causal_mask(q.shape[-2], K.shape[-2])
+    scores = q @ np.swapaxes(K, -1, -2) / q.shape[-1] ** 0.5     # (..., Tq, Tk); python float 不会把 fp32 升成 fp64
+    return softmax(scores + mask, axis=-1) @ V
+
+
 # --------------------------------------------------------------------- #
 # 计时器                                                                #
 # --------------------------------------------------------------------- #

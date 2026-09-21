@@ -1,6 +1,9 @@
 """
 bpe.py — 手写一个最小 byte-level BPE tokenizer（GPT-2 同款思想）
 
+【独立演示】本文件不参与训练流水线：prepare.py / train.py / sample.py 用的是字符级
+tokenizer.py（vocab=65），ckpt.npz 也是按它训练的。bpe.py 只依赖 input.txt，可以单独跑。
+
 字符级 tokenizer（tokenizer.py）的词表 = 语料里出现过的字符，简单但有两个代价：
   1. 序列太长：一个英文单词要 5~10 个 token，注意力是 O(T^2)，长序列很贵
   2. 没有"词"的概念：模型要花参数容量自己学字母如何拼成词
@@ -148,9 +151,11 @@ def main() -> None:
     print(f"  前 18 个 token: {shown}")
     print(f"  字符级需要 {len(sample)} 个 token, BPE 只要 {len(ids)} 个")
     print(f"  压缩率: {len(sample) / len(ids):.2f} 字符/token  (GPT-2 在英文上约 4)")
+    assert len(ids) < len(sample), "BPE 必须比字节级更短，否则合并规则没生效"
+    assert len(vocab) == 256 + len(merges)
 
-    print("\n  OK: 词表大小是「序列长度 vs embedding 参数量」之间的工程权衡，")
-    print("      BPE 用一个贪心统计算法把这个权衡变成了可调的旋钮 (--merges)。")
+    print("\n  结论: 词表大小是「序列长度 vs embedding 参数量」之间的工程权衡，")
+    print("        BPE 用一个贪心统计算法把这个权衡变成了可调的旋钮 (--merges)。")
 
 
 if __name__ == "__main__":

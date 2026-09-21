@@ -1,1 +1,1 @@
-"""Retrieval memory (RAG-lite, TF-IDF 向量检索) demo."""
+"""m08: TF-IDF 检索 (含中文 bigram), 实现在 core/retrieval.py。"""

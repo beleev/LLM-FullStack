@@ -197,6 +197,13 @@ K_n = R(nθ) · k
       </div>
     </section>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav
       :prev="{ name: 'attention', label: '注意力的四代演进', hint: 'KV cache 的瓶颈与解法' }"
       :next="{ name: 'blocks', label: 'Block 组装器', hint: '把 attention + ffn + norm + pos 拼起来, 数模型差异' }"
@@ -205,6 +212,8 @@ K_n = R(nθ) · k
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import { ref, computed } from 'vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'

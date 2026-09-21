@@ -1,90 +1,77 @@
 """
-flash_attention.py — Online softmax 的 numpy 实现
+flash_attention.py — 分块 (tiling) + online softmax 的 attention, numpy 版
 
-接口与朴素 attention 一致: (Q, K, V, mask?) → O。
-内部按 block 切, 不显式存 (T, T) 矩阵。
-
-简化:
-    - 单头, 无 batch 维 (T, D)
-    - causal mask 默认开
-    - block_size 同时切 Q 与 KV (生产实现 Q-block 与 KV-block 大小常不同)
+是什么: 不落地 (Tq,Tk) 分数矩阵, 每次只算一块 (b_q, b_k), 用 logsumexp 增量合并。
+解决的瓶颈: 显存 O(T²) → 工作集 O(b_q·b_k); 真实 GPU 上更关键的是少读写 HBM (延迟)。
+关键数字: T=4096, b=64 → 工作集 4,096 个元素 vs 16,777,216 (4096×); causal 下约一半的块整块跳过。
+循环顺序: 外层 Q 块, 内层 K/V 块 —— FlashAttention-2 的顺序 (FA-1 相反)。
+    好处: 一个 Q 块的 (O_i, lse_i) 在内层循环里常驻 SRAM, 只写回 HBM 一次; Q 块之间无依赖, 可并行。
+读代码盯住: `lse` (每个 query 行的 logsumexp), 它是 softmax 分母的 log。有了它:
+    - 两段部分 attention 可以精确合并 (merge_attention) → ring attention / chunked prefill 的原语
+    - 反向传播不用存 P (T,T), 由 lse 重算 P = exp(S - lse)
+对应真实系统: flash-attn 库返回的 softmax_lse; vLLM / SGLang 的 FlashAttention / FlashInfer backend。
+简化: 单头 (T,D), 无 batch; 要求 Tq <= Tk (query 对齐 K 的尾部, 与 core.dense_attention 同约定)。
 """
 from __future__ import annotations
 import numpy as np
 
 
-def flash_attention(
-    Q: np.ndarray,            # (Tq, D)
-    K: np.ndarray,            # (Tk, D)
-    V: np.ndarray,            # (Tk, D)
-    block_size: int = 16,
-    causal: bool = True,
-) -> np.ndarray:
-    """Online softmax 流式计算 attention, 输出形状 (Tq, D)。
+def _logsumexp(S: np.ndarray) -> np.ndarray:
+    """按行 logsumexp, (bq,bk) → (bq,); 整行 -inf (本块对该行全被 mask) 时返回 -inf 而不是 nan。"""
+    m = np.max(S, axis=-1)
+    m_safe = np.where(np.isfinite(m), m, 0.0)
+    with np.errstate(divide="ignore"):                    # log(0) = -inf 是预期结果
+        return m_safe + np.log(np.sum(np.exp(S - m_safe[:, None]), axis=-1))
 
-    内存峰值: O(block_size² + block_size·D), 与 Tq, Tk 无关。
+
+def merge_attention(O1, lse1, O2, lse2):
+    """把同一批 query 在两段不相交 K/V 上的部分结果, 精确合并成"在全部 K/V 上"的结果。
+
+    O_i (Tq,dv) 是各自归一化过的输出, lse_i (Tq,) 是各自分母的 log。
+    全局分母 = e^lse1 + e^lse2, 所以 O = (e^lse1·O1 + e^lse2·O2) / (e^lse1 + e^lse2)。
     """
-    Tq, D = Q.shape
+    lse = np.logaddexp(lse1, lse2)                        # (Tq,)
+    w1 = np.exp(lse1 - lse)[:, None]                      # (Tq,1) 第 1 段占全局 softmax 质量的比例
+    w2 = np.exp(lse2 - lse)[:, None]
+    return w1 * O1 + w2 * O2, lse
+
+
+def flash_attention(Q, K, V, block_q: int = 16, block_k: int = 16, causal: bool = True):
+    """Q (Tq,d), K (Tk,d), V (Tk,dv) → (O (Tq,dv), lse (Tq,), stats)。
+
+    常驻内存: O 与 lse 是 O(Tq) 的输出; 临时工作集只有一块 S (b_q, b_k), 与 T 无关。
+    stats: full / partial (跨对角线, 需逐元素 mask) / skipped (整块在对角线上方, 连 matmul 都不做)
+           三类块数, 以及 peak_elems = 见过的最大 S.size。
+    """
+    Tq, d = Q.shape
     Tk = K.shape[0]
-    sqrt_d = np.sqrt(D)
+    assert Tq <= Tk, "causal 约定: query 对齐 K 的尾部"
+    offset = Tk - Tq                                      # query 行 i 的绝对位置 = i + offset
+    O = np.zeros((Tq, V.shape[1]), dtype=np.float32)
+    lse = np.full(Tq, -np.inf, dtype=np.float32)
+    stats = dict(full=0, partial=0, skipped=0, peak_elems=0)
+    n_kblocks = -(-Tk // block_k)
 
-    # 输出累加器 + 数值稳定状态 (m: 当前 max, l: 当前 sum_exp)
-    O = np.zeros((Tq, D), dtype=np.float32)
-    m = np.full((Tq,), -np.inf, dtype=np.float32)
-    l = np.zeros((Tq,), dtype=np.float32)
-
-    # 按 KV 方向 block 流式处理
-    for k_start in range(0, Tk, block_size):
-        k_end = min(Tk, k_start + block_size)
-        K_b = K[k_start:k_end]            # (Bk, D)
-        V_b = V[k_start:k_end]
-
-        # 同时按 Q 方向 block (这里偷懒一次取全部, 实际 FA 也切 Q)
-        # S 的 shape: (Tq, Bk), 显存只有 Tq * Bk, 远小于 Tq * Tk
-        S = (Q @ K_b.T) / sqrt_d
-
-        if causal:
-            # 行 i 不能看 (k_start + j) > i + (Tk - Tq) 的 key
-            # 简化: 只支持 Tq <= Tk, query i 对应"绝对位置" i + (Tk - Tq)
-            offset = Tk - Tq
-            for i in range(Tq):
-                last_visible = i + offset
-                for j in range(k_end - k_start):
-                    if k_start + j > last_visible:
-                        S[i, j] = -np.inf
-
-        # ---- online softmax 增量更新 ---------------------------- #
-        m_b = np.max(S, axis=-1)                              # (Tq,) 本块的 max
-        m_new = np.maximum(m, m_b)
-        # 之前累计的 O / l 需要按"新 max"重新缩放
-        scale_old = np.exp(m - m_new)                         # (Tq,)
-        scale_old = np.where(np.isnan(scale_old), 0, scale_old)  # -inf - -inf 处理
-        # 本块的 exp(S - m_new)
-        P_b = np.exp(S - m_new[:, None])                      # (Tq, Bk)
-        # 累加
-        l = scale_old * l + np.sum(P_b, axis=-1)
-        O = scale_old[:, None] * O + P_b @ V_b
-        m = m_new
-
-    # 最终归一化
-    O = O / l[:, None]
-    return O
-
-
-def naive_attention(
-    Q: np.ndarray, K: np.ndarray, V: np.ndarray, causal: bool = True
-) -> np.ndarray:
-    """对照组: 显式 (T, T) 矩阵的标准做法。"""
-    Tq, D = Q.shape
-    Tk = K.shape[0]
-    S = (Q @ K.T) / np.sqrt(D)
-    if causal:
-        offset = Tk - Tq
-        for i in range(Tq):
-            for j in range(Tk):
-                if j > i + offset:
-                    S[i, j] = -np.inf
-    S = S - np.max(S, axis=-1, keepdims=True)
-    P = np.exp(S)
-    P = P / np.sum(P, axis=-1, keepdims=True)
-    return P @ V
+    for qs in range(0, Tq, block_q):                      # 外层: Q 块 (FA-2 顺序)
+        qe = min(Tq, qs + block_q)
+        Qb = Q[qs:qe]                                     # (bq, d)
+        Ob, lb = O[qs:qe], lse[qs:qe]                     # 视图: 本 Q 块的累加器, 内层循环里原地更新
+        for kb, ks in enumerate(range(0, Tk, block_k)):   # 内层: K/V 块
+            ke = min(Tk, ks + block_k)
+            if causal and ks > qe - 1 + offset:           # 块内最早的 key 也晚于块内最晚的 query
+                stats["skipped"] += n_kblocks - kb        # 后面的 K 块更晚, 一起跳过
+                break
+            S = Qb @ K[ks:ke].T / np.sqrt(d)              # (bq, bk) ← 唯一的 "attention 矩阵", 只有一块
+            stats["peak_elems"] = max(stats["peak_elems"], S.size)
+            if causal and ke - 1 > qs + offset:           # 块跨过对角线 → 逐元素 mask
+                i_abs = np.arange(qs, qe)[:, None] + offset        # (bq,1)
+                S = np.where(np.arange(ks, ke)[None, :] > i_abs, -np.inf, S)
+                stats["partial"] += 1
+            else:
+                stats["full"] += 1
+            # online softmax: 与 merge_attention 同一个公式, 只是新块不先归一化
+            # (省一次除法, 也避开 "整行被 mask → 0/0")
+            new_l = np.logaddexp(lb, _logsumexp(S))       # (bq,)
+            Ob[:] = np.exp(lb - new_l)[:, None] * Ob + np.exp(S - new_l[:, None]) @ V[ks:ke]  # (bq,bk)@(bk,dv)
+            lb[:] = new_l
+    return O, lse, stats

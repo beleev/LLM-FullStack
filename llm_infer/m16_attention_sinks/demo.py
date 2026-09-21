@@ -1,112 +1,147 @@
 """
-m16 demo — Attention Sinks / StreamingLLM: 无限流式输入下的有界 KV cache
+m16 demo — Attention Sinks / StreamingLLM: 无限流下的有界 KV cache
 
-问题:
-    KV cache 随上下文线性增长 (m01), 流式场景 (长对话/实时字幕) 迟早爆显存。
-    最朴素的办法是只保留最近 W 个 token 的滑动窗口 —— 但实测一滑就崩:
-    开头几个 token 被逐出后, 困惑度瞬间飙升。
+是什么: cache = [开头 S 个 sink token] + [最近 W 个 token], 位置按 cache 槽位重编号。
+瓶颈  : 显存 O(T) → O(S+W); 且位置永不超过 max_seq_len, 流可以无限长。
+为什么要留开头: softmax 权重和必须为 1, 训练后的模型把"无处可去"的注意力倒在开头几个 token 上
+        (attention sink); 逐出它们 = softmax 分母丢掉最大项, 剩余权重被整体放大, 输出畸变。
+本 demo:
+    [A] 真实 TinyLM + SinkCache (sink_cache.py): 1024 token 的流, 完整 / 纯窗口 / sink+窗口 三种策略的
+        PPL 与 KL。**TinyLM 是随机权重、没训练过, sink 现象不会出现** —— 如实打印, 只断言机制性质:
+        显存有界、流长 ≤ S+W 时与完整 cache 逐位相等、位置重编号后用 64 行的 RoPE 表跑 1024 步。
+    [B] 合成注意力分数 + **人工植入**的 sink: 演示 softmax 分母论证 (真实模型里这个 sink 是训练出来的)。
+盯住  : sink_cache.py 里的 `positions = arange(L)`; 本文件 [B] 里 `ks[0] = u * 16`。
+对应  : StreamingLLM / HF SinkCache / TensorRT-LLM sink_token_length。
 
-StreamingLLM (Xiao et al., 2023) 的发现 — attention sink:
-    softmax 要求注意力权重和为 1, 当一个 query 与谁都不相关时, 多余的
-    注意力必须有处可去。训练后的模型习惯把这部分"垃圾注意力"倾倒在
-    **开头几个 token** 上 (它们对所有后续位置可见, 是天然的锚点)。
-    开头 token 一旦被逐出, softmax 分母失去了最大的一项, 剩余权重被
-    强行放大重排 —— 输出分布整体畸变。
-
-解法 (本 demo 验证):
-    cache = [开头 S 个 sink token] + [最近 W 个 token]
-    显存 O(S+W) 有界, 输出与完整 cache 几乎一致。
-    (工程细节: 窗口滑动后, RoPE 位置按 cache 内的相对位置重新编号)
-
-后续演化:
-    GPT-OSS (2025) 把 sink 做成每个 head 一个**可学习的 logit**, 参与
-    softmax 分母但不输出 value —— 模型自己学会"把多余注意力丢进下水道"。
-
-运行:
-    python -m llm_infer.m16_attention_sinks.demo
-
-说明: 真实模型的 sink 现象来自预训练; 本 demo 用"给第一个 token 的 key
-      加上与平均 query 对齐的分量"来复现这一统计特征, 机制完全相同。
+运行: python -m llm_infer.m16_attention_sinks.demo
 """
 from __future__ import annotations
 
 import numpy as np
 
-from llm_infer.core.utils import banner, kv, softmax
+from llm_infer.core import ModelConfig, TinyLM, dense_attention, softmax
+from llm_infer.core.tiny_model import apply_rope, init_weights
+from llm_infer.core.utils import banner, kv
+from llm_infer.m16_attention_sinks.sink_cache import SinkCache, stream_step
+
+T, N_SINK, WINDOW = 1024, 4, 60          # 流长 = 16 × cache 预算
+BUDGET = N_SINK + WINDOW
 
 
-def attention_out(q: np.ndarray, ks: np.ndarray, vs: np.ndarray) -> np.ndarray:
-    """单 query 对一组 KV 的注意力输出: softmax(q·K^T/√d)·V。"""
-    scores = ks @ q / np.sqrt(len(q))
-    w = softmax(scores)
-    return w @ vs
+def log_softmax(z: np.ndarray) -> np.ndarray:
+    z = z - z.max(-1, keepdims=True)
+    return z - np.log(np.exp(z).sum(-1, keepdims=True))
 
 
-def sink_mass(q: np.ndarray, ks: np.ndarray, n_sink: int) -> float:
-    """完整 cache 下, 开头 n_sink 个位置吸收的注意力权重之和。"""
-    w = softmax(ks @ q / np.sqrt(len(q)))
-    return float(w[:n_sink].sum())
+def run_tinylm(seed: int, check_full: bool):
+    """一个权重 seed 上跑三种策略 → {策略: (PPL, KL→full, mean|Δlogit|)}, 只统计 t ≥ BUDGET (已开始逐出) 的步。"""
+    cfg = ModelConfig(max_seq_len=T)
+    lm = TinyLM(cfg, init_weights(cfg, seed))                       # 完整 cache 需要 T 行 RoPE 表
+    lm_small = TinyLM(ModelConfig(max_seq_len=BUDGET), lm.w)        # 同一份权重, RoPE 表只有 64 行
+
+    # 基线: core 的标准 KV cache (K 存 post-RoPE, 绝对位置)。流由基线模型自己采样 → 它的 PPL 最低
+    rng = np.random.RandomState(0)
+    stream, full, cache = [1], [], None
+    for _ in range(T):
+        logits, cache = lm.decode_step(stream[-1], cache) if cache else lm.forward(stream)
+        full.append(logits.reshape(-1))
+        stream.append(int(rng.choice(cfg.vocab_size, p=softmax(full[-1]))))
+    full, targets = np.array(full), np.array(stream[1:])            # (T, V), (T,)
+    lp_full = log_softmax(full)
+
+    def evaluate(out: np.ndarray):
+        lp = log_softmax(out)
+        nll = -lp[np.arange(T), targets]                            # teacher-forced: 真实下一个 token 的 NLL
+        kl = (np.exp(lp_full) * (lp_full - lp)).sum(-1)             # KL(full ‖ policy), (T,)
+        late = slice(BUDGET, T)
+        return float(np.exp(nll[late].mean())), float(kl[late].mean()), float(np.abs(out - full)[late].mean())
+
+    results = {"完整 cache": evaluate(full)}
+    for name, n_sink, window in (("纯窗口", 0, BUDGET), ("sink+窗口", N_SINK, WINDOW)):   # 同预算
+        c, out, max_len = SinkCache(cfg.n_layer, cfg.d_model, n_sink, window), [], 0
+        for tok in stream[:-1]:
+            out.append(stream_step(lm_small, c, tok))
+            max_len = max(max_len, len(c))
+        out = np.array(out)
+        assert max_len == BUDGET, "显存有界: cache 条目永不超过 n_sink + window"
+        assert np.abs(out[:BUDGET] - full[:BUDGET]).max() < 1e-4, "还没逐出时应与完整 cache 一致"
+        results[name] = evaluate(out)
+
+    mass = {}
+    if check_full:   # window=∞ 的 SinkCache: 槽位 == 绝对位置 → 必须复现 core 的标准 cache (验证"存未旋转 K + 每步重转")
+        c, out = SinkCache(cfg.n_layer, cfg.d_model, 0, T), []
+        for t, tok in enumerate(stream[:-1]):
+            w = [] if t + 1 in (64, 256, 1024) else None
+            out.append(stream_step(lm, c, tok, w))
+            if w:
+                mass[t + 1] = [float(x[:N_SINK].sum()) for x in w]  # 每层: 开头 4 个 token 吃掉的注意力
+        diff = float(np.abs(np.array(out) - full).max())
+        assert diff < 1e-4
+        kv("SinkCache(window=∞) vs core 标准 cache, max|Δlogit|", f"{diff:.1e}")
+
+        k = np.ones((1, cfg.d_model), dtype=np.float32)
+        try:
+            apply_rope(k, lm_small.cos, lm_small.sin, positions=np.array([T - 1]))
+            raise AssertionError("绝对位置本应越界")
+        except IndexError:
+            kv(f"RoPE 表仅 {BUDGET} 行: 绝对位置 {T - 1}", "IndexError (跑不了); 槽位重编号 → 上面两种有界策略全程正常")
+    return results, mass
 
 
 def main() -> None:
     banner("M16 - Attention Sinks / StreamingLLM")
 
+    # ================= [A] 真实 TinyLM + SinkCache =================
+    print(f"\n[A] TinyLM (随机权重) 流长 T={T}, cache 预算 {BUDGET} = sink {N_SINK} + 窗口 {WINDOW}; 纯窗口同预算 W={BUDGET}")
+    wins = 0
+    for i, seed in enumerate((42, 1, 2)):
+        results, mass = run_tinylm(seed, check_full=(i == 0))
+        if mass:
+            print("\n  完整 cache 下开头 4 个 token 的注意力占比 (逐层) vs 均匀注意力 4/T:")
+            for t, m in mass.items():
+                print(f"    T={t:>4}: " + "  ".join(f"{x:.4f}" for x in m) + f"   | 均匀 = {4 / t:.4f}")
+            print(f"\n  {'权重 seed':>8} | {'策略':<10} | {'PPL':>8} | {'KL→完整':>8} | {'mean|Δlogit|':>12} | cache 条目")
+        for name, (ppl, kl, drift) in results.items():
+            n = T if name == "完整 cache" else BUDGET
+            print(f"  {seed:>9} | {name:<10} | {ppl:>8.2f} | {kl:>8.4f} | {drift:>12.4f} | {n}")
+        wins += results["sink+窗口"][1] < results["纯窗口"][1]
+    print(f"\n  sink+窗口 的 KL 优于纯窗口: {wins}/3 个权重 seed  ← 如实报告, 不做断言")
+    print("  诚实结论: 随机权重的 TinyLM 没有 attention sink (开头 token 的注意力 ≈ 均匀水平), 注意力也没有局部性,")
+    print("  所以逐出任何 token 都伤, 留不留开头 4 个没有稳定差别。sink 是**训练**出来的统计特征, 见 [B]。")
+    print("  已断言 (机制性质): cache ≤ 64 条; 前 64 步与完整 cache 一致; window=∞ 复现标准 cache; 重编号后不越界。")
+
+    # ================= [B] 合成分数 + 人工植入的 sink =================
+    print("\n[B] softmax 分母论证 (合成 K/V, sink 是**人工植入**的: ks[0] 与平均 query 方向对齐)")
     rs = np.random.RandomState(0)
     d, t_max, window, n_sink = 32, 256, 32, 4
-
-    # 平均 query 方向 u; 第一个 token 的 key 与 u 强对齐 → 它吸走大部分注意力。
-    # (复现真实模型里 "开头 token 是注意力下水道" 的统计特征: StreamingLLM 实测
-    #  许多层 >70% 的注意力质量落在开头几个 token 上)
     u = rs.randn(d)
     u /= np.linalg.norm(u)
-    ks = rs.randn(t_max, d)
-    vs = rs.randn(t_max, d)
-    ks[0] = u * 16.0
+    ks, vs = rs.randn(t_max, d), rs.randn(t_max, d)                 # (T, d)
+    ks[0] = u * 16.0                                                # 植入: 第 0 个 key 与所有 query 强对齐
 
-    # 所有 query 都带一个稳定朝向 sink 的分量 (真实模型中这是训练出来的习惯)
     def new_query() -> np.ndarray:
-        return u * 3.0 + rs.randn(d) * 0.6
+        return (u * 3.0 + rs.randn(d) * 0.6)[None]                  # (1, d) 稳定朝向 sink + 噪声
 
-    # ---- 1) sink 现象: 第一个 token 吸收的注意力占比 ----
     q_probe = new_query()
-    print("\n[1] attention sink 现象 (完整 cache 下开头 4 个位置的注意力占比)")
     for t in (32, 64, 128, 256):
-        mass = sink_mass(q_probe, ks[:t], n_sink)
-        bar = "#" * int(mass * 40)
-        kv(f"上下文 T={t:>3}", f"{mass:5.1%}  {bar}")
+        w = dense_attention(q_probe, ks[:t], np.eye(t))[0]          # V=I → 输出即注意力权重 (t,)
+        kv(f"T={t:>3} 开头 {n_sink} 个位置的注意力占比", f"{w[:n_sink].sum():5.1%}  {'#' * int(w[:n_sink].sum() * 40)}")
 
-    # ---- 2) 两种有界 cache 策略的输出误差 (相对完整 cache, 16 个 query 平均) ----
-    def mean_errors(t: int, n_queries: int = 16) -> tuple[float, float]:
-        keep_a = list(range(n_sink)) + list(range(t - window, t))   # sink + 窗口
-        keep_b = list(range(t - window - n_sink, t))                # 纯窗口 (同预算)
-        errs_a, errs_b = [], []
-        for _ in range(n_queries):
-            q = new_query()
-            full = attention_out(q, ks[:t], vs[:t])
-            scale = np.linalg.norm(full)
-            errs_a.append(np.linalg.norm(attention_out(q, ks[keep_a], vs[keep_a]) - full) / scale)
-            errs_b.append(np.linalg.norm(attention_out(q, ks[keep_b], vs[keep_b]) - full) / scale)
-        return float(np.mean(errs_a)), float(np.mean(errs_b))
-
-    print("\n[2] 最新 token 的注意力输出平均误差 (vs 完整 cache, 16 个 query)")
-    print(f"  {'T':>5} | {'窗口+sink (S=4+W=32)':>22} | {'纯窗口 (W=36)':>16} | cache 条目")
-    last_errs = None
+    print(f"\n  最新 token 的注意力输出相对误差 (vs 完整 cache, 16 个 query 平均)")
+    print(f"  {'T':>5} | {'sink+窗口 (4+32)':>18} | {'纯窗口 (36)':>12}")
     for t in (64, 128, 192, 256):
-        err_a, err_b = mean_errors(t)
-        last_errs = (err_a, err_b)
-        print(f"  {t:>5} | {err_a:>21.2%} | {err_b:>15.2%} | "
-              f"{n_sink + window} (有界) vs {t} (线性)")
-
-    # ---- 3) 结论性断言 ----
-    err_sink, err_win = last_errs
-    assert err_sink < err_win / 3, "保留 sink 应当显著优于纯滑动窗口"
-
-    print("\n[3] 显存对比")
-    kv("完整 cache", f"O(T) — T={t_max} 时 {t_max} 条, 持续增长")
-    kv("sink + window", f"O(S+W) — 恒定 {n_sink + window} 条, 与流长度无关")
-
-    print("\n结论: 多花 4 个 token 的显存保住 softmax 的'下水道', 误差缩小约一个量级;")
-    print("      纯滑动窗口丢掉 sink 后, 剩余注意力被迫重新归一化, 输出整体畸变。")
+        keep_sink = np.r_[0:n_sink, t - window:t]
+        keep_win = np.r_[t - window - n_sink:t]                     # 同预算
+        errs = []
+        for _ in range(16):
+            q = new_query()
+            ref = dense_attention(q, ks[:t], vs[:t])                # (1, d)
+            errs.append([np.linalg.norm(dense_attention(q, ks[keep], vs[keep]) - ref) / np.linalg.norm(ref)
+                         for keep in (keep_sink, keep_win)])
+        err_sink, err_win = np.mean(errs, axis=0)
+        print(f"  {t:>5} | {err_sink:>17.2%} | {err_win:>11.2%}")
+    assert err_sink < err_win / 3, "有 sink 的注意力分布下, 保留 sink 应显著优于纯滑动窗口"
+    print("\n  纯窗口丢掉 sink 后 softmax 分母失去最大项, 剩余权重被迫放大重排 (误差 ≈100%); 多留 4 个 token 降到 4%~19%。")
 
 
 if __name__ == "__main__":

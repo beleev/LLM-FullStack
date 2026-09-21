@@ -168,6 +168,13 @@ x_{t-Δt} = x_t - Δt·v̂         # 直线反推</pre>
       </ul>
     </div>
 
+    <!-- 本章挂载的实验台 (data/labmap/*.js) 与章末自测 (data/quiz/*.js), 没配置时不渲染 -->
+
+    <LabMount />
+
+    <QuizCard />
+
+
     <ChapterNav
       :prev="{ name: 'moe', label: 'MoE 路由', hint: '语言侧的稀疏化与生成侧的连续化是两种「减算力」哲学' }"
       :next="{ name: 'train', label: '阶段 3 · 规模化训练', hint: '从模型结构进入分布式训练主循环' }"
@@ -176,6 +183,8 @@ x_{t-Δt} = x_t - Δt·v̂         # 直线反推</pre>
 </template>
 
 <script setup>
+import LabMount from '@/components/LabMount.vue'
+import QuizCard from '@/components/QuizCard.vue'
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'

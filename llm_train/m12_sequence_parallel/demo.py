@@ -1,125 +1,123 @@
 """
-M12 — Sequence / Context Parallelism (Ring Attention)
+M12 — 上下文并行 (Context Parallel): Ring Attention + zigzag 负载均衡
 
-长上下文训练的新瓶颈: T=128K 时, 单层注意力的激活 (Q/K/V 与 softmax 中间量)
-就能挤爆一张卡 —— 这次模型和 batch 都没问题, 是 **序列本身** 放不下。
-
-序列并行 (Megatron CP / Ring Attention, Liu et al. 2023) 把序列切成 D 段:
-    - 每张卡常驻自己那段的 Q_r / K_r / V_r  (显存 O(T/D))
-    - 注意力需要"我的 Q × 所有人的 K/V" → K/V 块在 D 张卡之间按环传递
-    - 每一步对收到的 KV 块算一次局部注意力, 用 **online softmax** 增量合并
-      (与 FlashAttention 的分块技巧完全相同, 只是块来自别的卡)
-
-    step 0:  卡 r 处理 KV_r       (自己的块)
-    step 1:  卡 r 处理 KV_{r-1}   (邻居寄来的)
-    ...
-    step D-1: 每张卡都见过了完整序列, 但**任何时刻**只持有 1/D 的 KV
-
-因果模型还能省一半: 块 j > 块 i 的 KV 对 Q_i 全不可见, 直接跳过。
-
-说明: 本 demo 用 list 模拟 D 张卡, "环传递" 就是数组下标轮转。
+命名: 目录沿用 sequence_parallel, 但这里做的是 **context parallel** —— 在注意力内部按序列切。
+      (Megatron 的 "sequence parallel" 指 TP 组内切 LayerNorm/Dropout 激活, 是另一回事;
+       另一条按序列切的路线是 Ulysses, 见 m16。)
+是什么: 序列切成 D 段, 每卡常驻自己的 Q/K/V; KV 块沿环传 D-1 次, 每到一块就用 online softmax 并入结果。
+解决的瓶颈: 长序列的激活显存 (每卡 O(T/D))。通信是邻居间 P2P, 可与计算重叠。
+关键公式: online softmax (同 FlashAttention):  m' = max(m, max s);  den' = den·e^{m-m'} + Σe^{s-m'};  acc 同理
+因果负载: 连续切分时 rank r 只有 r+1 个块要算 → 每一轮都有人在算整块, 墙钟时间一点不省;
+          zigzag 把序列切 2D 块, rank r 拿第 r 和第 2D-1-r 块 → 每卡每轮工作量完全相同。
+读代码盯住: `work[step][rank]` (每轮每卡算了多少个 q·k 对) 和它的 "每轮取 max 再求和"。
 """
 from __future__ import annotations
 
 import numpy as np
 
-from llm_train.core import banner, kv, max_abs_diff, set_seed
+from llm_train.core import banner, comm, kv, make_rng, max_abs_diff, ring_shift, softmax
 
 
-def full_attention(q: np.ndarray, k: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """单卡基线: 完整因果 softmax 注意力 (T×T 分数矩阵一次成形)。"""
+def full_attention(q, k, v):
+    """单卡基线: 一次成形的 [T, T] 因果注意力。"""
     t, d = q.shape
     scores = q @ k.T / np.sqrt(d)
-    scores[np.triu_indices(t, k=1)] = -np.inf      # 因果: 上三角屏蔽
-    scores -= scores.max(axis=1, keepdims=True)
-    w = np.exp(scores)
-    return (w / w.sum(axis=1, keepdims=True)) @ v
+    scores[np.triu_indices(t, k=1)] = -np.inf
+    return softmax(scores) @ v
 
 
-def ring_attention(
-    q: np.ndarray, k: np.ndarray, v: np.ndarray, world: int
-) -> tuple[np.ndarray, dict]:
-    """
-    Ring Attention: 序列均分到 world 张卡, KV 块沿环传递 world-1 次。
+def shard_positions(t_total: int, world: int, zigzag: bool):
+    """每个 rank 持有哪些 token 位置。"""
+    if not zigzag:
+        return np.split(np.arange(t_total), world)                       # D × [T/D], 连续
+    chunks = np.split(np.arange(t_total), 2 * world)                     # 2D × [T/2D]
+    return [np.concatenate([chunks[r], chunks[2 * world - 1 - r]]) for r in range(world)]   # 一头一尾配对
 
-    每张卡维护 online-softmax 的三件套 (与 FlashAttention 相同):
-        m     — 已见分数的逐行最大值   [t_local]
-        denom — 归一化分母 (指数和)    [t_local]
-        acc   — 未归一化的加权 V 累计  [t_local, d]
-    收到新 KV 块时按公式增量合并, 数值上与一次性 softmax 完全等价。
-    """
+
+def ring_attention(q, k, v, world: int, zigzag: bool = False):
     t_total, d = q.shape
-    t_local = t_total // world
+    pos = shard_positions(t_total, world, zigzag)
+    q_loc = [q[p] for p in pos]                                          # D × [T/D, d], 常驻不动
+    kv_blk = [np.concatenate([k[p], v[p]], axis=1) for p in pos]         # D × [T/D, 2d], 沿环流动
+    kv_pos = [p.copy() for p in pos]                                     # KV 块自带位置, 因果 mask 要用
 
-    def blocks(a: np.ndarray) -> list[np.ndarray]:
-        return [a[r * t_local : (r + 1) * t_local] for r in range(world)]
-
-    q_blk, k_blk, v_blk = blocks(q), blocks(k), blocks(v)
-
-    m = [np.full(t_local, -np.inf) for _ in range(world)]
-    denom = [np.zeros(t_local) for _ in range(world)]
-    acc = [np.zeros((t_local, d)) for _ in range(world)]
-    comm_floats = 0
-    skipped = 0
+    n_loc = t_total // world
+    m = [np.full(n_loc, -1e30) for _ in range(world)]                    # 已见分数的逐行最大值 (有限值, 防全 mask 行出 NaN)
+    den = [np.zeros(n_loc) for _ in range(world)]                        # softmax 分母
+    acc = [np.zeros((n_loc, d)) for _ in range(world)]                   # 未归一化的 Σ p·v
+    work = np.zeros((world, world), dtype=int)                           # [step, rank] → 本轮算的 q·k 对数
 
     for step in range(world):
         for r in range(world):
-            src = (r - step) % world          # 本步处理来自 src 卡的 KV 块
-            if src > r:
-                skipped += 1                  # 因果性: 未来块整块不可见, 不算
-                continue
-            scores = q_blk[r] @ k_blk[src].T / np.sqrt(d)   # [t_local, t_local]
-            if src == r:                      # 对角块: 块内仍要因果屏蔽
-                scores[np.triu_indices(t_local, k=1)] = -np.inf
-
-            # ---- online softmax 增量合并 ----
-            m_new = np.maximum(m[r], scores.max(axis=1))
-            scale = np.exp(m[r] - m_new)                  # 旧累计量的修正系数
-            p = np.exp(scores - m_new[:, None])
-            denom[r] = denom[r] * scale + p.sum(axis=1)
-            acc[r] = acc[r] * scale[:, None] + p @ v_blk[src]
+            mask = pos[r][:, None] >= kv_pos[r][None, :]                 # [T/D, T/D] 因果: q 位置 ≥ k 位置
+            if not mask.any():
+                continue                                                 # 整块在未来: 跳过 (但这一轮别的卡还在算)
+            work[step, r] = mask.sum()
+            kb, vb = kv_blk[r][:, :d], kv_blk[r][:, d:]
+            s = np.where(mask, q_loc[r] @ kb.T / np.sqrt(d), -np.inf)
+            m_new = np.maximum(m[r], s.max(axis=1))
+            fix = np.exp(m[r] - m_new)                                   # 旧累计量换到新基准
+            p = np.exp(s - m_new[:, None])
+            den[r] = den[r] * fix + p.sum(axis=1)
+            acc[r] = acc[r] * fix[:, None] + p @ vb
             m[r] = m_new
         if step < world - 1:
-            comm_floats += world * t_local * d * 2        # 每步全环传一轮 K+V
+            kv_blk = ring_shift(kv_blk)                                  # rank r 发给 r+1: [T/D, 2d]
+            kv_pos = [kv_pos[(r - 1) % world] for r in range(world)]     # 位置元数据跟着走 (字节可忽略)
 
-    out = np.concatenate([acc[r] / denom[r][:, None] for r in range(world)])
-    stats = {
-        "comm_floats": comm_floats,
-        "skipped_blocks": skipped,
-        "peak_kv_per_dev": t_local * d * 2,
-        "full_kv": t_total * d * 2,
-    }
-    return out, stats
+    out = np.empty_like(q)
+    for r in range(world):
+        out[pos[r]] = acc[r] / den[r][:, None]                           # 按原位置写回
+    return out, work
 
 
 def main() -> None:
-    banner("M12 - Sequence Parallel / Ring Attention")
+    banner("M12 - Context Parallel (Ring Attention + zigzag)")
 
-    rs = set_seed(11)
-    world, t_total, d = 4, 32, 16
-    q = rs.randn(t_total, d)
-    k = rs.randn(t_total, d)
-    v = rs.randn(t_total, d)
-
+    rs = make_rng(11)
+    world, T, d = 4, 32, 16
+    q, k, v = rs.randn(T, d), rs.randn(T, d), rs.randn(T, d)
     base = full_attention(q, k, v)
-    ring, stats = ring_attention(q, k, v, world)
 
-    print("\n[1] 正确性 (online softmax 与一次性 softmax 数值等价)")
-    kv("max |full - ring|", f"{max_abs_diff(base, ring):.2e}")
-    assert max_abs_diff(base, ring) < 1e-9
+    results = {}
+    for name, zz in [("连续切分", False), ("zigzag", True)]:
+        comm.reset()
+        out, work = ring_attention(q, k, v, world, zigzag=zz)
+        results[name] = (max_abs_diff(base, out), work, comm.total)
 
-    print("\n[2] 显存: 每张卡任何时刻只持有 1/D 的 KV")
-    kv("完整 KV (单卡基线)", f"{stats['full_kv']} floats")
-    kv(f"每卡常驻 KV (D={world})", f"{stats['peak_kv_per_dev']} floats (1/{world})")
+    print("\n[1] 正确性 (online softmax 跨块合并是精确的, 不是近似)")
+    for name, (diff, _, _) in results.items():
+        kv(f"max |full - ring| {name}", f"{diff:.1e}")
+        assert diff < 1e-12
 
-    print("\n[3] 通信与因果跳过")
-    kv("环传递轮数", f"{world - 1} (每步只和邻居收发, 可与计算重叠)")
-    kv("KV 环传递总量", f"{stats['comm_floats']} floats")
-    kv("因果性跳过的块", f"{stats['skipped_blocks']} / {world * world} (上三角整块不算)")
+    print("\n[2] 因果注意力的每卡工作量 (q·k 对数; 行 = 环上第几轮, 列 = rank)")
+    block = (T // world) ** 2
+    for name, (_, work, _) in results.items():
+        print(f"    {name}:")
+        for step, row in enumerate(work):
+            print(f"      step {step}: {row.tolist()}   本轮耗时 ∝ max = {row.max()}")
+    wall = {name: int(work.max(axis=1).sum()) for name, (_, work, _) in results.items()}
+    total = {name: int(work.sum()) for name, (_, work, _) in results.items()}
+    per_rank = {name: work.sum(axis=0) for name, (_, work, _) in results.items()}
+    kv("总计算量 (两者相同)", f"{total['连续切分']} 对 (非因果为 {T * T})")
+    kv("每卡总工作量 连续", per_rank["连续切分"].tolist())
+    kv("每卡总工作量 zigzag", per_rank["zigzag"].tolist())
+    kv("墙钟 Σ_step max_rank", f"连续 {wall['连续切分']} → zigzag {wall['zigzag']}  ({wall['连续切分'] / wall['zigzag']:.2f}x)")
+    kv("不利用因果性的墙钟", world * block)
 
-    print("\n  OK: 序列并行解决 '一条序列放不下一张卡' 的问题;")
-    print("      online softmax 让分块合并精确无损 —— 同一个技巧, 在单卡内是")
-    print("      FlashAttention (llm_infer/m11), 跨卡传块就是 Ring Attention。")
+    assert total["连续切分"] == total["zigzag"] == T * (T + 1) // 2
+    assert wall["连续切分"] == per_rank["连续切分"].max() > 0.85 * world * block, \
+        "连续切分: 计算省了一半, 墙钟却只省 ~10% —— 最后一张卡每轮都在算整块, 所有人等它"
+    assert per_rank["zigzag"].max() == per_rank["zigzag"].min(), "zigzag: 每卡工作量完全相同"
+    assert per_rank["连续切分"].max() > 3 * per_rank["连续切分"].min()
+    assert wall["zigzag"] < 0.6 * wall["连续切分"]
+
+    print("\n[3] 显存与通信")
+    kv("每卡常驻 KV", f"{T // world * d * 2} / {T * d * 2} floats (1/{world})")
+    kv("通信量", f"{results['zigzag'][2]:.0f} B/rank = (D-1) 轮 × 一个 KV 块; 与是否 zigzag 无关")
+    assert results["zigzag"][2] == results["连续切分"][2] == (world - 1) * (T // world) * 2 * d * 8
+
+    print("\n  OK: Ring Attention 精确等于完整注意力; 因果场景必须 zigzag (或 striped) 才能把省下的计算变成省下的时间。")
 
 
 if __name__ == "__main__":

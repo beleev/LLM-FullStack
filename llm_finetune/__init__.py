@@ -1,112 +1,59 @@
 """
-llm_finetune — 大模型微调教学章节
-==================================
+llm_finetune — 把预训练 LM 变成 "听指令 / 合偏好 / 会解题 / 更小" 的模型
 
-本章节是 ``llm_models`` 的后继: 已经能 "训练一个 LLM" 后, 真正落地到
-下游应用还需要 "把通用语言模型变成对话模型 / 领域模型 / 对齐模型"。
-这一步统称 **fine-tuning (微调)**, 是连接预训练与产品体验的关键环节。
+路线 (每一步解决上一步留下的问题):
+    SFT ─→ LoRA ─→ DoRA ─→ QLoRA          学会任务 → 省梯度与优化器显存 → 拆开长度与方向 → 连基座也压到 4 bit
+    Reward Model ─→ DPO ─→ SimPO / ORPO   偏好变标量分 → 跳过 RM 和 RL → 连 reference 也不要
+    GRPO ─→ DAPO / Dr.GRPO / GSPO         在线 RL + 可验证奖励, 组内均值替代 critic; 三个变体各修一个偏差
+    蒸馏 (forward KL) ─→ on-policy 蒸馏 (reverse KL)
 
-教学路线 (从基础到现代):
+所有方法共用一个可学习、依赖 prompt 的合成任务 (data/tasks.py), 验收指标是**留出集**上的 exact-match / 偏好准确率。
 
-    Full SFT       —— 全参监督微调, 概念最朴素 (loss-mask 在 prompt 上)
-        ↓
-    LoRA           —— 参数高效微调 (PEFT) 的事实标准, 在权重旁加低秩适配器
-        ↓
-    DPO            —— 离线偏好对齐, 跳过 reward model 与 RL
-        ↓
-    Reward Model   —— 把人类相对偏好蒸馏成标量分 (RLHF 第二阶段)
-        ↓
-    GRPO           —— 在线 RL: 组内相对优势替代 critic (DeepSeek-R1 配方)
-        ↓
-    Distillation   —— 大模型能力压进小模型 (软标签 + 温度)
-
-为什么挑这六个?
-    - 覆盖四类 **目标差异**: 任务对齐 / 资源效率 / 偏好对齐 / 能力迁移
-    - 各自代表了 finetune 的一个 "时代":
-      LoRA(2021) → SFT(2022) → RM+RLHF(2022) → DPO(2023) → GRPO(2024-25)
-      蒸馏(2015) 则贯穿始终, 在 R1 时代再次成为主角
-    - 都能在小尺寸 LLaMA 上 CPU 跑通, 教学闭环
-
-模块结构:
-    methods/        微调算法实现 (sft, lora, dpo, reward_model, grpo, distill)
-    data/           合成数据生成器 (instruction / preference / prompt)
-    utils/          参数管理工具 (冻结/统计/保存)
-    run_finetune/   可运行的端到端示例脚本
-
-设计原则:
-    - 复用 ``llm_models.training`` 的 Trainer/Config 抽象, 把 fine-tune 视为
-      "新的 LossComputer + 新的 DataGenerator", 保持开闭原则
-    - 所有示例统一使用 LLaMA mini 作为 base model (业界 finetune 的事实标准)
+与 llm_models.training.Trainer 的关系 (实话):
+    - SFT / LoRA / DoRA / QLoRA: 纯粹是 "新数据 + 同一个 loss", Trainer 原样复用。
+    - DPO / SimPO / ORPO / RM / 蒸馏: 一步里要跑多次前向 (chosen+rejected / ref / teacher)。
+      把这些前向包进一个 nn.Module (dpo.PairwiseForward, distill.TeacherStudent) 后, 同样复用 Trainer, 不复制训练循环。
+    - GRPO / on-policy 蒸馏: **不**用 Trainer。数据由当前策略现场采样, 且 GRPO 对同一批数据更新多次,
+      "取 batch → 前向 → 更新一次" 的约定不成立, 硬塞只会更难读。
 """
 
+from llm_finetune.data import (
+    SeqTask, make_labels, completion_mask,
+    InstructionDataGenerator, PreferenceDataGenerator, PromptDataGenerator,
+)
 from llm_finetune.methods.sft import SFTLoss
 from llm_finetune.methods.lora import (
-    LoRALinear,
-    apply_lora,
-    mark_only_lora_as_trainable,
-    merge_lora_weights,
-    get_lora_state_dict,
+    LoRALinear, apply_lora, mark_only_lora_as_trainable, merge_lora_weights, get_lora_state_dict,
+    ATTENTION_LINEARS, ALL_LINEARS,
 )
-from llm_finetune.methods.dpo import (
-    DPOLoss,
-    DPOTrainer,
-    compute_sequence_logprobs,
-)
-from llm_finetune.methods.reward_model import RewardModel, bradley_terry_loss
+from llm_finetune.methods.dora import DoRALinear
+from llm_finetune.methods.qlora import NF4Linear, apply_qlora, nf4_quantize, nf4_dequantize, weight_bytes
+from llm_finetune.methods.dpo import DPOLoss, PairwiseForward, compute_sequence_logprobs
+from llm_finetune.methods.simpo import SimPOLoss
+from llm_finetune.methods.orpo import ORPOLoss
+from llm_finetune.methods.reward_model import RewardModel, BradleyTerryLoss
 from llm_finetune.methods.grpo import (
-    GRPOTrainer,
-    completion_logprobs,
-    make_region_reward,
+    GRPOConfig, GRPOTrainer, VARIANTS, make_config, group_advantages, aggregate, completion_logprobs,
 )
-from llm_finetune.methods.distill import DistillLoss, soften_demo
-from llm_finetune.methods.qlora import (
-    QLoRALinear,
-    apply_qlora,
-    nf4_quantize,
-    nf4_dequantize,
-)
-from llm_finetune.data.instruction_data import InstructionDataGenerator
-from llm_finetune.data.preference_data import PreferenceDataGenerator
-from llm_finetune.data.prompt_data import PromptDataGenerator
-from llm_finetune.utils.param_utils import (
-    count_parameters,
-    freeze_module,
-    print_trainable_parameters,
-)
+from llm_finetune.methods.distill import DistillLoss, TeacherStudent
+from llm_finetune.methods.on_policy_distill import on_policy_distill_step, token_kl
+from llm_finetune.utils.param_utils import count_parameters, freeze_module, print_trainable_parameters
 
 __all__ = [
-    # SFT
-    "SFTLoss",
-    "InstructionDataGenerator",
-    # LoRA
-    "LoRALinear",
-    "apply_lora",
-    "mark_only_lora_as_trainable",
-    "merge_lora_weights",
-    "get_lora_state_dict",
-    # DPO
-    "DPOLoss",
-    "DPOTrainer",
-    "PreferenceDataGenerator",
-    "compute_sequence_logprobs",
-    # Reward Model
-    "RewardModel",
-    "bradley_terry_loss",
-    # GRPO
-    "GRPOTrainer",
-    "PromptDataGenerator",
-    "completion_logprobs",
-    "make_region_reward",
-    # Distillation
-    "DistillLoss",
-    "soften_demo",
-    # QLoRA
-    "QLoRALinear",
-    "apply_qlora",
-    "nf4_quantize",
-    "nf4_dequantize",
+    # 数据
+    "SeqTask", "make_labels", "completion_mask",
+    "InstructionDataGenerator", "PreferenceDataGenerator", "PromptDataGenerator",
+    # 监督 / 参数高效
+    "SFTLoss", "LoRALinear", "DoRALinear", "NF4Linear",
+    "apply_lora", "apply_qlora", "mark_only_lora_as_trainable", "merge_lora_weights", "get_lora_state_dict",
+    "ATTENTION_LINEARS", "ALL_LINEARS", "nf4_quantize", "nf4_dequantize", "weight_bytes",
+    # 离线偏好
+    "PairwiseForward", "DPOLoss", "SimPOLoss", "ORPOLoss", "compute_sequence_logprobs",
+    "RewardModel", "BradleyTerryLoss",
+    # 在线 RL
+    "GRPOConfig", "GRPOTrainer", "VARIANTS", "make_config", "group_advantages", "aggregate", "completion_logprobs",
+    # 蒸馏
+    "DistillLoss", "TeacherStudent", "on_policy_distill_step", "token_kl",
     # 工具
-    "count_parameters",
-    "freeze_module",
-    "print_trainable_parameters",
+    "count_parameters", "freeze_module", "print_trainable_parameters",
 ]

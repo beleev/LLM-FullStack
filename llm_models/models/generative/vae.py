@@ -1,26 +1,14 @@
 """
-Variational AutoEncoder (VAE) — Latent Diffusion 的前置压缩器
+VAE — Latent Diffusion 的前置压缩器 (Kingma & Welling 2013; Rombach et al. 2022)
 
-论文出处:
-    "Auto-Encoding Variational Bayes" (Kingma & Welling, 2013)
-    "High-Resolution Image Synthesis with Latent Diffusion Models"
-    (Rombach et al., CVPR 2022) 把 VAE 用作 SD 的潜空间压缩
+解决的问题: 在 512×512×3 像素上做扩散太贵; 先压到 64×64×4 的 latent (元素数 ÷48) 再扩散。
+为什么不是普通 AE: AE 的 latent 分布任意, 扩散模型无从假设; VAE 用 KL 把它拉向 N(0, I)。
 
-为什么扩散模型需要 VAE?
-    直接在像素空间 (512×512×3) 做扩散, 每步都要在 ~10⁵ 维张量上去噪, 算力爆炸。
-    Latent Diffusion 先用 VAE 把图像压到 (64×64×4) 的潜空间, 面积 ÷64,
-    扩散只在潜空间里做, 最后 decoder 还原为像素, 算力省 64×, 质量几乎无损。
+    μ, logσ² = Encoder(x);   z = μ + σ·ε, ε~N(0,I)      # 重参数化: 随机性挪到 ε, 梯度能穿过采样
+    loss = MSE(Decoder(z), x) + kl_weight · KL,   KL = -0.5·Σ(1 + logσ² - μ² - σ²)
 
-与普通 AE 的差别 (教学重点):
-    - AE 的 latent 可能散布在潜空间任意位置, 不好被扩散模型对齐 (分布未知)
-    - VAE 用 reparameterization: 让 encoder 输出 (μ, logσ²) 并从该高斯采样,
-      配合 KL(q || N(0, I)) 把潜分布拉近标准正态, 下游扩散就能默认 latent 服从
-      "接近正态"的分布, 训练更稳
-
-本文件提供 2D 图像 VAE, 结构参考 SD 1.5 的简化版:
-    - Encoder: 3 次 stride-2 卷积, 把 H×W 压到 H/8 × W/8 (教学用 4×, 可调)
-    - Decoder: 对应的反卷积 (ConvTranspose / Upsample+Conv) 还原
-    - 瓶颈: mean_head / logvar_head 两个 1×1 卷积产出参数
+关键数字: SD 的 kl_weight ~1e-6 —— 几乎就是 AE, 只要 latent 别离 N(0,I) 太远。
+读代码时盯住: ImageVAE.reparameterize, 以及 encoder 的两个 1×1 头 (mean_head / logvar_head)。
 """
 
 from typing import Dict, Tuple
@@ -75,8 +63,8 @@ class ImageVAEEncoder(nn.Module):
         self.logvar_head = nn.Conv2d(ch, latent_dim, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.trunk(x)
-        return self.mean_head(h), self.logvar_head(h)
+        h = self.trunk(x)                                   # [B, ch, H/2^L, W/2^L]
+        return self.mean_head(h), self.logvar_head(h)       # 2 × [B, latent_dim, H/2^L, W/2^L]
 
 
 class ImageVAEDecoder(nn.Module):
@@ -104,7 +92,7 @@ class ImageVAEDecoder(nn.Module):
             layers.append(_conv_block(ch // 2, ch // 2))
             ch //= 2
 
-        # 输出层: 回到 pixel 通道, 用 tanh 把 [−1, 1] 作为标准像素范围
+        # 输出层: 回到 pixel 通道 (forward 里再过 tanh → [-1, 1])
         layers.append(nn.Conv2d(ch, out_channels, kernel_size=3, padding=1))
 
         self.trunk = nn.Sequential(*layers)
@@ -158,9 +146,9 @@ class ImageVAE(nn.Module):
 
     @staticmethod
     def reparameterize(mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        std = torch.exp(0.5 * logvar)
+        std = torch.exp(0.5 * logvar)                       # logσ² → σ
         eps = torch.randn_like(std)
-        return mean + std * eps
+        return mean + std * eps                             # [B, latent_dim, h, w]
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         return self.decoder(z)

@@ -1,83 +1,68 @@
 #!/usr/bin/env python
 """
-QLoRA 训练示例: NF4 4-bit 基座 + LoRA 适配器
-=============================================
+QLoRA: 把基座的全部线性层压成 NF4, 看 (1) 整个模型省了多少 (2) 量化伤了多少能力 (3) 还能不能照常适配新任务。
 
-教学目标:
-    - NF4 量化误差有多大: 逐层对比 dequant(W) vs 原始 W
-    - 显存对账: 基座从 4 字节/参数 → ~0.56 字节/参数 (真 4bit 打包)
-    - 量化基座 + 高精度 LoRA 联合前向, loss 照常下降
-      (梯度只流过 LoRA 旁路, 量化权重是 buffer, 天然冻结)
-
-运行:
     python -m llm_finetune.run_finetune.qlora.train_qlora
 """
 
 import torch
 
-from llm_models.models.language_models.llama import LLaMA
-from llm_models.training import Trainer, TrainingConfig
-
 from llm_finetune import (
-    InstructionDataGenerator,
-    SFTLoss,
-    apply_qlora,
-    mark_only_lora_as_trainable,
-    print_trainable_parameters,
+    InstructionDataGenerator, NF4Linear, SeqTask, SFTLoss, apply_qlora, count_parameters,
+    mark_only_lora_as_trainable, merge_lora_weights, nf4_dequantize, nf4_quantize, weight_bytes,
 )
-from llm_finetune.methods.qlora import QLoRALinear
+from llm_finetune.run_finetune.common import fit, pretrained_base
+
+STEPS, RANK, LR = 300, 8, 1e-2
 
 
 def main() -> None:
-    torch.manual_seed(42)
-    vocab_size = 1000
+    torch.manual_seed(0)
+    old_task, task = SeqTask("copy"), SeqTask("sort")
+    model = pretrained_base()
+    probe = task.sample_prompts(8, "test")
 
-    cfg = TrainingConfig(
-        learning_rate=3e-3,           # 与 LoRA 同理: 参数空间小, lr 可以更大
-        batch_size=2, seq_len=32,
-        num_steps=50, warmup_steps=5, log_interval=10, seed=42,
-    )
+    # ---- 0) 打包的边界情况: block_size 为奇数 → 索引个数为奇数 ----
+    w = torch.randn(3, 5)
+    packed, scales = nf4_quantize(w, block_size=5)                    # 15 个索引 → 8 字节
+    w_hat = nf4_dequantize(packed, scales, w.shape, block_size=5)
+    assert packed.numel() == 8 and w_hat.shape == w.shape
+    assert (w_hat - w).norm() / w.norm() < 0.2, "奇数长度打包后反量化结果不对"
 
-    model = LLaMA(
-        vocab_size=vocab_size, d_model=256, n_heads=4, num_kv_heads=2,
-        num_layers=2, max_len=128, dropout=0.0,
-    )
+    # ---- 1) 量化全部线性层, 整模型对账 ----
+    fp32_bytes, em_fp32 = weight_bytes(model), old_task.exact_match(model)
+    w_orig = model.layers[0].ffn.w_up.weight.detach().clone()
+    apply_qlora(model, r=RANK, alpha=2 * RANK, block_size=64)
+    mark_only_lora_as_trainable(model)
 
-    # ---- 1) 量化误差: 先抽一层看 NF4 的保真度 ----
-    w_orig = model.layers[0].attn.w_q.weight.detach().clone()
+    n_q = sum(isinstance(m, NF4Linear) for m in model.modules())
+    adapter_bytes = count_parameters(model)["trainable"] * 4
+    base_bytes = weight_bytes(model) - adapter_bytes
+    rel_err = float((model.layers[0].ffn.w_up.base.weight - w_orig).norm() / w_orig.norm())
+    em_nf4 = old_task.exact_match(model)                              # B = 0: 此刻测到的就是 "纯量化" 的影响
+    print(f"量化了 {n_q} 个线性层; embedding / lm_head (共享) 与 RMSNorm 保持 fp32")
+    print(f"整模型权重: fp32 {fp32_bytes / 1024:.0f} KB → NF4 基座 {base_bytes / 1024:.0f} KB "
+          f"({fp32_bytes / base_bytes:.2f}×) + LoRA {adapter_bytes / 1024:.0f} KB")
+    print(f"单层相对量化误差 {rel_err:.1%}; 基座原任务 (copy) 留出集 EM: fp32 {em_fp32:.3f} → NF4 {em_nf4:.3f}")
 
-    apply_qlora(model, r=8, alpha=16, block_size=64)   # 替换 w_q/w_k/w_v/w_o
-    mark_only_lora_as_trainable(model)                 # 其余参数全部冻结
+    # ---- 2) 在量化基座上训练 LoRA ----
+    hist = fit(model, InstructionDataGenerator(task), SFTLoss(), STEPS, LR, log_interval=STEPS)
+    em = task.exact_match(model)
+    assert all(not p.requires_grad or "lora_" in n for n, p in model.named_parameters())
+    print(f"QLoRA 适配到 sort: loss {hist[0]['total_loss']:.3f} → {hist[-1]['total_loss']:.3f}, 留出集 EM {em:.3f}")
 
-    q_layer = model.layers[0].attn.w_q
-    w_deq = q_layer.dequantized_weight()
-    rel = (w_deq - w_orig).norm() / w_orig.norm()
-    print(f"NF4 量化相对误差 (layers.0.attn.w_q): {rel:.2%} "
-          f"(block_size=64, 16 个正态分位格点)")
+    # ---- 3) 合并: 反量化 → 加 ΔW → 普通 nn.Linear ----
+    with torch.no_grad():
+        before = model(probe)
+        merge_lora_weights(model)
+        gap = float((before - model(probe)).abs().max())
+    print(f"合并 (dequant → merge) 前后 logits 最大差 {gap:.1e}; 合并后模型回到 {weight_bytes(model) / 1024:.0f} KB 的高精度权重")
 
-    # ---- 2) 显存对账 ----
-    nf4_total, fp32_total = 0, 0
-    for m in model.modules():
-        if isinstance(m, QLoRALinear):
-            mem = m.memory_bytes()
-            nf4_total += mem["nf4_bytes"]
-            fp32_total += mem["fp32_bytes"]
-    print(f"被量化的基座: FP32 {fp32_total / 1024:.0f} KB → NF4 {nf4_total / 1024:.0f} KB "
-          f"({fp32_total / nf4_total:.1f}x 压缩, 含 scale 开销)")
-    print_trainable_parameters(model, name="QLoRA (NF4 基座 + LoRA r=8)")
-
-    # ---- 3) 训练: 梯度只流过 LoRA 旁路 ----
-    data_gen = InstructionDataGenerator(
-        vocab_size=vocab_size, batch_size=cfg.batch_size, seq_len=cfg.seq_len,
-        seed=cfg.seed,
-    )
-    trainer = Trainer(model, cfg, data_gen, SFTLoss())
-    metrics = trainer.train()
-
-    first, last = metrics[0]["total_loss"], metrics[-1]["total_loss"]
-    assert last < first, f"QLoRA loss 未下降: {first:.4f} → {last:.4f}"
-    print(f"\nQLoRA 通过: loss {first:.4f} → {last:.4f}")
-    print("65B 模型按此配方: 全参微调 780GB → QLoRA <48GB, 单卡可跑 (论文数字)。")
+    assert n_q == 7 * len(model.layers), "每个 block 应量化 4 个注意力投影 + 3 个 SwiGLU 矩阵"
+    assert fp32_bytes / base_bytes > 5, "整模型压缩比应 > 5× (理论上限 4 / 0.5625 = 7.1×)"
+    assert em_nf4 > 0.9, "NF4 不应毁掉基座已有的能力"
+    assert em > 0.2, f"QLoRA 没学到新任务: EM {em:.3f}"
+    assert gap < 1e-4 and not any(isinstance(m, NF4Linear) for m in model.modules())
 
 
 if __name__ == "__main__":

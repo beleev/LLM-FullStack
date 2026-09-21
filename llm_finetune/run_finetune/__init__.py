@@ -1,1 +1,1 @@
-"""可运行的端到端微调示例 (SFT / LoRA / DPO), 每个子目录一个完整脚本。"""
+"""可运行的端到端示例: common.py (共用小模型 / Trainer 封装 / SFT 热身) + 每种方法一个 train_<name>.py + readme.md。"""

@@ -1,23 +1,12 @@
 """
-通用 Transformer Block 模块 — Pre-LN 模板的依赖注入封装
+通用 Transformer Block — Pre-LN 模板 + 依赖注入
 
-抽出各模型重复出现的 Pre-LN 模板:
-    PreLNBlock:       Pre-LN Self-Attention + FFN  (Decoder-only / Encoder)
-    PreLNCrossBlock:  Pre-LN Self-Attention + Cross-Attention + FFN  (经典 Decoder)
-
-为什么是 Pre-LN 而非 Post-LN:
-    原始 Transformer (2017) 用 Post-LN: x = LN(x + sublayer(x))，
-    在大模型 / 长训练下数值不稳，需要 warmup。
-    Pre-LN (Xiong et al., 2020) 改为: x = x + sublayer(LN(x))，
-    残差路径上无 LN，梯度直接回传，训练显著更稳，已成现代 LLM 的事实标准。
-
-通过把 attn / ffn / norm_cls 作为依赖注入参数，可以组合出:
-    - GPT-3:        MHA + GeLU-FFN + LayerNorm
-    - LLaMA / Qwen2: GQA + SwiGLU  + RMSNorm
-    - DeepSeek V3:  MLA + SwiGLU  + RMSNorm
-    - 原始 Transformer Decoder: MHA + FFN + LayerNorm + CrossAttn
-
-模型差异集中在构造参数上，而不是散落在各自的 Block 类里 (面向组合编程)。
+是什么: PreLNBlock (self-attn + FFN) 与 PreLNCrossBlock (self-attn + cross-attn + FFN)。
+解决什么: Post-LN `x = LN(x + f(x))` 的残差主路上有 LN, 深层梯度不稳、必须 warmup;
+          Pre-LN `x = x + f(LN(x))` (Xiong et al., 2020) 主路是纯恒等, 梯度直通。
+怎么用: attn / ffn / norm_cls 由调用方注入 —— 模型间的差异全在构造参数里:
+    GPT-3 = MHA + GELU-FFN + LayerNorm;  LLaMA = GQA + SwiGLU + RMSNorm;  DeepSeek-V3 = MLA + MoE + RMSNorm
+读代码时盯住: `residual` —— 它从不经过 norm。
 """
 
 from typing import Callable, Optional
@@ -38,7 +27,7 @@ class PreLNBlock(nn.Module):
 
     Args:
         d_model: 模型维度
-        attn: 自注意力模块。必须实现 forward(q, k, v, mask, rope[, position_ids])
+        attn: 自注意力模块。必须实现 forward(q, k, v, mask, rope, position_ids[, cache])
               并返回张量 (不返回 tuple)
         ffn: 前馈模块。必须实现 forward(x) -> x
         norm_cls: 归一化工厂函数 (默认 LayerNorm；现代 LLM 通常传 RMSNorm)
@@ -66,11 +55,14 @@ class PreLNBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         rope: Optional[nn.Module] = None,
         position_ids: Optional[torch.Tensor] = None,
+        cache: Optional[dict] = None,
     ) -> torch.Tensor:
         # 子层 1: 自注意力分支 (Pre-LN: 归一化只作用于进入 attn 的拷贝)
         residual = x
         h = self.norm1(x)
-        h = self.attn(q=h, k=h, v=h, mask=mask, rope=rope, position_ids=position_ids)
+        # cache 只在给定时才下传: 不支持 KV cache 的 attn 模块 (教学版 MHA 等) 无需改签名
+        extra = {} if cache is None else {"cache": cache}
+        h = self.attn(q=h, k=h, v=h, mask=mask, rope=rope, position_ids=position_ids, **extra)
         x = residual + self.dropout(h)
 
         # 子层 2: FFN 分支

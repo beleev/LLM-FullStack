@@ -1,28 +1,14 @@
 """
-Qwen2.5-Omni 架构演示模块
+Qwen2.5-Omni — 全模态输入 + 文本/语音双输出的 Thinker-Talker 架构 (Xu et al., 阿里, 2025)
 
-论文出处:
-    "Qwen2.5-Omni Technical Report" (Xu et al., 2025, 阿里通义千问团队)
-    第一个开源支持 "文本+图像+音频+视频" 全模态输入与 "文本+流式语音" 输出的端到端模型
-
-核心创新 (相比 GPT-4o / Gemini 等闭源对手):
-    1) Thinker-Talker 双脑结构:
-       - Thinker: 大型 LLM 主干，吸收所有模态做"思考"，输出文本与隐状态
-       - Talker: 小型自回归解码器，只读 Thinker 的 hidden 来流式生成语音 codec token
-       为什么拆成两个? 因为语音生成是流式的 (要边想边说), 而文本理解是批量的;
-       解耦后 Talker 可以用极小模型实现低延迟流式输出，Thinker 专注质量
-    2) TMRoPE (Time-aligned M-RoPE):
-       在 M-RoPE 基础上把视频帧与音频片段按真实时间戳对齐到同一个时间轴,
-       让模型理解"画面里嘴巴动 == 同一时刻的语音"
-    3) 音频用 mel-spectrogram + Whisper 风格 encoder:
-       而非直接送波形 — 频域特征更紧凑、训练更稳，且能直接利用 ASR 预训练权重
-
-本文件采用早融合 + cross-attention 混合策略:
-    所有模态 token 拼到 Thinker 前缀 (早融合); Talker 通过 cross-attention
-    访问 Thinker 隐状态 (晚融合), 兼顾理解能力与流式生成
-
-通用编码器/投影器/重采样器抽到 multimodal.py; Thinker 直接复用 Qwen2VLDecoder,
-本文件只保留 Talker 和顶层胶水。
+是什么: Thinker = 吃 [图像; 视频; 音频; 文本] 前缀的 LLM (就是 Qwen2-VL 的 decoder), 输出文本;
+       Talker = 小型自回归 decoder, 通过 cross-attention 读 Thinker 的隐状态, 输出离散语音 codec token。
+解决了什么: 级联方案 (LLM 出文本 → 独立 TTS) 丢失语气/情绪, 且要等整句文本; Talker 直接读 Thinker 的隐状态
+           (比文本信息多), 并可边想边说 (流式)。拆成两个模型也让文本 loss 和语音 loss 互不干扰。
+关键公式: x = concat([vision; video; audio; text]) → Thinker → (text_logits, hidden)
+         audio_logits = Talker(codec_tokens, context=hidden);   loss = CE_text + λ·CE_audio  (λ=0.5)
+原版还有 TMRoPE (音视频按真实时间戳对齐位置); 本实现未做, 位置就是拼接后的下标。
+读代码时盯住: thinker_hidden —— 两个"大脑"之间唯一的连接。
 """
 
 import math
@@ -35,10 +21,7 @@ from llm_models.layers.core.attention import GroupedQueryAttention
 from llm_models.layers.core.blocks import PreLNCrossBlock
 from llm_models.layers.core.feedforward import SwiGLUFeedForward
 from llm_models.layers.core.normalization import RMSNorm
-from llm_models.layers.core.position_encoding import (
-    RotaryPositionalEncoding,
-    SinPositionalEncoding,
-)
+from llm_models.layers.core.position_encoding import RotaryPositionalEncoding, SinPositionalEncoding
 from llm_models.layers.multimodal import (
     ModalityProjector,
     PatchEmbed2D,
@@ -47,40 +30,20 @@ from llm_models.layers.multimodal import (
     PerceiverResampler,
 )
 from llm_models.models.multimodal.qwen2_vl import Qwen2VLDecoder
+from llm_models.utils.init import init_weights
 from llm_models.utils.masks import build_causal_mask, combine_causal_and_padding_mask
 
 
-# Thinker 与 Qwen2-VL 解码器同构 (decoder-only LLM + M-RoPE)
-# 仅用别名导出，避免重复实现。这也说明 Omni 的"理解侧"复用了 VL 的全部成熟设计
+# Thinker 与 Qwen2-VL 的 decoder 同构, 直接复用
 OmniThinkerDecoder = Qwen2VLDecoder
 
 
 class OmniTalkerDecoder(nn.Module):
     """
-    Talker — 流式语音解码器 (Qwen2.5-Omni 的"嘴巴")
+    Talker: 每层 = 因果 self-attn (GQA) + cross-attn (context = Thinker 隐状态) + SwiGLU, 全部 Pre-RMSNorm。
 
-    结构 (每层): self-attn -> cross-attn -> FFN，与经典 Transformer decoder 相同
-        x -> RMSNorm -> Masked Self-Attn (GQA) -> Add
-          -> RMSNorm -> Cross-Attn (context=Thinker hidden) -> Add
-          -> RMSNorm -> SwiGLU FFN -> Add
-
-    设计要点:
-        - 词表是离散语音 codec token (如 Encodec / SoundStream 输出的 1024 个码本索引)
-          不是文字; 由专门的 codec decoder 还原波形
-        - 通过 cross-attention 而非 prefix 注入 Thinker 隐状态:
-          (a) Talker 每生成一个语音 token 就要 cross 一次, 不污染自身上下文
-          (b) Thinker 隐状态可流式追加, Talker 边想边说
-          (c) Talker 可以做得很小 (低延迟), 与大 Thinker 解耦
-
-    Args:
-        vocab_size: 语音 codec 词表大小 (典型 1024)
-        d_model: 隐维度
-        n_heads: Q head 数
-        num_kv_heads: K/V head 数 (GQA, None 则等于 n_heads)
-        num_layers: 层数 (Talker 通常 12 层左右, 远少于 Thinker)
-        max_len: 最大音频 token 序列长度
-        dropout: Dropout 概率
-        use_rope: 是否使用 RoPE (否则使用 Sinusoidal)
+    词表是语音 codec 码本索引 (如 1024 个), 由外部 codec decoder 还原波形。
+    用 cross-attn 而非 prefix: Thinker 隐状态可以流式追加, 不占 Talker 自己的上下文; Talker 可以很小 (低延迟)。
     """
 
     def __init__(
@@ -137,31 +100,16 @@ class OmniTalkerDecoder(nn.Module):
         )
 
         self.ln_f = RMSNorm(d_model)
-        # Talker 通常不与 token_embedding 共享权重 — 因为语音 codec 词表与文本词表
-        # 完全不同; 共享反而会拖累训练
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)      # 不与 embedding 共享
 
-        causal = build_causal_mask(max_len, torch.device("cpu"))
-        self.register_buffer("causal_mask", causal, persistent=False)
+        self.register_buffer("causal_mask", build_causal_mask(max_len, torch.device("cpu")), persistent=False)
+        init_weights(self)
 
     def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.token_embedding(input_ids) * self._embed_scale
+        return self.token_embedding(input_ids) * self._embed_scale     # [B, T, D]
 
     def _causal_mask(self, seq_len: int) -> torch.Tensor:
-        if seq_len <= self.causal_mask.size(-1):
-            return self.causal_mask[:, :seq_len, :seq_len]
-        return build_causal_mask(seq_len, self.causal_mask.device)
-
-    @staticmethod
-    def _normalize_context_mask(
-        context_mask: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        """将 [B, S] padding mask 扩成 [B, 1, S] 便于广播到 [B, T, S]。"""
-        if context_mask is None:
-            return None
-        if context_mask.dim() == 2:
-            return context_mask.unsqueeze(1)
-        return context_mask
+        return self.causal_mask[:, :seq_len, :seq_len]                 # [1, T, T]
 
     def forward(
         self,
@@ -171,8 +119,7 @@ class OmniTalkerDecoder(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Talker 必须依赖 Thinker 的语义条件才能生成有意义的语音
-        # 否则就退化为无条件语音 LM, 失去 "想清楚再说" 的设计意图
+        """input_ids [B, T_a] (codec token), context [B, S, D] (Thinker 隐状态), context_mask [B, S] -> [B, T_a, V_audio]"""
         if context is None:
             raise ValueError("Talker 需要 context (Thinker 隐状态) 作为条件输入")
         if (input_ids is None) == (inputs_embeds is None):
@@ -189,12 +136,9 @@ class OmniTalkerDecoder(nn.Module):
         else:
             x = self.pos_encoder(x)
 
-        # 双 mask:
-        #   self_mask  — 自身因果 + padding (生成端约束)
-        #   cross_mask — 标记 context 中哪些位置可以 attend (来自 Thinker 的 padding)
-        causal = self._causal_mask(seq_len)
-        self_mask = combine_causal_and_padding_mask(causal, attention_mask)
-        cross_mask = self._normalize_context_mask(context_mask)
+        self_mask = combine_causal_and_padding_mask(self._causal_mask(seq_len), attention_mask)   # [B|1, T, T]
+        # cross-attn 只屏蔽 Thinker 侧的 padding: [B, S] -> [B, 1, S]
+        cross_mask = context_mask.unsqueeze(1) if context_mask is not None and context_mask.dim() == 2 else context_mask
 
         for layer in self.layers:
             x = layer(
@@ -211,27 +155,15 @@ class OmniTalkerDecoder(nn.Module):
 
 class Qwen2_5_OmniModel(nn.Module):
     """
-    Qwen2.5-Omni 顶层模型 — 全模态输入 + 文本/语音双输出
+    image ─ ViT ──────────┐
+    video ─ ViT(tubelet) ─┼ (Resampler) ─ Projector ─┐
+    audio ─ ViT(mel) ─────┘                          ├ concat ─ Thinker ─┬─ text_logits
+    text  ─ token embedding ─────────────────────────┘                   └─ hidden ─(cross-attn)─ Talker ─ audio_logits
 
-    融合策略:
-        - 输入侧: 早融合 (所有模态 token 拼到 Thinker 前缀, 共享因果注意力)
-        - 输出侧: 双头解耦
-            * text_logits  来自 Thinker — 给文本输出
-            * audio_logits 来自 Talker  — 通过 cross-attention 读 Thinker 隐状态
-              生成流式语音 codec token
-
-    数据流:
-        vision   -> Encoder -> (Resampler) -> Projector ─┐
-        video    -> Encoder -> (Resampler) -> Projector ─┤
-        audio    -> Encoder -> (Resampler) -> Projector ─┼── Concat ──┐
-        text_ids -> TokenEmbed                            ┘            │
-                                                                       ▼
-                                            Thinker (decoder-only LLM, return_hidden=True)
-                                                ├── text_logits
-                                                └── hidden_states ──► Talker (cross-attn) ──► audio_logits
+    拼接顺序固定为 vision → video → audio → text; 文本在最后, 因果 mask 下看得到全部模态前缀。
+    不传 audio_input_ids 就不跑 Talker (纯文本输出)。
     """
 
-    # 4 种模态用于 segment embedding 区分 — 视频与图像分开是因为它们时间属性不同
     MODALITY_VISION = 0
     MODALITY_VIDEO = 1
     MODALITY_AUDIO = 2
@@ -288,8 +220,10 @@ class Qwen2_5_OmniModel(nn.Module):
         use_modality_embedding: bool = True,
     ):
         super().__init__()
+        if use_mrope:
+            raise ValueError("本教学实现的 Omni.forward 不构造 [3, B, T] position_ids, use_mrope 未接通 (M-RoPE 演示见 qwen2_vl)")
 
-        # --- Vision: 静态图像 (RGB), 与 Qwen2-VL 视觉端同构 ---
+        # --- Vision ---
         self.vision_encoder = PatchTransformerEncoder(
             patch_embed=PatchEmbed2D(
                 input_size=vision_image_size,
@@ -310,9 +244,7 @@ class Qwen2_5_OmniModel(nn.Module):
             vision_d_model, text_d_model, projector_hidden_dim
         )
 
-        # --- Audio: 输入是 mel-spectrogram (1 通道二维张量), 不是原始波形 ---
-        # 频域特征更紧凑 (16kHz 1 秒波形 16000 点 -> 100 帧 mel), 模型训练更稳
-        # 也方便复用 Whisper 等预训练 encoder 权重
+        # --- Audio: mel 声谱图当作 1 通道图像切 patch (1 s 波形 16000 点 → 100 帧 mel, 紧凑得多) ---
         self.audio_encoder = PatchTransformerEncoder(
             patch_embed=PatchEmbed2D(
                 input_size=audio_spec_size,
@@ -333,7 +265,7 @@ class Qwen2_5_OmniModel(nn.Module):
             audio_d_model, text_d_model, projector_hidden_dim
         )
 
-        # --- Video: 用 PatchEmbed3D (tubelet) 同时处理时间与空间, 节省 token 数 ---
+        # --- Video: tubelet (时间×空间) 切块 ---
         self.video_encoder = PatchTransformerEncoder(
             patch_embed=PatchEmbed3D(
                 video_size=video_size,
@@ -355,7 +287,7 @@ class Qwen2_5_OmniModel(nn.Module):
             video_d_model, text_d_model, projector_hidden_dim
         )
 
-        # --- Thinker: 全模态理解主干, 直接复用 VL 解码器 (decoder-only LLM + M-RoPE) ---
+        # --- Thinker ---
         self.thinker = Qwen2VLDecoder(
             vocab_size=vocab_size,
             d_model=text_d_model,
@@ -368,7 +300,7 @@ class Qwen2_5_OmniModel(nn.Module):
             use_mrope=use_mrope,
         )
 
-        # --- Talker: 流式语音解码器, 通常做得比 Thinker 小以降低延迟 ---
+        # --- Talker (通常比 Thinker 小得多) ---
         if talker_d_model is None:
             talker_d_model = text_d_model
 
@@ -383,18 +315,15 @@ class Qwen2_5_OmniModel(nn.Module):
             use_rope=use_rope,
         )
 
-        # 维度桥接: 当 Talker 比 Thinker 窄时, 把 Thinker 隐状态线性投到 Talker 维度
-        # 仅当维度不一致才创建, 同维度时省去这次投影
+        # Talker 与 Thinker 维度不同时, 先把 hidden 线性投到 Talker 维度
         self.thinker_to_talker: Optional[nn.Linear] = None
         if talker_d_model != text_d_model:
             self.thinker_to_talker = nn.Linear(text_d_model, talker_d_model, bias=False)
 
-        # --- Modality Embedding (可选) ---
         self.use_modality_embedding = use_modality_embedding
-        if use_modality_embedding:
-            self.modality_embedding = nn.Embedding(4, text_d_model)
-        else:
-            self.modality_embedding = None
+        self.modality_embedding = nn.Embedding(4, text_d_model) if use_modality_embedding else None
+
+        init_weights(self)
 
     @staticmethod
     def _maybe_resampler(
@@ -404,7 +333,7 @@ class Qwen2_5_OmniModel(nn.Module):
         num_layers: int,
         dropout: float,
     ) -> Optional[PerceiverResampler]:
-        """工厂函数: num_latents <= 0 表示该模态不启用 Resampler (token 直接送 LLM)。"""
+        """num_latents <= 0 ⇒ 该模态不用 Resampler。"""
         if not num_latents or num_latents <= 0:
             return None
         return PerceiverResampler(
@@ -422,60 +351,11 @@ class Qwen2_5_OmniModel(nn.Module):
         resampler: Optional[nn.Module],
         projector: nn.Module,
     ) -> torch.Tensor:
-        """统一三阶段编码流水线 (encoder -> resampler? -> projector), 各模态共用。"""
+        """encoder -> (resampler) -> projector: x -> [B, N, D_text]"""
         tokens = encoder(x)
         if resampler is not None:
             tokens = resampler(tokens)
         return projector(tokens)
-
-    def _build_modality_embeddings(
-        self,
-        batch_size: int,
-        segments: List[Tuple[int, int]],
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        按 segments 顺序为每段填充对应模态 ID, 然后查表得到 modality embedding。
-        segments 形如 [(MODALITY_VISION, 64), (MODALITY_TEXT, 128), ...],
-        最终输出 [B, T_total, D] 与拼接后的 combined_embeds 同形, 直接相加即可。
-        """
-        if self.modality_embedding is None:
-            raise ValueError("modality_embedding 未启用")
-        ids = [
-            torch.full(
-                (batch_size, seg_len), modality_id,
-                dtype=torch.long, device=device,
-            )
-            for modality_id, seg_len in segments
-        ]
-        return self.modality_embedding(torch.cat(ids, dim=1))
-
-    def _build_attention_mask(
-        self,
-        batch_size: int,
-        segments: List[Tuple[int, int]],
-        text_attention_mask: Optional[torch.Tensor],
-        device: torch.device,
-    ) -> Optional[torch.Tensor]:
-        """
-        非文本模态固定长度无 padding, 直接全 1; 文本段沿用调用者给的 mask。
-        最后按 segments 顺序拼成 [B, T_total] 的有效位掩码。
-        """
-        if text_attention_mask is None:
-            return None
-        masks = []
-        for modality_id, seg_len in segments:
-            if modality_id == self.MODALITY_TEXT:
-                masks.append(text_attention_mask)
-            else:
-                # 视觉/视频/音频经过 Resampler 后是定长 token, 全部有效
-                masks.append(
-                    torch.ones(
-                        batch_size, seg_len, device=device,
-                        dtype=text_attention_mask.dtype,
-                    )
-                )
-        return torch.cat(masks, dim=1)
 
     def forward(
         self,
@@ -489,78 +369,50 @@ class Qwen2_5_OmniModel(nn.Module):
         return_dict: bool = True,
     ):
         """
-        Args:
-            input_ids:           文本 [B, T_text]
-            images:              图像 [B, 3, H, W] (可选)
-            audio_spectrograms:  mel 声谱图 [B, 1, F, T_a] (可选)
-            videos:              视频 [B, 3, T_v, H, W] (可选)
-            text_attention_mask: 文本 padding mask [B, T_text]
-            audio_input_ids:     传入则同时跑 Talker 生成 audio_logits, 否则只输出文本
-            audio_attention_mask: Talker 自注意力的 padding mask
+        input_ids [B, T]; images [B, 3, H, W]; audio_spectrograms [B, 1, F, T_a]; videos [B, 3, T_v, H, W] (后三者可选)
+        audio_input_ids [B, T_audio]: 给了才跑 Talker
+        -> text_logits [B, N_total, V], audio_logits [B, T_audio, V_audio] 或 None, thinker_hidden [B, N_total, D]
         """
-        batch_size = input_ids.size(0)
-        text_embeds = self.thinker.embed_tokens(input_ids)
+        B = input_ids.size(0)
+        parts: List[Tuple[int, torch.Tensor]] = []                     # (模态 id, [B, N, D]) 按固定顺序
+        for modality, x, enc, res, proj in (
+            (self.MODALITY_VISION, images, self.vision_encoder, self.vision_resampler, self.vision_projector),
+            (self.MODALITY_VIDEO, videos, self.video_encoder, self.video_resampler, self.video_projector),
+            (self.MODALITY_AUDIO, audio_spectrograms, self.audio_encoder, self.audio_resampler, self.audio_projector),
+        ):
+            if x is not None:
+                parts.append((modality, self._encode_modality(x, enc, res, proj)))
+        parts.append((self.MODALITY_TEXT, self.thinker.embed_tokens(input_ids)))
 
-        # 按固定顺序拼接: vision -> video -> audio -> text
-        # segment_info 记录每段长度, 便于后续构造 modality embedding 与 mask
-        modality_embeds_list: List[torch.Tensor] = []
-        segment_info: List[Tuple[int, int]] = []
+        combined_embeds = torch.cat([e for _, e in parts], dim=1)      # [B, N_total, D]
+        device = combined_embeds.device
 
-        if images is not None:
-            vision_embeds = self._encode_modality(
-                images, self.vision_encoder, self.vision_resampler, self.vision_projector
-            )
-            modality_embeds_list.append(vision_embeds)
-            segment_info.append((self.MODALITY_VISION, vision_embeds.size(1)))
+        if self.modality_embedding is not None:
+            modality_ids = torch.cat([torch.full((e.size(1),), m, device=device) for m, e in parts])   # [N_total]
+            combined_embeds = combined_embeds + self.modality_embedding(modality_ids)
 
-        if videos is not None:
-            video_embeds = self._encode_modality(
-                videos, self.video_encoder, self.video_resampler, self.video_projector
-            )
-            modality_embeds_list.append(video_embeds)
-            segment_info.append((self.MODALITY_VIDEO, video_embeds.size(1)))
+        # 非文本段没有 padding: mask 全 1
+        combined_attention_mask = None
+        if text_attention_mask is not None:
+            combined_attention_mask = torch.cat(
+                [
+                    text_attention_mask if m == self.MODALITY_TEXT else text_attention_mask.new_ones(B, e.size(1))
+                    for m, e in parts
+                ],
+                dim=1,
+            )                                                          # [B, N_total]
 
-        if audio_spectrograms is not None:
-            audio_embeds = self._encode_modality(
-                audio_spectrograms,
-                self.audio_encoder, self.audio_resampler, self.audio_projector,
-            )
-            modality_embeds_list.append(audio_embeds)
-            segment_info.append((self.MODALITY_AUDIO, audio_embeds.size(1)))
-
-        # 文本始终放最后 — 因果注意力下文本可看到全部模态前缀
-        modality_embeds_list.append(text_embeds)
-        segment_info.append((self.MODALITY_TEXT, text_embeds.size(1)))
-
-        combined_embeds = torch.cat(modality_embeds_list, dim=1)
-
-        combined_attention_mask = self._build_attention_mask(
-            batch_size, segment_info, text_attention_mask, combined_embeds.device,
-        )
-
-        if self.use_modality_embedding:
-            modality_embeds = self._build_modality_embeddings(
-                batch_size, segment_info, combined_embeds.device,
-            )
-            combined_embeds = combined_embeds + modality_embeds
-
-        # Thinker 同时返回 logits 与 hidden_states:
-        #   logits      给文本输出 (与普通 LLM 一致)
-        #   hidden      作为 Talker 的 cross-attention 条件源
         text_logits, thinker_hidden = self.thinker(
             inputs_embeds=combined_embeds,
             attention_mask=combined_attention_mask,
             return_hidden=True,
         )
 
-        # Talker 是按需开启的: 训练或推理纯文本任务时可以省去, 节省显存与算力
         audio_logits = None
         if audio_input_ids is not None:
-            context = thinker_hidden
-            # 维度桥接 (Talker 比 Thinker 窄时)
+            context = thinker_hidden                                   # [B, N_total, D]
             if self.thinker_to_talker is not None:
                 context = self.thinker_to_talker(context)
-            # context_mask 复用 combined_attention_mask: 让 Talker 忽略 Thinker 中的 padding
             audio_logits = self.talker(
                 input_ids=audio_input_ids,
                 context=context,
