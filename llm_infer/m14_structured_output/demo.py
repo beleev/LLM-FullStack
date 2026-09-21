@@ -60,7 +60,7 @@ def main() -> None:
     hist = {n: n_pairs.count(n) for n in sorted(set(n_pairs))}
     kv("pair 数分布 {pairs: 次数}", hist)
     assert all(1 <= n <= MAX_PAIRS for n in n_pairs), "每个输出都应是 1..max_pairs 对的合法 JSON"
-    assert set(hist) == {1, 2, 3}, "修复后 1 对也应出现 (旧 bug: string 结尾被迫 ≥2 对)"
+    assert set(hist) == {1, 2, 3}, "1 对也应出现 (两个分支若用不同的计数, string 结尾会被迫 ≥2 对)"
 
     # ---- [2] token 级预编译 --------------------------------------------
     print("\n[2] 多字符词表 → 预编译 mask_table[state] / next_state[state, token]")

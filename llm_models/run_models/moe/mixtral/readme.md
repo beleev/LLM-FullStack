@@ -42,7 +42,7 @@ aux loss 极值 (E=8, K=2): 均衡 = 2.0000 (应为 K), 坍塌 = 8.0000 (应为 
 Step [   1/50] | lm_loss: 6.9587 | aux_loss: 2.0113        ← ln 1000 = 6.9078
 Step [  50/50] | lm_loss: 4.6168 | aux_loss: 2.0084
 ```
-修复前 (默认 N(0,1) embedding + weight tying + ·sqrt(D)) 第 1 步 lm_loss 是 **126.98**, 50 步后 total_loss 还有 117.99。
+不这样做时 (默认 N(0,1) embedding + weight tying + ·sqrt(D)) 第 1 步 lm_loss 是 **126.98**, 50 步后 total_loss 还有 117.99。
 数据是固定的一个随机 batch: loss 下降只说明模型在背这个 batch, 不代表学到了语言。
 
 ## 常见误区

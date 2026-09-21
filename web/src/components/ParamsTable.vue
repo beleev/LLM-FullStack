@@ -9,7 +9,9 @@
         </tr>
       </thead>
       <tbody>
-        <tr v-for="(p, i) in rows" :key="i">
+        <tr v-for="(p, i) in rows" :key="i"
+            :class="{ lit: active === p.name }"
+            @mouseenter="$emit('hover', p.name)" @mouseleave="$emit('hover', '')">
           <td>
             <code class="inline">{{ p.name }}</code>
             <div v-if="p.note" class="note">{{ p.note }}</div>
@@ -53,9 +55,11 @@ import { computed } from 'vue'
 import ShapeTuple from './ShapeTuple.vue'
 import { evalExpr, computeParamCount, formatParams } from '@/data/inspector.js'
 
+defineEmits(['hover'])
 const props = defineProps({
   params:    { type: Array, required: true },
   ctx:       { type: Object, required: true },
+  active: { type: String, default: '' },
   breakdown: { type: String, default: null },
   cache:     { type: Object, default: null }, // { expr, note }
 })
@@ -131,4 +135,6 @@ const cacheNum = computed(() => {
 }
 .breakdown .eq { color: var(--text-dim); margin: 0 6px; }
 .breakdown .accent-val { color: var(--accent); }
+tbody tr.lit { background: color-mix(in srgb, var(--warn) 14%, transparent); }
+tbody tr { transition: none; }
 </style>

@@ -504,3 +504,11 @@ export function computeParamCount(param, ctx) {
   if (dims.some(d => typeof d !== 'number')) return null
   return dims.reduce((a, b) => a * b, 1)
 }
+
+/** 一个形状有多少个元素。用来按比例画张量大小, batch 维不计 —— 只比形状本身。 */
+export function numelOf(shape, ctx) {
+  return formatShape(shape, ctx).reduce((n, v) => {
+    const x = typeof v === 'number' ? v : Number(String(v).replace(/[^\d]/g, '')) || 1
+    return n * x
+  }, 1) / (ctx.B || 1)
+}

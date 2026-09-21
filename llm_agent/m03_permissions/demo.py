@@ -66,8 +66,8 @@ def main() -> None:
 
     print("\n[3] auto 模式: 按风险分级, 危险词只看 shell command / 文件 path")
     auto = PermissionGate("auto")
-    show(auto, ToolCall("search_docs", {"query": "tokenizer bpe secret sauce"}), "allow", "auto")  # 旧版误杀
-    show(auto, ToolCall("calculator", {"expr": "5 > 3"}), "allow", "auto")  # 旧版误杀 (含 '>')
+    show(auto, ToolCall("search_docs", {"query": "tokenizer bpe secret sauce"}), "allow", "auto")  # 只按子串匹配会误杀: "tokenizer" 里有 "token"
+    show(auto, ToolCall("calculator", {"expr": "5 > 3"}), "allow", "auto")  # 同理: "5 > 3" 里有 ">"
     show(auto, ToolCall("write_note", {"text": "bounded write"}), "allow", "auto")
     show(auto, ToolCall("shell", {"command": "cat token.txt > /tmp/x"}), "deny", "auto")
     show(auto, ToolCall("shell", {"command": "ls"}), "deny", "human")  # 高风险且拿不准 → 问人; 没人 → fail closed

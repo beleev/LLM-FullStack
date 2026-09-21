@@ -2,7 +2,7 @@
 <template>
   <LabFrame
     title="KV 体积 — MHA / GQA / MQA / MLA 各占多少显存"
-    sub="同一个 attention 数学, 只是「cache 里存什么」不同。上图是每 token 的 KV 字节; 下图每个小格 = 一条序列在所选上下文长度下的 KV, 竖线是留给 KV 的显存预算 —— 左右拖动它, 看每种结构能同时放下几条序列。"
+    sub="同一个 attention 数学, 只是「cache 里存什么」不同。上图是每 token 的 KV 字节。下图每个小格 = 一条序列在所选上下文长度下的 KV, 竖线是留给 KV 的显存预算。左右拖动这条竖线, 看每种结构能同时放下几条序列。"
     module="llm_infer/m18"
     run="python -m llm_infer.m18_kv_attention_variants.demo"
     :challenge="{

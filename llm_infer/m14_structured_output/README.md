@@ -48,7 +48,7 @@ python -m llm_infer.m14_structured_output.demo
   字符额度时也合法 (当作 4 个字母), 额度不够就非法 —— demo 里它在 24 个状态下合法。
 - "约束不改变分布": mask 后重新归一化, 会放大模型本来很小的概率; 同一字符串有多种分词
   (`{"` vs `{`+`"`), 强制走模型不习惯的分词会伤质量 (token healing 要解决的问题)。
-- 旧版 bug: value 写完后能否接 `,`/`}` 的判断, string 分支用 `n_pairs`、number 分支用
+- 容易写错的地方: value 写完后能否接 `,`/`}` 的判断, 若 string 分支用 `n_pairs`、number 分支用
   `n_pairs+1` → string 结尾时被迫 ≥2 对, 且能写出 max_pairs+1 对。现统一到 `_separators()`。
 
 ## 自测题

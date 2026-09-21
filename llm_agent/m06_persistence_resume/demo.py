@@ -52,7 +52,7 @@ def main() -> None:
         for record in lines:
             print("  " + json.dumps(record, ensure_ascii=False)[:150])
         kinds = [b["type"] for r in lines if isinstance(r["content"], list) for b in r["content"]]
-        assert kinds == ["tool_use", "tool_result"], kinds  # 旧版只有工具结果, 看不到模型发起的调用
+        assert kinds == ["tool_use", "tool_result"], kinds  # 只记工具结果的话, 看不到模型发起过什么调用, 这种 transcript 对真实 API 也不合法
 
         print("\n[2] session B: 新进程读回 transcript 继续; 引用'刚才的结果'")
         agent_b = Agent(

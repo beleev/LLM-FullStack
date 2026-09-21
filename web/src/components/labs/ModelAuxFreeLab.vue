@@ -11,7 +11,7 @@
     run="python -m llm_models.run_models.moe.deepseek.train_deepseek"
     :challenge="{
       ask: '两种方法都能把 max/mean 压到 1.2 左右 (256 个 token 的抽样噪声下限)。先猜: “路由分数被改动量” 这一项, 两者分别是多少? 再把 γ 拖到 0.1 看会发生什么。',
-      answer: 'Aux-loss-free 的偏置 b 只加在 top-k 的排序分数上, 门控权重仍取自原始 sigmoid 分数, 所以分数改动量恒为 0 —— 均衡和语言建模目标互不干扰。Aux loss 则是往总 loss 里加 α·E·Σf_e·P_e, 梯度直接把热门专家的路由分数往下压: 负载平了, 但 “这个 token 本该更信任哪个专家” 的信息也被改了, α 大了伤效果、小了不均衡。γ=0.1 时偏置每步跳 0.1, 而 sigmoid 分数之间的差距也就 0.1 量级, 于是每步都矫枉过正, 负载来回震荡; 因为只用 sign, 步长与 batch 大小无关, 好调, 但必须足够小 (DeepSeek-V3 用 0.001)。',
+      answer: 'Aux-loss-free 的偏置 b 只加在 top-k 的排序分数上, 门控权重仍取自原始 sigmoid 分数, 所以分数改动量恒为 0 —— 均衡和语言建模目标互不干扰。Aux loss 则是往总 loss 里加 α·E·Σf_e·P_e, 梯度直接把热门专家的路由分数往下压。负载是平了, 但 “这个 token 本该更信任哪个专家” 的信息也被改了。α 大了伤效果、小了不均衡。γ=0.1 时偏置每步跳 0.1, 而 sigmoid 分数之间的差距也就 0.1 量级, 于是每步都矫枉过正, 负载来回震荡。因为只用 sign, 步长与 batch 大小无关, 好调, 但必须足够小 (DeepSeek-V3 用 0.001)。',
     }"
   >
     <template #controls>

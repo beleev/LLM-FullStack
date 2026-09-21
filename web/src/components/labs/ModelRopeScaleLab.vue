@@ -11,7 +11,7 @@
     run="python -m llm_models.run_models.foundation.rope_scaling.infer_rope_scaling"
     :challenge="{
       ask: '扩展倍数拖到 8, 位置 m 拖到目标长度 16384。依次切换四种方案, 先猜: 哪种没有红柱但 “相邻 token 分辨率” 最差? 哪种分辨率满分却还剩红柱?',
-      answer: 'PI (位置内插) 把所有频率一律 ÷8: 角度全部回到训练范围, 没有红柱, 但最高频也被 ÷8 —— 相邻两个 token 的转角差只剩 1/8, 模型分不清 “紧挨着” 和 “隔几个”, 必须微调才能恢复。NTK-aware 改的是 base: 最高频不动 (分辨率 100%), 最低频恰好 ÷8, 但中间那些 “没转满一圈” 的维度只被压了 8^(2i/(d−2)) < 8 倍, 仍然越界 —— 还剩红柱。YaRN 按 “训练期转了几圈” 分段: 转够 32 圈的高频原样外推, 不足 1 圈的低频按 PI ÷s, 中间线性过渡, 两头都保住; 再乘 mscale = 0.1·ln s + 1 补偿长上下文下 softmax 变平。',
+      answer: 'PI (位置内插) 把所有频率一律 ÷8: 角度全部回到训练范围, 没有红柱。但最高频也被 ÷8, 相邻两个 token 的转角差只剩 1/8。模型于是分不清 “紧挨着” 和 “隔几个”, 必须微调才能恢复。NTK-aware 改的是 base: 最高频不动 (分辨率 100%), 最低频恰好 ÷8, 但中间那些 “没转满一圈” 的维度只被压了 8^(2i/(d−2)) < 8 倍, 仍然越界 —— 还剩红柱。YaRN 按 “训练期转了几圈” 分段: 转够 32 圈的高频原样外推, 不足 1 圈的低频按 PI ÷s, 中间线性过渡, 两头都保住。再乘 mscale = 0.1·ln s + 1, 补偿长上下文下 softmax 变平。',
     }"
   >
     <template #controls>
@@ -78,7 +78,7 @@ import { clamp, range } from '@/utils/labmath.js'
 
 const D = 64, NF = D / 2, BASE = 10000, L = 2048, PMAX = 32768, BETA_FAST = 32, BETA_SLOW = 1 // 与 infer_rope_scaling 同设定
 const MODES = [
-  { id: 'none', label: '不缩放 (直接外推)', note: '直接外推: 高频维度转过无数圈, 什么角度都见过, 没事; 低频维度训练时只走过一小段弧, 超长后走到弧外 —— 注意力分数失真, 困惑度爆炸。' },
+  { id: 'none', label: '不缩放 (直接外推)', note: '直接外推: 高频维度转过无数圈, 什么角度都见过, 没事。低频维度训练时只走过一小段弧, 超长后走到弧外, 注意力分数失真, 困惑度爆炸。' },
   { id: 'pi', label: 'PI 位置内插', note: 'PI: θ′ = θ/s, 等价于把位置 m 压成 m/s。所有角度回到训练范围, 但高频也被压, 局部顺序信息被抹糊。' },
   { id: 'ntk', label: 'NTK-aware', note: "NTK-aware: base′ = base·s^(d/(d−2))。θ₀ 不变、θ_last 恰好 ÷s, 中间按指数过渡 —— 免微调就能用, 但中段低频压得不够。" },
   { id: 'yarn', label: 'YaRN', note: 'YaRN (NTK-by-parts): 按训练期圈数 r 分段, r>32 不动, r<1 按 PI ÷s, 中间线性混合; 另乘 mscale 调 softmax 温度。' },

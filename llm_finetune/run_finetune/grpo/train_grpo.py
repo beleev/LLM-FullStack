@@ -52,7 +52,7 @@ def diagnostics(policy, task) -> None:
     assert tv["z/T"] < tv["z"]
     policy.train()
     seqs = policy.generate(prompt.repeat(4, 1), 3, temperature=T).clone()
-    assert policy.training, "generate() 结束后应恢复调用前的 train 状态 (旧版会把模型永久留在 eval)"
+    assert policy.training, "generate() 结束后应恢复调用前的 train 状态 (否则采样一次就把模型永久留在 eval)"
     with torch.no_grad():
         assert not torch.allclose(completion_logprobs(policy, seqs, prompt.size(1), T),
                                   completion_logprobs(policy, seqs, prompt.size(1), 1.0))

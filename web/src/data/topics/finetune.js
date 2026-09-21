@@ -68,7 +68,7 @@ loss = cross_entropy(logits.reshape(-1, V), labels.reshape(-1),
         {
           title: '买的是显存和分发, 不是速度',
           key: true,
-          body: '同一基座从 copy 适配到 sort, 各 300 步: 全参 99,648 个可训参数 / Adam 状态 778 KB / 留出集 EM 0.809; LoRA r=8 只有 19,456 个参数 / 152 KB, lr 拉到 1e-2 也才 EM 0.352。旧版 README 里"LoRA 收敛更快"是病态初始化加 10× 学习率造出来的假象, 已经删掉。',
+          body: '同一基座从 copy 适配到 sort, 各 300 步: 全参 99,648 个可训参数 / Adam 状态 778 KB / 留出集 EM 0.809; LoRA r=8 只有 19,456 个参数 / 152 KB, lr 拉到 1e-2 也才 EM 0.352。"LoRA 收敛更快"是个流行说法, 但在初始化正常、同看留出集的条件下站不住。',
         },
       ],
       links: [
@@ -103,7 +103,7 @@ W <- W + (alpha / r) * (B @ A)`,
       question: '同样 16 个码点, 为什么按分位数摆比等间距好? block 为什么不能太大也不能太小?',
       code: 'llm_finetune/methods/qlora.py · llm_finetune/run_finetune/qlora/train_qlora.py',
       points: [
-        { title: '码点跟着密度走', body: '权重大多挤在 0 附近。NF4 的 16 个码点取标准正态的等概率分位数, 中间密两端疏, 每个码被用到的概率都接近 1/16; 等间距 INT4 有好几个码浪费在几乎没有权重的两端。' },
+        { title: '码点跟着密度走', body: '权重大多挤在 0 附近。NF4 的 16 个码点取标准正态的等概率分位数, 中间密两端疏。每个码被用到的概率都接近 1/16。等间距 INT4 则有好几个码浪费在几乎没有权重的两端。' },
         {
           title: '账要算整个模型',
           key: true,
@@ -150,7 +150,7 @@ y = x @ w_hat.T + (alpha / r) * (x @ A.T) @ B.T     # base 冻结, 只训 A/B`,
         {
           title: '两个量在 LoRA 里被绑住了',
           key: true,
-          body: '全参微调时, 一行权重的长度变化和方向变化基本各走各的; LoRA 的 ΔW = BA 是加性的, 想"只转方向不改长度", ΔW 必须精确落在一个点上。DoRA 把两件事拆开: 归一化之后 BA 只剩方向, 长度交给 m。',
+          body: '全参微调时, 一行权重的长度变化和方向变化基本各走各的。LoRA 的 ΔW = BA 是加性的: 想"只转方向不改长度", ΔW 必须精确落在一个点上。DoRA 把两件事拆开: 归一化之后 BA 只剩方向, 长度交给 m。',
         },
         { title: '归一化顺手做了梯度投影', body: 'V = W₀ + (α/r)BA 被除以自己的行范数, loss 对 V 的梯度里径向那一份自动消掉 —— 低秩容量全花在转方向上。反传时分母 .detach(), 省一整份 [d_out, d_in] 的梯度显存, 效果几乎不变。' },
         { title: '参数几乎白送, 时间不白送', body: '比 LoRA 每层多 d_out 个参数 (本仓库 19,456 → 20,736, 多 1,280 个)。代价在训练: 归一化作用在整行上, 每步都要显式构造 [d_out, d_in] 的 W′, 拆不成两次小 matmul。merge 完就是普通 Linear, 推理零开销。' },
@@ -199,7 +199,7 @@ y = x @ W.T                                # 归一化作用于整行, 每步都
         { from: 'SFT 终态', to: 'policy / reference', body: 'policy 可训, ref 冻结 + eval + no_grad。ref 若被注册成子模块, 会进 optimizer、被 .train() 切模式, 所以代码里故意把它塞在 tuple 里。' },
         { from: 'make_labels', to: 'compute_sequence_logprobs', body: '同样忽略 prompt 和 pad。多盖一位会丢掉 log p(y₁|x) —— 上下文相同, 但 chosen 与 rejected 的 y₁ 可以不同, 这一项恰恰是区分两者的。' },
         { from: 'DPOLoss', to: 'SimPO / ORPO', body: '同一份数据、同一个 logsigmoid 外壳, 换的是送进去的 z 和要不要 ref。' },
-        { from: 'PairwiseForward', to: '通用 Trainer', body: '把 "policy 前向 + ref 前向" 包成一个 nn.Module, Trainer 一行不改; 旧版 DPOTrainer 里复制的训练循环已删。' },
+        { from: 'PairwiseForward', to: '通用 Trainer', body: '把 "policy 前向 + ref 前向" 包成一个 nn.Module, Trainer 一行不改, 不用为 DPO 单写一套训练循环。' },
       ],
       sourceRows: [
         { concept: 'logprob 汇总', code: 'llm_finetune/methods/dpo.py:compute_sequence_logprobs', takeaway: '返回 [B], 保留逐样本粒度。用 cross_entropy(reduction="sum") 会把整个 batch 加成一个数, 没法逐对相减。' },
@@ -271,7 +271,7 @@ loss = -logsigmoid(z).mean()      # DPO / SimPO 共用的外壳`,
       widgets: ['GrpoLab', 'SoftmaxTempLab'],
       title: 'RM · GRPO · 蒸馏 — 从偏好到能力迁移',
       subtitle: '三件事: 标注有噪声时 RM 最多学到多大分差、GRPO 的 baseline 从哪来、蒸馏的 KL 项为什么要乘 T²。',
-      tldr: 'RM 把"A 比 B 好"学成一个能随时调用的标量分 (留出集偏好准确率 0.549 → 0.930); GRPO 用同题 G 条回复的组内均值当 baseline, 把 PPO 的 critic 整个省掉; 蒸馏用温度软化的 teacher 分布, 给 student 比硬标签密得多的监督。',
+      tldr: 'RM 把"A 比 B 好"学成一个能随时调用的标量分, 留出集偏好准确率 0.549 → 0.930。GRPO 用同题 G 条回复的组内均值当 baseline, 把 PPO 的 critic 整个省掉。蒸馏用温度软化的 teacher 分布, 给 student 比硬标签密得多的监督。',
       question: 'GRPO 砍掉 critic 之后 baseline 从哪来? 标注有 20% 概率标反时, RM 学到的分差会停在哪?',
       code: 'llm_finetune/methods/reward_model.py · llm_finetune/methods/grpo.py · llm_finetune/methods/distill.py',
       points: [
@@ -325,7 +325,7 @@ loss.backward(); opt.step()                # 5. 一次更新`,
         {
           title: '两处偏置藏在分母里',
           key: true,
-          body: '1/|o_i| 让答错的长回复每个 token 罚得更轻 —— 实测 3-token 回复的单 token 权重是 9-token 的 3.0 倍, 等于鼓励"错就错得长一点"; ÷σ 给几乎全对、几乎全错的题加权 (难题比中等题的权重 0.66, 去掉 σ 后只有 0.44)。Dr.GRPO 把两个分母都换成常数。',
+          body: '1/|o_i| 让答错的长回复每个 token 罚得更轻: 实测 3-token 回复的单 token 权重是 9-token 的 3.0 倍, 等于鼓励"错就错得长一点"。÷σ 给几乎全对、几乎全错的题加权 —— 难题比中等题的权重 0.66, 去掉 σ 后只有 0.44。Dr.GRPO 把两个分母都换成常数。',
         },
         { title: '比率的粒度', body: '奖励是整条序列给的, token 级 ρ_t 却是单样本噪声估计。GSPO 改用 s = exp(mean_t log ρ_t), 整条回复共用一个权重一起裁剪: 实测 std log ρ 从 0.067 降到 0.027 (约小 √C 倍), 所以它的裁剪区间也要跟着收窄到 0.05。' },
       ],
@@ -372,14 +372,14 @@ for _ in range(K):                                    # 同一批样本更新 K 
     'finetune-onpolicy-distill': {
       title: 'on-policy 蒸馏 · 学生自己写, 老师逐 token 打分',
       subtitle: '用 KL 写在哪一侧解释两种蒸馏的性格差异, 再挑出容量不够的学生该用哪一种。',
-      tldr: '离线蒸馏在老师写的前缀上教学生 (forward KL, 摊开盖住所有峰); on-policy 让学生先自己生成, 再在自己走到的每个位置上对齐老师 (reverse KL, 钻进一个峰)。实测样本合格率 0.059 → 0.402。',
+      tldr: '离线蒸馏在老师写的前缀上教学生 —— forward KL, 摊开盖住所有峰。on-policy 让学生先自己生成, 再在自己走到的每个位置上对齐老师 —— reverse KL, 钻进一个峰。实测样本合格率 0.059 → 0.402。',
       question: '容量不够的学生, 该摊开盖住老师的所有答法, 还是挑一种答到位? 这跟 KL 写在哪一侧有什么关系?',
       code: 'llm_finetune/methods/on_policy_distill.py · llm_finetune/methods/distill.py',
       points: [
         {
           title: 'KL 的方向决定性格',
           key: true,
-          body: 'KL(p‖q) = Σ p·log(p/q): 谁写在前面, 期望就在谁的分布上取。forward KL 在老师的样本上取期望 —— 老师有质量而学生没有的地方惩罚趋于无穷, 学生被迫全覆盖, 代价是往两峰之间的低谷里也放概率, 采样时半路串台。reverse KL 在学生自己的样本上取期望 —— 学生不去的地方权重为 0, 于是它缩进一个峰。',
+          body: 'KL(p‖q) = Σ p·log(p/q): 谁写在前面, 期望就在谁的分布上取。forward KL 在老师的样本上取期望: 老师有质量而学生没有的地方, 惩罚趋于无穷。学生被迫全覆盖, 代价是往两峰之间的低谷里也放概率, 采样时半路串台。reverse KL 在学生自己的样本上取期望 —— 学生不去的地方权重为 0, 于是它缩进一个峰。',
         },
         { title: '分布错配', body: '离线蒸馏只见过老师的前缀; 推理时学生走进自己的前缀, 那是从没被教过的状态, 错误一步步累积。on-policy 直接在学生的前缀上训练, 训练分布就是推理分布。' },
         { title: '稠密 + on-policy, 但会丢多样性', body: 'RL 每条序列只有 1 个标量奖励; on-policy 蒸馏每个 token 位置都有老师的完整 V 维分布, 而且是解析求 KL, 不用 REINFORCE。实测合格率 0.402 vs 离线 0.059, reverse KL 0.51 vs 2.04; 代价是老师 30% 概率的少数派答法被压到 log π = −33 (离线只到 −17)。' },
@@ -418,7 +418,7 @@ loss.backward(); opt.step()`,
     'finetune-rlvr': {
       title: '看题的可验证奖励 · 别让 RL 只学会一个常数',
       subtitle: '跑 RL 之前先算一个数: 常数基线。它决定那条漂亮的 reward 曲线值不值钱。',
-      tldr: '奖励必须是 (prompt, completion) 的函数。"输出落在词表后半区就给分"这类区域奖励, 最优策略是无视 prompt 的常数输出, reward 能涨到 1.0 却什么都没证明; 换成"答案 = f(prompt)"之后, 常数策略的上限掉回 1/类别数。',
+      tldr: '奖励必须是 (prompt, completion) 的函数。"输出落在词表后半区就给分"这类区域奖励, 最优策略是无视 prompt 的常数输出。reward 能涨到 1.0, 却什么都没证明。换成"答案 = f(prompt)"之后, 常数策略的上限掉回 1/类别数。',
       question: '一条一路涨到 1.0 的 reward 曲线, 怎么分辨"学会按题作答"和"学会了一个 unigram 偏好"?',
       code: 'llm_finetune/data/tasks.py · llm_finetune/data/prompt_data.py · llm_finetune/methods/grpo.py',
       points: [
@@ -431,7 +431,7 @@ loss.backward(); opt.step()`,
         { title: '真实 RLVR 天然看题', body: '数学答案比对、单元测试、格式校验都依赖题目本身。自己造玩具任务时要主动保证这一点: 本仓库的 SeqTask 有 13⁶ ≈ 480 万种 prompt, 训练集与留出集按 token 和 mod 5 不相交, 背不下来。' },
       ],
       links: [
-        { from: '旧版区域奖励', to: 'SeqTask.verify', body: 'reward_fn 的签名从 (completion) 变成 (prompts, completions); 旧的区域奖励已从仓库移除。' },
+        { from: 'SeqTask.verify', to: 'reward_fn(prompts, completions)', body: '奖励函数必须同时看到 prompt 和 completion。只看 completion 的奖励是个 bandit —— 常数策略就能拿满分, 检验不出模型有没有在读题。' },
         { from: 'PromptDataGenerator', to: 'SeqTask', body: 'prompt 里编码题目 (copy / reverse / sort 一段序列), 答案由程序算出。' },
         { from: '组内零方差', to: 'DAPO 动态采样', body: '看题任务早期常见"整组全错": 这些组优势全为 0, 不产生梯度, 见 GRPO 进阶一章。' },
         { from: 'verify', to: '训练与验收', body: '同一个判分器既当奖励也当留出集指标 —— 前提是它真的依赖 prompt。' },
@@ -461,7 +461,7 @@ best_const = max(sum_reward(prompts, full_like(c)).mean() for c in range(10))
     // ───────────────────────── 压轴: 训练脚本与选型 ─────────────────────────
     'finetune-runs': {
       title: '训练脚本与落盘 · 11 种方法的代价结构',
-      subtitle: '在"有什么数据 / 有多少显存 / 能不能在线采样"之后直接点名方法, 并说出它每步几次前向、常驻几份权重、最后落盘什么。',
+      subtitle: '在"有什么数据 / 有多少显存 / 能不能在线采样"之后, 直接点名方法。还要说出它每步几次前向、常驻几份权重、最后落盘什么。',
       tldr: '方法之间的真正区别不在 loss 写得好不好看, 在代价结构: 要不要常驻 reference model、要不要在线采样、落盘是全量权重还是 adapter。实测 DPO 每步 2 次前向 / 常驻 778 KB / 5.4 s, SimPO 与 ORPO 1 次 / 389 KB / 4.0 s。',
       question: '手上只有 (问, 答) 且显存紧张, 该用哪个? 换成成对偏好呢? 换成"答案能被程序判对错"呢?',
       code: 'llm_finetune/run_finetune/{sft,lora,dora,qlora,rm,dpo,simpo_orpo,grpo,distill,on_policy_distill}/train_*.py',

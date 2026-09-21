@@ -10,7 +10,7 @@
     run="python -m llm_train.m15_fp4_microscaling.demo"
     :challenge="{
       ask: '先选 FP8 E4M3: outlier 要多大, 整张量 scale 才开始把别的元素冲成 0? 再换 MXFP4 —— 为什么 FP4 的 block 必须小到 16~32?',
-      answer: 'E4M3 自带约 2^15~2^17 的动态范围: outlier 在 1 万倍以内, 整张量 scale 和 block scale 几乎打平 (m13 的训练消融里 4.54e-4 vs 4.61e-4); 到 10 万倍才有约 18% 的元素归零, 100 万倍几乎全灭 —— block scaling 在 FP8 上是给极端 outlier 上的保险, 不是日常收益。FP4 E2M1 只有 ±{0.5,1,1.5,2,3,4,6}, 动态范围才 12 倍: outlier 只要比邻居大十几倍, 共享 scale 的邻居就大片归零, 所以 block 必须很小; 代价是每 block 多存 8 bit 的 scale (32 → +0.25 bit/元素, 16 → +0.5)。NVFP4 的 scale 带尾数, 能把 amax 精确对到 6; MXFP4 的 scale 只能是 2 的幂, amax/scale 落在 (6,8) 时最大值自己还会被饱和截断。',
+      answer: 'E4M3 自带约 2^15~2^17 的动态范围。outlier 在 1 万倍以内时, 整张量 scale 和 block scale 几乎打平 (m13 的训练消融里 4.54e-4 vs 4.61e-4)。到 10 万倍才有约 18% 的元素归零, 100 万倍几乎全灭。所以 block scaling 在 FP8 上是给极端 outlier 上的保险, 不是日常收益。FP4 E2M1 只有 ±{0.5,1,1.5,2,3,4,6}, 动态范围才 12 倍: outlier 只要比邻居大十几倍, 共享 scale 的邻居就大片归零, 所以 block 必须很小; 代价是每 block 多存 8 bit 的 scale (32 → +0.25 bit/元素, 16 → +0.5)。NVFP4 的 scale 带尾数, 能把 amax 精确对到 6; MXFP4 的 scale 只能是 2 的幂, amax/scale 落在 (6,8) 时最大值自己还会被饱和截断。',
     }"
   >
     <template #controls>

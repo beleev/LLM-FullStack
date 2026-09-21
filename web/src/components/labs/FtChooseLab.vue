@@ -12,7 +12,7 @@
     run="python -m llm_finetune.run_all"
     :challenge="{
       ask: '只勾「成对偏好」, 把显存预算从 1600 KB 往下拖。最先掉队的是哪一个? 到 1200 KB 时还剩谁? 拿掉的那份权重原本在干什么?',
-      answer: 'DPO 最先掉队 —— 它要常驻 policy + ref 两份权重 (389 + 389 = 778 KB), 再加全参 Adam 状态 778 KB, 合计 1556 KB。SimPO / ORPO / RM 都只要一份权重, 1167 KB 就够。ref 干的事有两件: 一是当锚, 不让 policy 漂离 SFT 起点; 二是顺手抵消长度红利 (它对同一条长回答也给出同样低的 Σlog p, 相减就消了)。拿掉 ref 就得请人接班: SimPO 用长度归一化 + 目标间隔 γ, ORPO 用 NLL 项当锚。实测代价写在结果里 —— 留出集 EM: ORPO 0.543 > DPO 0.121 > SimPO 0.023, SimPO 什么锚都没有, 掉得最惨。',
+      answer: 'DPO 最先掉队 —— 它要常驻 policy + ref 两份权重 (389 + 389 = 778 KB), 再加全参 Adam 状态 778 KB, 合计 1556 KB。SimPO / ORPO / RM 都只要一份权重, 1167 KB 就够。ref 干的事有两件。一是当锚, 不让 policy 漂离 SFT 起点。二是顺手抵消长度红利: ref 对同一条长回答也给出同样低的 Σlog p, 相减就消了。拿掉 ref 就得请人接班: SimPO 用长度归一化 + 目标间隔 γ, ORPO 用 NLL 项当锚。实测代价写在结果里 —— 留出集 EM: ORPO 0.543 > DPO 0.121 > SimPO 0.023, SimPO 什么锚都没有, 掉得最惨。',
     }"
   >
     <template #controls>

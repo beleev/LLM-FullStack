@@ -10,7 +10,7 @@
     run="python -m llm_agent.m11_orchestrator.demo"
     :challenge="{
       ask: '初始状态就是 m11 demo 的情形 (3 个子任务、各读 1 份短文档): orchestrator 总 token 更多。现在把「读几份文档」和「每份文档」都拖大。orchestrator 的总 token 什么时候比单 agent 多, 什么时候反而少? 最后把「worker 多探索」拖到 3×。',
-      answer: '活少、文档短时 orchestrator 更贵: 每个 worker 都要重建上下文 (system + 任务简报), 这份固定开销占了主导 —— m11 demo 就是这种情况 (770 vs 413)。活一多, 单 agent 的账是平方增长的: 每一轮都要重发此前读过的全部文档, 而每个 worker 只重发自己那一份, 所以同等工作量下总 token 反而更少。但真实系统里 worker 会各自多翻几份资料 (Anthropic 报告多智能体约为普通聊天的 15× token), 把探索倍数拖上去总账又反超了。不变的只有两件事: lead 峰值上下文始终小得多, 并行的墙钟时间始终短得多 —— 这才是多智能体买到的东西。',
+      answer: '活少、文档短时 orchestrator 更贵: 每个 worker 都要重建上下文 (system + 任务简报), 这份固定开销占了主导 —— m11 demo 就是这种情况 (770 vs 413)。活一多, 单 agent 的账是平方增长的: 每一轮都要重发此前读过的全部文档。而每个 worker 只重发自己那一份, 所以同等工作量下总 token 反而更少。但真实系统里 worker 会各自多翻几份资料 (Anthropic 报告多智能体约为普通聊天的 15× token), 把探索倍数拖上去总账又反超了。不变的只有两件事: lead 峰值上下文始终小得多, 并行的墙钟时间始终短得多 —— 这才是多智能体买到的东西。',
     }"
   >
     <template #controls>

@@ -10,7 +10,7 @@
     run="python -m llm_infer.m08_quantization.demo"
     :challenge="{
       ask: 'K 型 + INT4: 三种分组谁误差最小? 先猜再看。然后切到 V 型 (没有固定离群通道, 但各 token 幅度差别大), 排名变了吗? 最后在 K 型下把比特数拖到 2。',
-      answer: 'K 型: per-channel 最好。离群通道在所有 token 上都大, per-token 分组时每一行都含这几个离群值, 每行的 scale 都被撑大, 其余通道只剩一两个格点; 按通道分组则把离群值关在自己那一列, 别的列用各自的小 scale。V 型反过来: 没有固定离群列, 但 token 之间幅度差别大, 按行分组正好隔离大 token, 而且新 token 写入时可以独立量化, 对流式追加友好 —— 这就是 KIVI 的「K per-channel, V per-token」。比特越低差距越大: 真实 demo 里 INT4 的 K 误差 per-channel 0.026 vs per-token 0.18; 到 2 bit 时分错组基本不可用。',
+      answer: 'K 型: per-channel 最好。离群通道在所有 token 上都大。per-token 分组时每一行都含这几个离群值, 每行的 scale 都被撑大, 其余通道只剩一两个格点。按通道分组则把离群值关在自己那一列, 别的列用各自的小 scale。V 型反过来: 没有固定离群列, 但 token 之间幅度差别大, 按行分组正好隔离大 token。而且新 token 写入时可以独立量化, 对流式追加友好。这就是 KIVI 的「K per-channel, V per-token」。比特越低差距越大: 真实 demo 里 INT4 的 K 误差 per-channel 0.026 vs per-token 0.18; 到 2 bit 时分错组基本不可用。',
     }"
   >
     <template #controls>

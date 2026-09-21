@@ -44,16 +44,21 @@
 
       <div class="body-grid">
         <div class="params-col">
-          <div class="col-label">权重参数</div>
+          <div class="col-label">权重参数 <span class="hint-inline">鼠标停上去, 看它被哪一步用到</span></div>
           <ParamsTable
             :params="activeSpec.params"
             :ctx="ctx"
             :breakdown="activeSpec.paramBreakdown"
-            :cache="activeSpec.cachePerToken || null" />
+            :cache="activeSpec.cachePerToken || null"
+            :active="hotParam"
+            @hover="hotParam = $event" />
         </div>
         <div class="flow-col">
-          <div class="col-label">计算流 · 每一步的张量形状</div>
-          <FlowDiagram :steps="activeSpec.flow" :ctx="ctx" />
+          <div class="col-label">
+            计算流 · 每一步的张量形状
+            <span class="hint-inline">条的长度 = 这个张量有多大 (相对全流程最大的那个)</span>
+          </div>
+          <FlowDiagram :steps="activeSpec.flow" :ctx="ctx" :active-param="hotParam" />
           <div class="legend">
             <span class="legend-dot" style="background:#60a5fa;"></span> matmul
             <span class="legend-dot" style="background:#3dd68c;"></span> activation
@@ -69,7 +74,7 @@
 </template>
 
 <script setup>
-import { computed, reactive, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import FlowDiagram from './FlowDiagram.vue'
 import ParamsTable from './ParamsTable.vue'
 import { attnSpecs, ffnSpecs, normSpecs, posSpecs } from '@/data/inspector.js'
@@ -79,6 +84,9 @@ const props = defineProps({
   tab:    { type: String, default: 'attn' },
 })
 const emit = defineEmits(['update:tab'])
+
+// 鼠标停在左边哪个权重上 —— 右边用到它的步骤会亮
+const hotParam = ref('')
 
 // --- shape context (所有 flow 共用) ---
 // 所有字段都放在初始对象里, 确保 Vue 反应式追踪正常工作;
@@ -307,4 +315,5 @@ const activeSpec = computed(() => {
   margin-right: 4px;
   vertical-align: middle;
 }
+.hint-inline { font-weight: 400; color: var(--text-dim); font-size: 10.5px; margin-left: 8px; }
 </style>

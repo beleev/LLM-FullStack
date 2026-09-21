@@ -37,7 +37,7 @@ import { mulberry32, randn, softmax, entropy, clamp, lerp, sum, range, argmax, f
 1. **状态在 `ref`，计算在 `computed`，模板只管画。** 模拟逻辑写成纯函数式的 `computed`，滑杆一动全部重算。不要在模板里写逻辑。
 2. **模拟必须和 Python 模块算的是同一件事**，关键数字要对得上（例：PP=4、M=8 时 1F1B 峰值是 `[4,3,2,1]`）。拿不准就去跑对应的 `python -m …demo`。
 3. **随机数用 `mulberry32(seed)`**，给一个"换一组"按钮改 seed。拖滑杆时图形不能乱跳。
-4. **至少两种交互**：滑杆/按钮之外，优先考虑直接操作——拖动图上的点、点击格子切换状态、悬停高亮关联元素、步进播放。"读者的手放在被解释的那个量上"。
+4. **至少两种交互**：滑杆和按钮之外，再给一种直接操作——拖动图上的点、点击格子切换状态、悬停高亮关联元素、步进播放。标准是"读者的手放在被解释的那个量上"。
 5. **右侧 stats 给 2–4 个会变的数字**，好的变绿 `.good`、坏的变红 `.bad`。数字比形容词有说服力。
 6. **每个 lab 配一个 `challenge`**：先让读者预测，再展开看答案。答案要点破这个技术的本质取舍。
 7. **颜色只用 CSS 变量**（`--accent --left --eye --right --warn --danger --text-*` …），明暗主题才都能看。不要写死色值。不要给会随滑杆变化的颜色加 `transition`（颜色滞后于数字会出现一瞬间的错误画面）。
@@ -52,6 +52,18 @@ import { mulberry32, randn, softmax, entropy, clamp, lerp, sum, range, argmax, f
 cd web && npm run dev          # 手动点一遍
 npx vite build --outDir /tmp/llm-dist --emptyOutDir   # 必须零报错 (共享卷上直接 build 到 dist/ 偶尔会因清目录失败, 与代码无关)
 ```
+
+## 画图的共用件
+
+除了 `components/lab/` 那套 lab 外框，还有三个共享件给章节内的示意图用：
+
+| 组件 | 干什么 |
+|---|---|
+| `components/FlowDiagram.vue` | 计算流。每一步自带一条与张量元素数成比例的 `SizeBar`，所以 `[B,H,T,T]` 随 T 长出来的样子是看得见的。传 `active-param` 可以让用到某个权重的步骤高亮 |
+| `components/SizeBar.vue` | 一条正比于张量大小的横条，batch 维不计，只比形状本身 |
+| `components/ParamsTable.vue` | 权重表。`@hover` 抛出权重名，配合 `FlowDiagram` 的 `active-param` 做两栏联动 |
+
+画结构图时先问一句：**这张图有没有把"大小"画出来？** 两个形状写出来一样长，但元素数差一百倍——这种差别只有画成面积或长度才会被看见。
 
 ## 划重点：主干 / 扩展 / 冲刺
 

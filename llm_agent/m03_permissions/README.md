@@ -37,7 +37,7 @@ evaluate(call, tool)
 
 - 优先级写死为 deny > ask > allow, 与规则书写顺序无关: `git push*` 的 ask 压过更宽的 `git *` allow, 加一条宽 allow 不会意外放开已有的限制。
 - 复合命令必须逐段评估: `echo hi && rm -rf /` 整串可以匹配 allow `echo *`。
-- auto 模式的危险词只对有对应语义的参数生效: shell 的 `command` 和任意工具的 `path` 参数。旧版对所有参数做子串匹配, `search_docs "tokenizer"` (含 `token`) 和 `calculator "5 > 3"` (含 `>`) 都被误杀。
+- auto 模式的危险词只对有对应语义的参数生效: shell 的 `command` 和任意工具的 `path` 参数。若对所有参数做子串匹配, `search_docs "tokenizer"` (含 `token`) 和 `calculator "5 > 3"` (含 `>`) 都会被误杀 —— 在一个讲 LLM 的库里, "token" 会天天出现。
 - auto 模式下: low / medium 风险放行, high 风险且没看到危险词也不放行, 而是问人; 没人可问就拒绝。
 - plan 模式里 allow 规则不生效: 只读是模式的保证, 不应被一条配置覆盖; 只有计划获批切换模式后才能写 (`ExitPlanModeTool`, 见 m10)。
 - 在 agent loop 里 (`core/agent.py: Agent._authorize`), 门评估的是 PreToolUse hook 改写之后的最终调用。

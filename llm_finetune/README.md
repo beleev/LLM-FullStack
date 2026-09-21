@@ -70,14 +70,14 @@ pytest -m slow -k llm_finetune                                   # 同样的脚�
 | distill | 128 条固定数据: forward KL 硬标签 2.292 vs 软标签 **1.860**; 无限数据时差距消失 (0.906 vs 0.959) |
 | on_policy_distill | 样本合格率: off-policy 0.059 vs on-policy **0.402**; 但 on-policy 把 teacher 的少数派答案压到 log π = −33 (off-policy −17) |
 
-**更正旧版结论**: 旧 README 写 "LoRA 在同一份数据上比 SFT 收敛快得多, 这是 PEFT 的工程优势"。那组数字 (loss 249.97 → 27 vs → 215) 来自病态初始化 (初始 CE ≈ 250 而非 ln V)、只背 2 条样本、LoRA 用了 10× lr。初始化修好后用留出集重测, **同样步数下全参更快更好**; LoRA 的优势是显存与存储, 不是收敛速度。
+**一个常见的误解**: "LoRA 比全参收敛更快, 这是 PEFT 的工程优势"。这种结论通常来自病态初始化 (初始 CE ≈ 250 而非 ln V)、只背几条样本、以及给 LoRA 单独调大 10× 的 lr。在初始化正常、同看留出集的条件下, **同样步数下全参更快也更好**; LoRA 买的是显存与存储, 不是收敛速度。
 
 ## 关于 "复用 Trainer" 的实话
 
 `llm_models.training.Trainer` 的约定是 "取 batch → `model(**batch)` → `loss.compute(output, labels)` → 更新一次"。
 
 - **SFT / LoRA / DoRA / QLoRA**: 只换数据 (和模型里的层), loss 就是 `StandardLMLoss` (`SFTLoss` 是它的别名, 不再复制一份)。
-- **DPO / SimPO / ORPO / RM / 蒸馏**: 一步要跑多次前向。扩展点是**包一层 `nn.Module`**: [`PairwiseForward`](methods/dpo.py) (chosen + rejected [+ 冻结 ref]) 和 [`TeacherStudent`](methods/distill.py)。它们的 loss 都是普通 `LossComputer`, Trainer 一行不改, 旧版 `DPOTrainer` 里复制的 clip / step / scheduler 已删除。
+- **DPO / SimPO / ORPO / RM / 蒸馏**: 一步要跑多次前向。扩展点是**包一层 `nn.Module`**: [`PairwiseForward`](methods/dpo.py) (chosen + rejected [+ 冻结 ref]) 和 [`TeacherStudent`](methods/distill.py)。它们的 loss 都是普通 `LossComputer`, Trainer 一行不改 —— 不需要为它们各写一套复制粘贴的 clip / step / scheduler。
 - **GRPO / on-policy 蒸馏**: 不用 Trainer。数据由当前策略现场采样 (数据生成器得拿到模型), GRPO 还要在同一批 rollout 上更新 μ 次、并记住采样时刻的 log-prob。这与上面的约定有本质冲突, 硬塞进去只会更难读。
 
 ## 目录

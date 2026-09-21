@@ -9,5 +9,5 @@ export default {
   'models-gptoss': ['ModelSwaLayersLab', 'ModelAttnSinkLab'],
   'models-llada': ['ModelLladaLab'],
   'models-var': ['ModelVarLab'],
-  blocks: ['ModelInitLab'], // 绑权重 + 初始化尺度: 本仓库真实修过的 bug
+  blocks: ['ModelResidualLab', 'ModelInitLab'], // 绑权重 + 初始化尺度: 为什么首步 loss 应该等于 ln V
 }

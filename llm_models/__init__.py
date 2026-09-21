@@ -31,7 +31,7 @@ PyTorch 实现, 用于对比各主流架构的设计与训练 / 推理数据流�
     >>> from llm_models import Trainer, TrainingConfig, DDPMScheduler, DiffusionLoss
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__ = "LLM Team"
 
 # --- Layers (底层零件) ---

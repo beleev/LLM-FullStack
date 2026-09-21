@@ -44,7 +44,7 @@ export const variants = [
     color: '#34d399',
     pros: '只缓存 latent + 共享 rope 段, 每 token 68.6 KiB',
     cons: '要把 RoPE 解耦出来, 升维矩阵才能被吸收进 Q',
-    description: 'K 和 V 不直接存, 先压成一个低维 latent (比如 512 维) 存起来, 用的时候再升回去。位置信息单独走一小段所有头共享的 RoPE —— 这一步必须解耦, 否则旋转会挡住升维矩阵被吸收进 Q, 解码时就省不下来。DeepSeek-V3 一个 token 68.6 KiB, 比同规模的 MHA 少 56.9 倍。'
+    description: 'K 和 V 不直接存, 先压成一个低维 latent (比如 512 维) 存起来, 用的时候再升回去。位置信息单独走一小段所有头共享的 RoPE。这一步必须解耦: 否则旋转会挡住升维矩阵被吸收进 Q, 解码时就省不下来。DeepSeek-V3 一个 token 68.6 KiB, 比同规模的 MHA 少 56.9 倍。'
   },
   {
     id: 'dsa',

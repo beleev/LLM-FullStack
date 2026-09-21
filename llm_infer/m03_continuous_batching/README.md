@@ -31,7 +31,7 @@ decode 优先 (chunked_prefill=True):    _schedule_running 之后, 剩余预算�
 ## 常见误区
 - "batch 越大越好" —— decode 是访存瓶颈, 加 batch 几乎免费; 但 prefill 是算力瓶颈, 塞进同一步会拖慢所有人 (→ m06)
 - "抢占会丢结果" —— recompute 式抢占只丢 KV; token 都在, 回来把 prompt+已生成部分重新 prefill 一遍即可
-- "把已生成 token 折进 prompt 再重算"看似等价, 但会让 `max_new_tokens` 重新计数 (旧 bug): 长度必须只数 `output_ids`
+- "把已生成 token 折进 prompt 再重算"看似等价, 但会让 `max_new_tokens` 重新计数: 长度必须只数 `output_ids`
 
 ## 自测题
 1. 队首请求要 6 个 block, 只剩 2 个空闲, running 里有 3 条在 decode, 这一步该干什么? **答**: decode 那 3 条。直接 return 空 batch 的话 running 永不前进、block 永不释放 → 活锁。

@@ -144,7 +144,7 @@ class PermissionGate:
 
     def _auto_classify(self, call: ToolCall, risk: str) -> PermissionOutcome:
         # 危险词只对"有这种语义"的参数生效: shell 的 command、文件工具的 path。
-        # 旧版对所有工具的所有参数做子串匹配, `search_docs "tokenizer"` / `calculator "5 > 3"` 全被误杀。
+        # 只对有对应语义的参数生效。若对所有参数做子串匹配, `search_docs "tokenizer"` / `calculator "5 > 3"` 都会被误杀。
         if call.name == "shell":
             command = normalize_command(str(call.args.get("command", ""))) + " "
             if any(x in command for x in _SHELL_DANGER):

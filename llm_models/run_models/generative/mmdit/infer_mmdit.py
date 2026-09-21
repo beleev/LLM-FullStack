@@ -31,7 +31,7 @@ def main():
     cos_raw = F.cosine_similarity(*emb(t), dim=0).item()
     cos_scaled = F.cosine_similarity(*emb(noised.t_norm), dim=0).item()
     print(f"cos(emb(t=0.1), emb(t=0.9)): 裸 t = {cos_raw:.3f} | scheduler 输出的 t_norm = {cos_scaled:.3f}")
-    assert cos_raw > 0.95, "修复前的症状: 两个时间几乎同一个嵌入"
+    assert cos_raw > 0.95, "不缩放的症状: 两个时间几乎同一个嵌入"
     assert cos_scaled < 0.9 and torch.allclose(noised.t_norm, t * 1000)
 
     # 2) x_t 与 velocity 的定义

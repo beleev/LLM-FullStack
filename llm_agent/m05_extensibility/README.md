@@ -28,7 +28,7 @@ tool_result 挂回模型发出的原 id → user 消息;  notes → 独立 syste
 
 关键设计决策:
 
-- **门评估改写后的调用**。hook 是用户代码, 也可能有 bug 或被人塞了恶意逻辑; 只授权原始调用等于给 hook 一条绕过 deny 规则的路。第 [5] 节就是这个旧 bug 的回归测试。
+- **门评估改写后的调用**。hook 是用户代码, 也可能有 bug 或被人塞了恶意逻辑; 只授权原始调用等于给 hook 一条绕过 deny 规则的路。第 [5] 节就是这条路的回归测试。
 - **hook 文字走旁路**。`session_start` / `user_prompt_submit` / `post_tool_use` 追加的内容分别落成 name 为 `session_start` / `hook_context` / `post_tool_hook` 的 system 消息, 从不拼进用户 prompt 或 `tool_result` —— 否则 `[audit]` 之类的注释会被模型当成工具数据写进笔记、拿去当检索词。
 - **skill 正文是可信指令**。它由用户自己安装, toy LLM 会服从 `skill` 工具返回的内容; 而 `fetch_doc` 抓回的文档是不可信数据 (m12)。区别在来源, 不在格式。
 - **结果永远挂在模型发出的 id 上**, 即使 hook 把调用改成了别的工具 —— 保证 tool_use / tool_result 配对合法。
@@ -50,7 +50,7 @@ cd <仓库根目录> && python3 -m llm_agent.m05_extensibility.demo
 [3] PreToolUse hook 拦截: 即使权限模式全放行, 含 token 的 shell 也到不了执行层
   [hooked] turn 1: model -> tool_use toolu_0001 shell {'command': 'cat token.txt'}
   [hooked] tool_result toolu_0001 -> BLOCKED BY HOOK: secret-like shell command
-[5] 回归: hook 把 calculator 改写成 rm -rf, 权限门必须拦住 (旧版只授权原始调用 → 直接执行)
+[5] 回归: hook 把 calculator 改写成 rm -rf, 权限门必须拦住 (只授权原始调用的话, 执行的却是改写后的 → 直接放行)
   [rewritten] turn 1: model -> tool_use toolu_0001 calculator {'expr': '2 + 2'}
   [rewritten] pre_tool_use hook rewrote -> shell {'command': 'rm -rf /'}
   [rewritten] permission shell -> deny (rule: destructive)
@@ -87,7 +87,7 @@ cd <仓库根目录> && python3 -m llm_agent.m05_extensibility.demo
 1. 如果把 `_authorize` 里的 `self.permissions.evaluate(final, tool)` 改成 `evaluate(call, tool)`, 第 [5] 节会发生什么?
 <details><summary>答案</summary>
 
-门看到的是无害的 `calculator`, 在 `dont_ask` 模式下放行; 随后执行的却是 hook 改写出的 `shell rm -rf /`, deny 规则被绕过, `shell2.executed` 不再为空, 断言失败。这正是旧版的权限绕过 bug。
+门看到的是无害的 `calculator`, 在 `dont_ask` 模式下放行; 随后执行的却是 hook 改写出的 `shell rm -rf /`, deny 规则被绕过, `shell2.executed` 不再为空, 断言失败。所以鉴权必须发生在 hook 改写之后。
 
 </details>
 

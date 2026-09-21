@@ -2,12 +2,12 @@
 <template>
   <LabFrame
     title="Attention sinks — 为什么滑动窗口不能扔掉开头几个 token"
-    sub="这里的注意力是合成的: 我们人为在开头 4 个 token 上植入了 sink (训练过的 LLM 会自己长出这个现象; 随机权重的 TinyLM 没有, 所以不拿它演示)。第一行: 最新 token 对整条流的注意力, 实心 = 还留在 cache 里 (sink + 最近窗口), 半透明 = 已被逐出。第二行: 只剩 cache 里的 token 时, softmax 被迫重新归一化后的注意力。"
+    sub="这里的注意力是合成的: 我们人为在开头 4 个 token 上植入了 sink。训练过的 LLM 会自己长出这个现象, 随机权重的 TinyLM 没有, 所以不拿 TinyLM 演示。第一行: 最新 token 对整条流的注意力, 实心 = 还留在 cache 里 (sink + 最近窗口), 半透明 = 已被逐出。第二行: 只剩 cache 里的 token 时, softmax 被迫重新归一化后的注意力。"
     module="llm_infer/m16"
     run="python -m llm_infer.m16_attention_sinks.demo"
     :challenge="{
       ask: '把「保留的 sink 数」从 4 拖到 0 (纯滑动窗口), 丢失的注意力质量和幸存权重的放大倍数怎么变? 再把 sink 强度拖到 0 试试。',
-      answer: 'softmax 的权重和恒为 1: 当前 token 没什么可看时, 多余的注意力被倒在开头几个 token 上。纯滑动窗口把它们逐出后, 分母突然少了一大块, 所有幸存权重被放大好几倍, 注意力输出远离训练时见过的分布 → 困惑度爆炸。只要留住 4 个 sink, 分母基本不变, 丢掉的只是中间那些本来就没分到多少注意力的 token。sink 强度为 0 (没有 sink 现象) 时, 留不留开头就无所谓了 —— 这正是随机权重模型上看不到效果的原因。',
+      answer: 'softmax 的权重和恒为 1: 当前 token 没什么可看时, 多余的注意力被倒在开头几个 token 上。纯滑动窗口把这几个 token 逐出后, 分母突然少了一大块, 所有幸存权重被放大好几倍。注意力输出于是远离训练时见过的分布 → 困惑度爆炸。只要留住 4 个 sink, 分母基本不变, 丢掉的只是中间那些本来就没分到多少注意力的 token。sink 强度为 0 (没有 sink 现象) 时, 留不留开头就无所谓了 —— 这正是随机权重模型上看不到效果的原因。',
     }"
   >
     <template #controls>
