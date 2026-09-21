@@ -45,7 +45,7 @@ python -m llm_infer.m15_pd_disaggregation.demo      # ~0.2 s
 - GQA / MLA 会让 KV 小 4–8× 甚至更多 (LLaMA-3-8B 同上下文只有 ~0.5 GiB), 传输压力相应下降。
 
 ## 常见误区
-- **Gbps 当 GB/s**: 本模块旧版就是这样算的 (`bytes / (gbps·1e9)`), 传输时间被低估 8×。网卡/IB 永远按 bit 标。
+- **Gbps 当 GB/s**: 写成 `bytes / (gbps·1e9)` 就少除了 8, 传输时间低估 8×。网卡/IB 永远按 bit 标。
 - "分离能提高单请求速度": 不能, 单请求还多了一次传输。收益是**消除干扰** → 同样的 SLO 下每张卡能承载更多请求 (goodput)。
 - "传输时间算进 TTFT": 首 token 是 P 节点 prefill 的产物, 可以直接回给用户; 传输影响的是第 2 个 token。
 - "P、D 节点可以用不同权重精度": KV 是 P 节点的权重算出来的, D 节点权重不一致会让后续 token 悄悄跑偏 — 本 demo 两边同 seed 才能逐 token 相同。

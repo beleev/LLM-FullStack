@@ -105,7 +105,7 @@ export default {
       q: 'EP 的 all-to-all 和 DDP 的 all-reduce, 通信量上最本质的区别是?',
       options: ['all-to-all 总是更小', 'all-to-all 的通信量由路由结果 (数据) 决定, 不均衡时会出现热点卡', 'all-reduce 由数据决定', '没有区别'],
       answer: 1,
-      why: 'all-reduce 每步搬的字节数由模型大小固定; all-to-all 发多少、发给谁取决于 gating, 路由倾斜 = 某些卡收爆、其余闲着, 所以均衡是训练目标的一部分。',
+      why: 'all-reduce 每步搬的字节数由模型大小固定。all-to-all 发多少、发给谁取决于 gating: 路由倾斜 = 某些卡收爆、其余闲着, 所以均衡是训练目标的一部分。',
     },
     {
       q: '因果注意力下做 Ring Attention, 序列连续切给 4 张卡。mask 省掉了近一半计算, 墙钟时间省了多少?',

@@ -24,7 +24,7 @@ python -m llm_models.run_models.multimodal.qwen2_5_omni.train_qwen2_5_omni
   (信息单向: 图 → Thinker → Talker; 未训练时权重 std=0.02, 所以第一项数值很小但非零)。
 - train: text_loss 6.269 (ln 500 = 6.215) → 0.006; audio_loss 5.294 (ln 200 = 5.298) → 0.025。
   2 条样本的 codec 输入相同、标签不同, 不读 Thinker 时 audio_loss 下界是 ln 2 = 0.693, 实测远低于它。
-  初始化修复前 text_loss 初值是 **124.15** (50 步后 total 仍有 104.7)。
+  若换成默认 N(0,1) 初始化 + 绑权重: text_loss 初值是 **124.15** (50 步后 total 仍有 104.7)。
 - 数据是固定随机 batch: 记忆, 不是真的会说话。
 
 ## 常见误区

@@ -18,7 +18,7 @@ export default {
         {
           key: true,
           title: '训练走字符级, BPE 是旁边的独立演示',
-          body: '训练、采样、自带的 ckpt.npz 全部基于 tokenizer.py 的 65 个字符。bpe.py 只读 input.txt, 不接训练流水线。这么定是为了让注意力和梯度当主角, 不是因为 BPE 不重要: 跑一下 python bpe.py 就看得见, 300 次合并后同一句话字符级要 60 个 token, BPE 只要 24 个, 压缩率 2.50 字符/token。上面的实验台把这个合并过程一步步摊开了。',
+          body: '训练、采样、自带的 ckpt.npz 全部基于 tokenizer.py 的 65 个字符。bpe.py 只读 input.txt, 不接训练流水线。这么定是为了让注意力和梯度当主角, 不是因为 BPE 不重要。跑一下 python bpe.py 就看得见: 300 次合并后同一句话字符级要 60 个 token, BPE 只要 24 个, 压缩率 2.50 字符/token。上面的实验台把这个合并过程一步步摊开了。',
         },
         {
           title: 'y 就是 x 右移一位',
@@ -113,11 +113,11 @@ y:     [e, l, l, o]
         },
         {
           title: '一个张量被用了几次, 梯度就是几路之和',
-          body: 'x 同时喂给 Q/K/V 三条支路, 反向要 dx_q + dx_k + dx_v; 残差 out = x + f(x), 反向是捷径那份加上穿过子层回来的那份; 同一个 token id 在 batch 里出现多次, embedding 梯度必须 np.add.at 累加, 写成 dW[ids] += dout 只会加最后一次。check_ops 故意用含重复 id 的输入 [[0,1,1],[5,1,0]] 来考这一点。',
+          body: 'x 同时喂给 Q/K/V 三条支路, 反向要 dx_q + dx_k + dx_v。残差 out = x + f(x), 反向是捷径那份加上穿过子层回来的那份。同一个 token id 在 batch 里出现多次, embedding 梯度必须 np.add.at 累加; 写成 dW[ids] += dout 只会加最后一次。check_ops 故意用含重复 id 的输入 [[0,1,1],[5,1,0]] 来考这一点。',
         },
         {
           title: 'gradcheck 分两级, 定位方式完全不同',
-          body: '逐算子: 拿一个随机张量 R 当 dout (令 L = Σ(out ⊙ R), 于是 dL/dout 正好是 R), 对每个输入的每个元素做差分, 7 个算子的相对误差落在 1e-11 ~ 2e-10, 哪个算子错一目了然。端到端: 整模型 + CE, n_layer = 1 和 2 各跑一遍, 每个参数抽 8 个位置, 判定用 atol + rtol·max(|g_a|,|g_n|) —— 抽样常落在真实梯度≈0 的位置, 纯相对误差会误报。',
+          body: '逐算子: 拿一个随机张量 R 当 dout —— 令 L = Σ(out ⊙ R), 于是 dL/dout 正好是 R。再对每个输入的每个元素做差分, 7 个算子的相对误差落在 1e-11 ~ 2e-10, 哪个算子错一目了然。端到端: 整模型 + CE, n_layer = 1 和 2 各跑一遍, 每个参数抽 8 个位置, 判定用 atol + rtol·max(|g_a|,|g_n|) —— 抽样常落在真实梯度≈0 的位置, 纯相对误差会误报。',
         },
       ],
       links: [
@@ -152,7 +152,7 @@ assert abs(g_a - g_n) <= atol + rtol * max(abs(g_a), abs(g_n))    # atol=1e-7, r
     'basic-optim-sample': {
       title: 'Adam 与采样 · 训练后如何生成文本',
       subtitle: '读完你能说清 Adam 每步到底走多远, 以及生成为什么只能一个 token 一个 token 往外挤。',
-      tldr: 'Adam 用一阶矩定方向、二阶矩按坐标归一化步长, 每步位移大约就是 lr; 采样时不再算 loss, 只取最后一个位置的 logits, 抽一个 token 接上去再来一遍。',
+      tldr: 'Adam 用一阶矩定方向、二阶矩按坐标归一化步长, 每步位移大约就是 lr。采样时不再算 loss, 只取最后一个位置的 logits, 抽一个 token 接上去再来一遍。',
       question: '训练时 64 个位置一次算完, 生成时为什么只能一个一个来?',
       code: 'llm_basic/{optim.py,sample.py,train.py}',
       points: [

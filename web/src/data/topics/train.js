@@ -30,7 +30,7 @@ export default {
         },
         {
           title: '等价挂在"按样本数加权"上',
-          body: 'micro 的 loss 已经在本地取过均值, 累加时要再乘 n_k/N。等分时它退化成 1/K, 所以漏掉也不报错 —— m01 里"直接相加"恰好把梯度放大 K=4 倍, 等于偷偷把学习率乘 4; 换成 [3,3,2] 这种不等长切法立刻露馅。跨卡同理: all-reduce(mean) 做的是各卡局部均值的简单平均, 只有每卡样本数相同时它才等于全局均值。',
+          body: 'micro 的 loss 已经在本地取过均值, 累加时要再乘 n_k/N。等分时它退化成 1/K, 所以漏掉也不报错。m01 里"直接相加"恰好把梯度放大 K=4 倍, 等于偷偷把学习率乘 4。换成 [3,3,2] 这种不等长切法立刻露馅。跨卡同理: all-reduce(mean) 做的是各卡局部均值的简单平均, 只有每卡样本数相同时它才等于全局均值。',
         },
       ],
       links: [
@@ -217,7 +217,7 @@ scaler.update(overflow)                          # 溢出减半, 连续好 step 
       widgets: ['MoeRouteLab', 'RingAttnLab'],
       title: 'EP 与序列并行 · 切专家, 切序列',
       subtitle: '读完你能说清 MoE 的通信量为什么随数据变, 以及一条放不进单卡的序列怎么切给多卡还能算出精确的注意力。',
-      tldr: 'MoE 的通信量由 gating 结果决定而不是模型结构 (token 经两次 all-to-all 出门找专家再回家); Ring Attention 的通信量固定, 但因果 mask 下必须 zigzag 切, 否则省下的计算变不成省下的时间。',
+      tldr: 'MoE 的通信量由 gating 结果决定, 不是模型结构: token 经两次 all-to-all 出门找专家再回家。Ring Attention 的通信量固定, 但因果 mask 下必须 zigzag 切, 否则省下的计算变不成省下的时间。',
       question: 'all-to-all 的通信量为什么由数据决定而不是模型结构? Ring Attention 凭什么敢说自己和完整注意力精确相等?',
       code: 'llm_train/m11_expert_parallel/demo.py · llm_train/m12_sequence_parallel/demo.py',
       points: [
@@ -232,7 +232,7 @@ scaler.update(overflow)                          # 溢出减半, 连续好 step 
         },
         {
           title: '同一个 online softmax',
-          body: '分块算注意力再增量合并: 每收到一块就用新的最大值把旧的 (m, 分母, 加权和) 重新缩放一遍。这是恒等变形不是近似, m12 实测与完整注意力差 4.4e-16。单卡内做叫 FlashAttention, 跨卡传块就叫 Ring Attention, 任何时刻每卡只持有 1/D 的 KV。因果 mask 下连续切分会让最后一张卡每轮满载、其余人等它 (墙钟 228); 一头一尾配对的 zigzag 切法让每卡每轮工作量相同, 墙钟降到 132, 快 1.73×。',
+          body: '分块算注意力再增量合并: 每收到一块就用新的最大值把旧的 (m, 分母, 加权和) 重新缩放一遍。这是恒等变形不是近似, m12 实测与完整注意力差 4.4e-16。单卡内做叫 FlashAttention, 跨卡传块就叫 Ring Attention, 任何时刻每卡只持有 1/D 的 KV。因果 mask 下连续切分会让最后一张卡每轮满载、其余人等它 (墙钟 228)。一头一尾配对的 zigzag 切法让每卡每轮工作量相同, 墙钟降到 132, 快 1.73×。',
         },
       ],
       links: [
@@ -370,7 +370,7 @@ bubble = (PP - 1) / (v * M + PP - 1)`,
     'train-lr-schedule': {
       title: 'WSD 学习率调度 · 不用提前承诺总步数',
       subtitle: '读完你能解释为什么一条 WSD 主干可以随时分叉出成品模型, 而 cosine 训练做不到。',
-      tldr: 'cosine 的每一步 lr 都写成 f(step/total), 总步数一改整条曲线都变; WSD 的稳定段里没有 total, 所以任何一个稳定段 checkpoint 都能接着训, 或分叉出一段短退火。',
+      tldr: 'cosine 的每一步 lr 都写成 f(step/total), 总步数一改整条曲线都变。WSD 的稳定段里没有 total, 所以任何一个稳定段 checkpoint 都能接着训, 或分叉出一段短退火。',
       question: '训到 100% 发现 loss 还在降, 想加训: cosine 和 WSD 各要付出什么?',
       code: 'llm_train/m10_training_stability/demo.py',
       points: [
@@ -464,7 +464,7 @@ def nvfp4(x, block=16):
     'train-muon': {
       title: 'Muon 优化器 · 把更新矩阵正交化',
       subtitle: '读完你能说清 Muon 赢在哪、输在哪, 以及为什么它只用在 2-D 权重上。',
-      tldr: 'Adam 逐元素看梯度, Muon 把 2-D 权重的动量当成一个矩阵正交化后再更新, 让每个奇异方向迈同样大的步子; 病态方向不与坐标轴对齐时它赢 AdamW 9.2×, 对齐时反而输 1.9×。',
+      tldr: 'Adam 逐元素看梯度; Muon 把 2-D 权重的动量当成一个矩阵正交化后再更新, 让每个奇异方向迈同样大的步子。病态方向不与坐标轴对齐时 Muon 赢 AdamW 9.2×, 对齐时反而输 1.9×。',
       question: 'Adam 已经逐元素自适应了, 为什么还会被"病态方向"拖住? Muon 什么时候反而不如 Adam?',
       code: 'llm_train/m14_muon_optimizer/demo.py',
       points: [

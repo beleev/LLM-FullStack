@@ -1,22 +1,22 @@
 <!--
   初始化实验台: 为什么"刚建好的模型"第一步 loss 应该 ≈ ln V, 以及绑权重 + std=1 怎么把它炸到 250。
-  这是本仓库真实修过的 bug (llm_models/utils/init.py): 修前 LLaMA 首步 CE 258, 修后 7.09, ln 1000 = 6.91。
+  对应 llm_models/utils/init.py: std=0.02 时 LLaMA 首步 CE 7.09, ln 1000 = 6.91。
 -->
 <template>
   <LabFrame
     title="初始化 — 第一步 loss 该是多少?"
-    sub="一个什么都没学的模型应该均匀瞎猜, loss = ln V。拖 σ 看首步 CE 什么时候离开这条参考线: 输入嵌入和输出头绑权重时, 每个 token 会给「自己」打一个 ≈ σ·d 的高分, 而正确答案几乎从来不是它自己。"
+    sub="一个什么都没学的模型应该均匀瞎猜, loss = ln V。拖 σ 看首步 CE 什么时候离开这条参考线。输入嵌入和输出头绑权重时, 每个 token 会给「自己」打一个 ≈ σ·d 的高分, 而正确答案几乎从来不是它自己。"
     module="llm_models/utils/init.py"
     run="python -m llm_models.run_models.language_models.llama.train_llama"
     :challenge="{
       ask: '不改 σ=1, 只把「绑权重」关掉, 首步 CE 会回到 ln V 吗? 为什么真实 LLaMA 不绑权重也不乘 √d 却没这个问题?',
-      answer: '关掉绑权重后「给自己打高分」的那一项消失, 但其余 logit 的标准差仍是 σ·√d = 16, softmax 依旧极尖, CE 还是几十。根因是 logit 的尺度而不只是绑权重 —— 所以修法是把 σ 降到 0.02 (logit 标准差 ≈ 0.3, 近似均匀)。真实 LLaMA 用小 σ 初始化, 两个问题都不存在。',
+      answer: '关掉绑权重后「给自己打高分」的那一项消失, 但其余 logit 的标准差仍是 σ·√d = 16, softmax 依旧极尖, CE 还是几十。根因是 logit 的尺度而不只是绑权重 —— 所以把 σ 降到 0.02 才治本 (logit 标准差 ≈ 0.3, 近似均匀)。真实 LLaMA 用小 σ 初始化, 两个问题都不存在。',
     }"
   >
     <template #controls>
       <div class="row">
         <button type="button" :class="{ active: tied }" @click="tied = !tied">绑权重 lm_head = embedding: {{ tied ? '开' : '关' }}</button>
-        <button type="button" @click="logSigma = Math.log10(0.02)">σ = 0.02 (修复后)</button>
+        <button type="button" @click="logSigma = Math.log10(0.02)">σ = 0.02 (本仓库用的值)</button>
         <button type="button" @click="logSigma = 0">σ = 1 (nn.Embedding 默认)</button>
         <button type="button" @click="seed++">换一组随机权重</button>
       </div>

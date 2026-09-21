@@ -32,7 +32,7 @@ python -m llm_models.run_models.generative.mmdit.train_mmdit
 
 ## 常见误区
 
-- "Flow Matching 的 t∈[0,1] 直接喂 TimestepEmbedding": sinusoidal 频率族 (max_period=10000) 是为跨度上千的位置设计的, [0,1] 内大部分频率几乎不动 —— 本库修复前就是这个 bug, t=0.1 与 0.9 的嵌入余弦 0.98。SD3 同样把 t ×1000。插值系数仍用 t∈[0,1], 只有 **给模型看的 t** 要缩放; 采样器必须用同一量纲 (`EulerFlowSampler.time_scale`)。
+- "Flow Matching 的 t∈[0,1] 直接喂 TimestepEmbedding": sinusoidal 频率族 (max_period=10000) 是为跨度上千的位置设计的, [0,1] 内大部分频率几乎不动: 不缩放时 t=0.1 与 t=0.9 的嵌入余弦相似度高达 0.98, 模型根本分不清早晚。SD3 同样把 t ×1000。插值系数仍用 t∈[0,1], 只有 **给模型看的 t** 要缩放; 采样器必须用同一量纲 (`EulerFlowSampler.time_scale`)。
 - "双流 = 两个独立 Transformer": 注意力是共享的一次 softmax, 文本 token 能看图像 token, 反之亦然。
 - "velocity 依赖 t": 直线路径上 v = ε − x_0 与 t 无关; 依赖 t 的是模型的输入 x_t。
 

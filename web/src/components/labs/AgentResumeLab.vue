@@ -5,19 +5,19 @@
 <template>
   <LabFrame
     title="Resume — 哪些东西回来了, 哪些没有"
-    sub="会话 A 搜了一次文档就'关掉进程'。点任意一行 JSONL 看它 resume 时的下场; 打开三个故障开关制造崩溃现场; 换一套新会话的权限门, 看同一句'写进笔记'的裁决怎么变。下半部分: 拖动子 agent 读几份文档, 看子 transcript 涨到多大, lead 上下文却纹丝不动。"
+    sub="会话 A 搜了一次文档就'关掉进程'。点任意一行 JSONL 看它 resume 时的下场。打开三个故障开关制造崩溃现场。换一套新会话的权限门, 看同一句'写进笔记'的裁决怎么变。下半部分: 拖动子 agent 读几份文档, 看子 transcript 涨到多大, lead 上下文却纹丝不动。"
     module="llm_agent/m06 · m07"
     run="python -m llm_agent.m06_persistence_resume.demo"
     :challenge="{
-      ask: '三个故障开关全打开, 磁盘上有 7 行, resume 出来几条消息? 再把新会话的权限门换成 default 且无人可问 —— 上一次明明放行过 write_note, 这次为什么被拒?',
-      answer: '5 条。写了一半的第 7 行 json.loads 会抛 JSONDecodeError, load() 直接跳过它 (坏一行不该让整个会话无法恢复); 第 6 行是崩在 tool_use 和 tool_result 之间留下的悬空调用, Agent.__init__ 主动把它丢掉 —— 留着的话这段 transcript 发给真实 Messages API 会直接 400。权限被拒是因为 PermissionGate 根本不在 JSONL 里: 授权是当前运行环境的决定, 不是可以被文件恢复的状态。否则一个磁盘上的文件就能给自己提权。同理, hooks、skills、工具的外部副作用、子 agent 的 transcript 也都不会跟着 resume 回来。',
+      ask: '三个故障开关全打开, 磁盘上有 7 行。resume 出来几条消息? 再把新会话的权限门换成 default 且无人可问。上一次明明放行过 write_note, 这次为什么被拒?',
+      answer: '5 条。写了一半的第 7 行 json.loads 会抛 JSONDecodeError, load() 直接跳过它: 坏一行不该让整个会话无法恢复。第 6 行是崩在 tool_use 和 tool_result 之间留下的悬空调用, Agent.__init__ 主动把它丢掉。留着的话, 这段 transcript 发给真实 Messages API 会直接 400。权限被拒是因为 PermissionGate 根本不在 JSONL 里: 授权是当前运行环境的决定, 不是可以被文件恢复的状态。否则一个磁盘上的文件就能给自己提权。同理, hooks、skills、工具的外部副作用、子 agent 的 transcript 也都不会跟着 resume 回来。',
     }"
   >
     <template #controls>
       <div class="row">
         <button type="button" :class="{ active: dangling }" :aria-pressed="dangling" @click="dangling = !dangling">{{ dangling ? '☑' : '☐' }} 崩在 tool_use 和 tool_result 之间</button>
         <button type="button" :class="{ active: halfLine }" :aria-pressed="halfLine" @click="halfLine = !halfLine">{{ halfLine ? '☑' : '☐' }} 最后一行只写了一半</button>
-        <button type="button" :class="{ active: replay }" :aria-pressed="replay" @click="replay = !replay">{{ replay ? '☑' : '☐' }} resume 重放 session_start (旧 bug)</button>
+        <button type="button" :class="{ active: replay }" :aria-pressed="replay" @click="replay = !replay">{{ replay ? '☑' : '☐' }} resume 重放 session_start</button>
       </div>
       <div class="row">
         <span class="tip">新会话的权限门:</span>
@@ -116,7 +116,7 @@ const resumed = computed(() => {
   // ★ Agent.__init__: 最后一条若是悬空的 tool_use, 丢掉 —— 否则这段 transcript 不是合法 API 输入
   if (kept.length && kept[kept.length - 1].use) kept.pop()
   const out = kept.map((r) => ({ text: r.text }))
-  // session_start: 历史里已经有了就不再注入; 旧 bug 是每次 resume 都重放一遍
+  // session_start: 历史里已经有了就不再注入, 否则每次 resume 都会重复注入同一段
   if (replay.value) out.push({ dup: true, text: 'system  name=session_start  ← 又注入了一遍' })
   out.push({ fresh: true, text: 'user  "把刚才的结果写进笔记"  ← 新会话的第一句' })
   return out

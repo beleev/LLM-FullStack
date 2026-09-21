@@ -109,7 +109,7 @@ def main() -> None:
         mark = len(agent.messages)
         agent.run("排查 agent loop，并写入笔记")
         assert used_since(mark) == ["skill", "search_docs", "write_note"]
-        # 检索词是干净的用户 prompt → 命中 agent_loop (旧版 skill 文本漏进检索词, 第一名是 subagents)
+        # 检索词是干净的用户 prompt → 命中 agent_loop (skill 文本若漏进检索词, 第一名会变成 subagents)
         assert len(notes) == 1 and notes[0].split("] ")[1].startswith("agent_loop:"), notes
         assert "[audit]" not in notes[0] and "排查流程" not in notes[0]  # 笔记里只有工具数据
 

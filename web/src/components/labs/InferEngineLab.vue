@@ -2,7 +2,7 @@
   mini-vLLM 引擎主循环实验台 (llm_infer/full_engine)。
   一步永远是同四件事: 调度 → 前向 → 采样 → 后处理。难的只有调度那一步 ——
   它要同时管住 KV 显存 (block 够不够)、公平 (谁先进) 和延迟 (每步算几个 token)。
-  最后一个开关复现本仓库真实修过的活锁: 队首进不来时如果不落到 decode, 整条时间线就冻住。
+  最后一个开关演示一类真实存在的活锁: 队首进不来时如果不落到 decode, 整条时间线就冻住。
 -->
 <template>
   <LabFrame
@@ -12,7 +12,7 @@
     run="python -m llm_infer.full_engine.demo"
     :challenge="{
       ask: '打开最后那个红色开关 (队首进不来时也只走 prefill 分支), 再把 block 池拖到 10 以下。时间线会怎样? 为什么关掉就能恢复?',
-      answer: '时间线冻住: 队首拿不到 block → prefill 分支选不出任何序列 → 返回空 batch → running 一个 token 也不前进 → 没有序列结束 → block 永远不释放 → 队首永远进不来。这就是活锁, 本仓库的 engine.py 早期版本就死在这里。修法只有一行: prefill 进不来时落到 decode (Python 里就是 `_admit(budget) or _schedule_running(budget)` 的那个 or)。关键不在于 decode 更重要, 而在于必须保证「最老的那条序列总能前进」—— 有进度才有释放, 有释放才有名额。',
+      answer: '时间线冻住。队首拿不到 block → prefill 分支选不出任何序列 → 返回空 batch → running 一个 token 也不前进 → 没有序列结束 → block 永远不释放 → 队首永远进不来。这就是活锁, 本仓库的 engine.py 早期版本就死在这里。修法只有一行: prefill 进不来时落到 decode (Python 里就是 `_admit(budget) or _schedule_running(budget)` 的那个 or)。关键不在于 decode 更重要, 而在于必须保证「最老的那条序列总能前进」—— 有进度才有释放, 有释放才有名额。',
     }"
   >
     <template #controls>

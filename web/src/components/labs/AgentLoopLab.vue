@@ -10,7 +10,7 @@
     run="python -m llm_agent.m01_agent_loop.demo"
     :challenge="{
       ask: '关掉并行、打开「工具出错」, 先猜: 模型一共被调用几次? 累计 input tokens 大约是最终上下文的几倍?',
-      answer: '4 次 (search → 写错参数的 calculator → 改对的 calculator → final)。每次调用都要把 system + 全部历史重新发一遍, 所以累计 input (258) 已是最终上下文 (116) 的 2 倍多, 并随轮数近似平方增长 —— 这就是长会话贵、需要并行工具调用和上下文压缩的原因。错误没有抛异常, 而是变成 is_error=true 的 tool_result 回填, 模型下一轮自己改对了参数。',
+      answer: '4 次 (search → 写错参数的 calculator → 改对的 calculator → final)。每次调用都要把 system + 全部历史重新发一遍。所以累计 input (258) 已是最终上下文 (116) 的 2 倍多, 并随轮数近似平方增长。长会话贵、需要并行工具调用和上下文压缩, 原因就在这里。错误没有抛异常, 而是变成 is_error=true 的 tool_result 回填, 模型下一轮自己改对了参数。',
     }"
   >
     <template #controls>

@@ -6,7 +6,7 @@ python -m llm_finetune.run_finetune.grpo.train_grpo    # ~31 s
 
 ## 直觉
 同一个 prompt 采 G 条回复, 用程序判对错, 比组内平均好的就提高概率。组内均值就是 baseline, 不需要 critic; 判分是规则, 不需要 reward model。
-奖励 = `task.verify`: 排序全对 (含 EOS) 得 1 分, 否则 0 —— **依赖 prompt**, 不看 prompt 的策略拿不到分 (旧版 "token 落在词表后半区" 的奖励测不出这一点)。
+奖励 = `task.verify`: 排序全对 (含 EOS) 得 1 分, 否则 0 —— **依赖 prompt**, 不看 prompt 的策略拿不到分 (像 "token 落在词表后半区" 这种不看 prompt 的奖励就测不出这一点)。
 
 ## 核心公式
 `A_i = (r_i − mean_G r) / std_G r`，`ρ_t = π_θ(o_t)/π_old(o_t)`，`J = E[min(ρ_t A, clip(ρ_t, 1−ε_low, 1+ε_high) A)] − β·KL`

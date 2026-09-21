@@ -69,7 +69,7 @@ class JsonFSM:
         return (self.state, self.n_pairs, self.length, self.lit, self.spaced)
 
     def _separators(self) -> Set[str]:
-        """value 写完后能接什么。所有 value 类型共用这一处 (旧版 string 分支用 n_pairs、
+        """value 写完后能接什么。所有 value 类型共用这一处 (若 string 分支用 n_pairs、
         number 分支用 n_pairs+1, 导致 string 结尾时被迫 ≥2 对且可能超过 max_pairs)。"""
         n = self.n_pairs + 1                         # 算上刚写完、尚未结算的这一对
         return ({","} if n < self.max_pairs else set()) | ({"}"} if n >= self.min_pairs else set())

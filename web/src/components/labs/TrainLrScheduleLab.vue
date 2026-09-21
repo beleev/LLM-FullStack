@@ -10,7 +10,7 @@
     run="python -m llm_train.m10_training_stability.demo"
     :challenge="{
       ask: '原计划 1000 步, 训完发现 loss 还在降, 想加到 1600 步。cosine 和 WSD 各要回退多少步重训?',
-      answer: 'cosine 的 LR = f(step / 总步数): 总步数一改, warmup 之后每一步的 LR 都变了, 已经训过的 1000 步里只有 warmup 那一小段还「算数」—— 要么几乎从头重训, 要么硬着头皮把 LR 重新拉高 (re-warmup, loss 会先反弹)。WSD 的稳定段就是一条水平线, 与总步数无关: 只要回到退火刚开始时的那个 checkpoint (第 900 步附近), 继续保持高 LR 训到 1440 步再退火即可, 浪费的只有那约 100 步退火。这也是 MiniCPM / DeepSeek-V3 / Kimi 用 WSD 的原因: 同一条主干上随时可以分叉出一个退火分支来拿「成品」模型。',
+      answer: 'cosine 的 LR = f(step / 总步数)。总步数一改, warmup 之后每一步的 LR 都变了。已经训过的 1000 步里, 只有 warmup 那一小段还「算数」。于是要么几乎从头重训, 要么硬着头皮把 LR 重新拉高 (re-warmup, loss 会先反弹)。WSD 的稳定段就是一条水平线, 与总步数无关。只要回到退火刚开始时的那个 checkpoint (第 900 步附近), 继续保持高 LR 训到 1440 步再退火即可。浪费的只有那约 100 步退火。这也是 MiniCPM / DeepSeek-V3 / Kimi 用 WSD 的原因: 同一条主干上随时可以分叉出一个退火分支来拿「成品」模型。',
     }"
   >
     <template #controls>

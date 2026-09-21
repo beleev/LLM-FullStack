@@ -52,7 +52,7 @@ min-p 集合 == `{p_i ≥ min_p·p_max}`; T=0 与 T=1e-4 都等于 argmax; Gumbe
   bad_words、per-request seed、以及 m14 的结构化输出 mask (也是一个 `-inf` filter, 插在同一条链上)。
 
 ## 常见误区
-- "top-k 用 `logits >= 第k大值` 就行": 有并列值时会留下多于 k 个 (原实现就是这样, 已改为按下标保留)。
+- "top-k 用 `logits >= 第k大值` 就行": 有并列值时会留下多于 k 个, 所以要按下标保留。
 - "repetition penalty 就是 logit 除以 penalty": 负 logit 除以 >1 的数会变大, 反而鼓励重复 (见 [4])。
 - "top-p 和温度谁先谁后无所谓": 温度在前时, T 越大分布越平, 同样的 p 会留下更多 token。
 - "T=0 就是除以 0": 实现里必须特判成 argmax; 另外 greedy 也受 repetition penalty 影响 (penalty 在最前)。

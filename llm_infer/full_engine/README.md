@@ -25,8 +25,8 @@ step():  batch = scheduler.schedule()                       # [(seq, n)]
 `python -m llm_infer.full_engine.demo` (~1.5 s)
 - [1] `step 1 [s0:P45 s1:P3]`, `step 2 [s0:D s1:P39 s2:P8]` —— prefill chunk 与 decode 同步混跑, 每步 ≤ 48 token;
   需要 KV 的 token 305 = 实算 233 + 前缀命中 72
-- [2] 同样 5 条再来一遍: 实算 105 (第一轮 233) —— 已释放的 block 仍可命中, 且不再触发旧版的 stale-entry 崩溃
-- [3] 9 个 block 的 pool: 82 / 81 步, 抢占 4 次, 无活锁 (旧版在这里死循环)
+- [2] 同样 5 条再来一遍: 实算 105 (第一轮 233) —— 已释放的 block 仍可命中, 且不触发 stale-entry 崩溃
+- [3] 9 个 block 的 pool: 82 / 81 步, 抢占 4 次, 无活锁 (调度写错时这里会死循环)
 - [4] 同 batch 三种采样参数; [5] 30 组随机配置 fuzz: 214 条请求、34 次抢占
 - 全部断言: greedy 输出与 `TinyLM.generate_greedy` **逐 token 相同**, 无 block 泄漏
 
@@ -37,11 +37,11 @@ step():  batch = scheduler.schedule()                       # [(seq, n)]
 - 抢占只有 recompute, 没有 swap
 
 ## 常见误区
-- "分页 / 前缀缓存只是记账" —— 旧版确实如此 (KV 挂在 Sequence 上, 命中了照样整段 prefill); 现在 KV 只存在 pool 里, 命中的 token 不做前向
+- "分页 / 前缀缓存只是记账" —— 如果 KV 挂在 Sequence 上、命中了照样整段 prefill, 那确实只是记账。这里 KV 只存在 pool 里, 命中的 token 不做前向
 - "引擎很复杂" —— 复杂度都在调度策略与 kernel 里, 主循环就四行
 - "优化会改变输出" —— 这里所有优化都是**精确**的, 所以能用逐 token 相等做回归测试 (量化 / 稀疏注意力才是有损的)
 
 ## 自测题
 1. 一条序列前缀命中 24 token, prompt 共 45 token, 第一步 `runner.run` 的 `start_pos` 和 Q 的行数是多少 (预算充足)? **答**: start_pos=24, Q 有 21 行; K/V 经页表读回 45 行。
 2. 为什么 prefill 中途的 chunk 返回 `None` 而不采样? **答**: 它最后一个位置的 logits 预测的是 prompt 里已知的下一个 token, 不是新 token。
-3. 旧版引擎在 block 不够时为什么会死循环? **答**: `waiting` 非空就只走 prefill 分支, 队首拿不到 block 时什么都没选中就返回, running 从不 decode → block 永不释放。
+3. block 不够时, 什么样的调度会让引擎死循环? **答**: `waiting` 非空就只走 prefill 分支, 队首拿不到 block 时什么都没选中就返回, running 从不 decode → block 永不释放。

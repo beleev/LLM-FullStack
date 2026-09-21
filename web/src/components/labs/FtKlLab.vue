@@ -11,7 +11,7 @@
     module="llm_finetune/methods/on_policy_distill.py"
     :challenge="{
       ask: '先点「最小化 forward KL」, 再点「最小化 reverse KL」。两个最优学生分别落在哪? 各自的「垃圾样本率」是多少? 哪一个更像你希望小模型在生成时的表现?',
-      answer: 'forward KL = E_{x~p}[log p/q]: 期望在 teacher 的样本上取, 只要 teacher 有质量而 student 没有, log(p/q) 就爆炸 —— 所以学生被迫摊开盖住两个峰, 代价是把大量概率放在两峰之间 teacher 认为几乎不可能的低谷里 (垃圾样本率很高)。这就是离线蒸馏 / SFT 的行为: 在 teacher 写的数据上做 MLE。reverse KL = E_{x~q}[log q/p]: 期望在 student 自己的样本上取, student 没去的地方完全不罚, 去了 teacher 不认可的地方重罚 —— 于是它缩进一个峰, 样样像 teacher, 但放弃了另一种答法。on-policy 蒸馏 (学生采样、teacher 逐 token 打分) 优化的正是它: 容量小的学生宁可少会一点, 也不要胡说。',
+      answer: 'forward KL = E_{x~p}[log p/q], 期望在 teacher 的样本上取。只要 teacher 有质量而 student 没有, log(p/q) 就爆炸。所以学生被迫摊开盖住两个峰。代价是把大量概率放在两峰之间的低谷里 —— 那里 teacher 认为几乎不可能, 垃圾样本率很高。这就是离线蒸馏 / SFT 的行为: 在 teacher 写的数据上做 MLE。reverse KL = E_{x~q}[log q/p], 期望在 student 自己的样本上取。student 没去的地方完全不罚, 去了 teacher 不认可的地方重罚。于是它缩进一个峰: 样样像 teacher, 但放弃了另一种答法。on-policy 蒸馏 (学生采样、teacher 逐 token 打分) 优化的正是它: 容量小的学生宁可少会一点, 也不要胡说。',
     }"
   >
     <template #controls>

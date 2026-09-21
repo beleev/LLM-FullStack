@@ -67,7 +67,7 @@ for _ in range(max_new - 1):
     'infer-scheduler': {
       title: '调度与 prefill · 每一步都重新组 batch',
       subtitle: '读完你能说清"每步 token 预算"这一个旋钮, 怎么同时拧动 TBT 和 TTFT。',
-      tldr: '静态 batch 要等最长的那条; 连续批把调度粒度从"一个请求"缩到"一步前向", 每步重问一遍谁进谁出。一条长 prompt 会把所有正在 decode 的用户卡住, 所以再加两道: chunked prefill 把它切块混进 decode 的 batch (最大卡顿 297 → 52 ms), P/D 分离干脆把两类负载放到不同节点。',
+      tldr: '静态 batch 要等最长的那条; 连续批把调度粒度从"一个请求"缩到"一步前向", 每步重问一遍谁进谁出。一条长 prompt 会把所有正在 decode 的用户卡住, 所以再加两道。chunked prefill 把长 prompt 切块混进 decode 的 batch, 最大卡顿 297 → 52 ms。P/D 分离干脆把两类负载放到不同节点。',
       question: '队首请求因为 block 不够而进不来, 这一步调度器该干什么?',
       code: 'llm_infer/m03_continuous_batching · m06_chunked_prefill · m15_pd_disaggregation',
       points: [
@@ -158,7 +158,7 @@ for _ in range(max_new - 1):
     'infer-compute': {
       title: '算子与调度开销 · 一样的数学, 少搬几趟',
       subtitle: '读完你能说清 FlashAttention 快在哪一步, 以及 CUDA Graph 省的是谁的时间。',
-      tldr: 'FlashAttention 把 Q 和 K/V 都切块, 用 online softmax 增量维护最大值、分母和输出, 从不把 T×T 的分数矩阵写进显存 —— 工作集恒为 64×64, T=4096 时比 T² 小 4096 倍, 结果与朴素实现只差 1.78e-06。CUDA Graph 把一步几百次 kernel 提交压成 1 次。推理 TP 把每层权重切给多张卡, 一个 block 只需 2 次 all-reduce。',
+      tldr: 'FlashAttention 把 Q 和 K/V 都切块, 用 online softmax 增量维护最大值、分母和输出, 从不把 T×T 的分数矩阵写进显存。工作集恒为 64×64, T=4096 时比 T² 小 4096 倍, 结果与朴素实现只差 1.78e-06。CUDA Graph 把一步几百次 kernel 提交压成 1 次。推理 TP 把每层权重切给多张卡, 一个 block 只需 2 次 all-reduce。',
       question: 'FlashAttention 的 FLOPs 一点没少, 凭什么还能快?',
       code: 'llm_infer/m09_tensor_parallel · m11_flash_attention · m12_cuda_graph (量化见「INT4 · AWQ · KIVI」)',
       points: [
@@ -217,11 +217,11 @@ m = m_new
         {
           title: '难的只有调度那一步',
           key: true,
-          body: '前向、采样、后处理都是固定动作; 调度要同时管住三件事: block 够不够 (不够就抢占最年轻的)、队首会不会饿死 (进不来必须落到 decode)、这一步算多少 token (预算封顶每步耗时)。引擎的复杂度全在这里, 主循环只有四行。',
+          body: '前向、采样、后处理都是固定动作。调度要同时管住三件事。一是 block 够不够, 不够就抢占最年轻的。二是队首会不会饿死, 进不来必须落到 decode。三是这一步算多少 token, 用预算封顶每步耗时。引擎的复杂度全在这里, 主循环只有四行。',
         },
         {
           title: '账必须对得上',
-          body: 'prefix_hit_tokens + tokens_computed 必须等于全部需要 KV 的 token 数, 抢占后的重算也如实计入。这条 assert 是"省下的算力是真的"的唯一证据 —— 旧版引擎里命中了照样整段 prefill, 账一对就露馅。',
+          body: 'prefix_hit_tokens + tokens_computed 必须等于全部需要 KV 的 token 数, 抢占后的重算也如实计入。这条 assert 是"省下的算力是真的"的唯一证据 —— 命中了却照样整段 prefill 的引擎, 账一对就露馅。',
         },
       ],
       links: [
@@ -504,7 +504,7 @@ q = apply_rope(q, positions=pos[-1:])`,
         {
           title: 'tree mask',
           key: true,
-          body: 'anc[i, j] = "j 是 i 的祖先或就是 i"。每个节点看到的恰好是从根到自己那一条链, 等价于把每条路径各跑一次顺序 decode; 兄弟之间互不可见, 同深度共享同一个位置。一次 forward 就把整棵树验完。',
+          body: 'anc[i, j] = "j 是 i 的祖先或就是 i"。每个节点看到的恰好是从根到自己那一条链, 等价于把每条路径各跑一次顺序 decode。兄弟之间互不可见, 同深度共享同一个位置。一次 forward 就把整棵树验完。',
         },
         {
           title: '算力换延迟',
@@ -598,7 +598,7 @@ self.store(prompt)                            # 命中的提升回 GPU 层, 溢�
         },
         {
           title: '两步贪心',
-          body: '① 反复给"每副本负载"最大的那个专家再加一个副本; ② 把所有 slot 按负载从大到小, 依次放到当前最轻且还有空位的 rank 上。',
+          body: '① 反复给"每副本负载"最大的那个专家再加一个副本。② 把所有 slot 按负载从大到小, 依次放到当前最轻且还有空位的 rank 上。',
         },
         {
           title: '不可分的热点',

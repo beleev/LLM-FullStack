@@ -79,7 +79,7 @@ calculator: 2 + 3 * 4 = 14
 - 第二个问题的回答含 `10 / 4 = 2.5` 且不含 `14`; 全会话 `tool_use` 总数为 2 (第二问重新调用了工具)。
 - `llm_calls == 4`: 每个问题两次模型调用, 一次决定调工具, 一次读结果作答。
 
-关于旧 bug: 计算器曾用 `ast.Num` 判断数字节点, 该类在 Python 3.12 被移除, 在 3.12+ 上工具每次都返回 `ERROR` (工具异常会被 `ToolRegistry.execute` 转成 `is_error` 结果, loop 不会崩); 旧 demo 没有断言答案内容, 于是照样打印 OK。现在用 `ast.Constant` 并显式限定 `int / float`, 且第一条 `assert` 就是为了让这种"静默失败"无处可藏。
+一个容易踩的坑: 用 `ast.Num` 判断数字节点会在 Python 3.12+ 上失效 (该类已被移除), 工具每次都返回 `ERROR` —— 而工具异常会被 `ToolRegistry.execute` 转成 `is_error` 结果, loop 照常跑完, 不会崩。如果 demo 只打印不断言, 这种静默失败就一直藏着。所以这里用 `ast.Constant` 并显式限定 `int / float`, 第一条 `assert` 直接检查答案内容。
 
 ## 与真实系统的差距
 

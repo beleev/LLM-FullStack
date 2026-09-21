@@ -24,7 +24,7 @@ python -m llm_models.run_models.language_models.gpt3.infer_gpt3
 ## 常见误区
 - "loss 从 6.9 降到 0.07 = 学会了语言": 不是。数据是**固定的一个随机 batch**, 下降只说明模型背下了它,
   验证的是 forward/backward/优化器通路。每步换新随机 batch 时 loss 会停在 ln V。
-- "初始 loss 多大无所谓": 本库修复前是 ~255 (N(0,1) embedding + weight tying → 初始 logits 标准差 ≈ sqrt(D))。
+- "初始 loss 多大无所谓": N(0,1) embedding + weight tying 会让初始 logits 标准差 ≈ sqrt(D), 首步 loss 冲到 ~255。
   现在统一 `init_weights` N(0, 0.02²)。
 - "KV cache 是近似": 不是, 是精确等价; 本脚本用 `torch.equal` 断言。Sin-PE 下要记得给位置编码加 offset。
 

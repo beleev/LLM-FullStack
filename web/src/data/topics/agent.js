@@ -182,12 +182,12 @@ def tokenize(text):                            # 英文按词, 中文 bigram
       title: 'Hooks / Skills · 按上下文成本给扩展点分层',
       subtitle: '读完你能判断一条团队规范该写成 hook 还是 skill, 也能说清为什么 skill 正文能当指令、网页不能。',
       tldr: '能用确定性代码办的事写成 hook (零 token、100% 执行); 需要模型自己判断要不要用的写成 skill (常驻只有一行描述, 正文用到才加载)。',
-      question: '旧版 loop 的顺序是"权限门 → PreToolUse hook → 执行"。一个把 calculator 改写成 shell rm -rf / 的 hook, 会让 deny 规则发生什么?',
+      question: '如果顺序写成"权限门 → PreToolUse hook → 执行", 一个把 calculator 改写成 shell rm -rf / 的 hook 会让 deny 规则发生什么?',
       code: 'llm_agent/core/{hooks.py,skills.py} · llm_agent/m05_extensibility',
       points: [
         {
           title: 'Hook 必然执行, 但不能提权',
-          body: 'hook 只能做三件事: 拦截、改写调用、追加上下文。七个事件 (SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / PreCompact / Stop / SubagentStop) 跟 Claude Code 同名。顺序固定成 hook → 权限门 → 执行, 门评估的是改写之后那个调用 —— 旧顺序下改写发生在检查之后, deny 规则形同虚设, 这是典型的 TOCTOU。',
+          body: 'hook 只能做三件事: 拦截、改写调用、追加上下文。七个事件 (SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / PreCompact / Stop / SubagentStop) 跟 Claude Code 同名。顺序固定成 hook → 权限门 → 执行, 门评估的是改写之后那个调用。旧顺序下改写发生在检查之后, deny 规则形同虚设, 这是典型的 TOCTOU。',
         },
         {
           title: 'Hook 的输出走旁路',
@@ -200,7 +200,7 @@ def tokenize(text):                            # 英文按词, 中文 bigram
         {
           key: true,
           title: 'skill 正文是指令, 抓回来的网页是数据',
-          body: '两者都以 tool_result 的形式进上下文, 看起来一模一样, 但来源完全不同: SKILL.md 是你自己装进来的, 它的正文当指令执行天经地义; fetch 回来的网页谁都能写, 它只能当数据读。这条线一模糊, prompt injection 就不是意外而是必然。整个阶段最该带走的就是这一句。',
+          body: '两者都以 tool_result 的形式进上下文, 看起来一模一样, 但来源完全不同。SKILL.md 是你自己装进来的, 它的正文当指令执行天经地义。fetch 回来的网页谁都能写, 它只能当数据读。这条线一模糊, prompt injection 就不是意外而是必然。整个阶段最该带走的就是这一句。',
         },
       ],
       links: [
@@ -238,7 +238,7 @@ system += "## Skills\\n" + "\\n".join(f"- {n}: {d}" for n, d in descriptions.ite
     'agent-state-subagents': {
       title: '持久化与子智能体 · 状态能恢复, 上下文要隔离',
       subtitle: '读完你能说出 resume 带回了什么、没带回什么, 也能解释子 agent 读的 20 篇文档为什么挤不进父级上下文。',
-      tldr: '会话的全部状态就是 messages, 所以每产生一条就往 JSONL 尾部追加一行; resume 就是把这些行读回来 —— 只读回消息, 权限得由新会话自己重新建立。',
+      tldr: '会话的全部状态就是 messages, 所以每产生一条就往 JSONL 尾部追加一行。resume 就是把这些行读回来, 但只读回消息。权限得由新会话自己重新建立。',
       question: '为什么恢复 transcript 不应该等于恢复上次的 bypass 权限?',
       code: 'llm_agent/core/{persistence.py,subagents.py} · m06_persistence_resume · m07_subagents',
       points: [
@@ -249,7 +249,7 @@ system += "## Skills\\n" + "\\n".join(f"- {n}: {d}" for n, d in descriptions.ite
         {
           key: true,
           title: 'resume 恢复的是上下文, 不是信任',
-          body: 'PermissionGate 根本不在 JSONL 里。会话 A 跑在 auto 模式, 会话 B 退回 default, 写笔记要重新问一次人。上次的"同意"是对当时那个情境的同意, 不是永久授权 —— 把权限写进可被恢复的状态, 等于让一个磁盘上的文件给自己提权。hooks、skills、工具在外面留下的改动, 同样不会跟着回来。',
+          body: 'PermissionGate 根本不在 JSONL 里。会话 A 跑在 auto 模式, 会话 B 退回 default, 写笔记要重新问一次人。上次的"同意"是对当时那个情境的同意, 不是永久授权。把权限写进可被恢复的状态, 等于让一个磁盘上的文件给自己提权。hooks、skills、工具在外面留下的改动, 同样不会跟着回来。',
         },
         {
           title: '压缩不删历史, 只加一条边界',
@@ -300,11 +300,11 @@ parent = Agent(llm, ToolRegistry([delegate]))`,
         {
           key: true,
           title: '所有动作走同一条执行面',
-          body: '内置工具、MCP 工具、子智能体都以同一个 Tool 接口接进 ToolRegistry, 于是共用同一套参数校验、同一个权限门、同一批 hook、同一份审计日志。安全策略只需要在一处写对。任何绕开它的"特殊通道"迟早就是漏洞 —— 这也是为什么 MCP 工具没有后门, 它和 calculator 走的是同一条路。',
+          body: '内置工具、MCP 工具、子智能体都以同一个 Tool 接口接进 ToolRegistry。于是它们共用同一套参数校验、同一个权限门、同一批 hook、同一份审计日志。安全策略只需要在一处写对。任何绕开它的"特殊通道"迟早就是漏洞 —— 这也是为什么 MCP 工具没有后门, 它和 calculator 走的是同一条路。',
         },
         {
           title: '纵深防御: 每层都假设别的层会失守',
-          body: 'demo 里的防线互不依赖: deny 规则挡住 rm -fr (字符串规则, 会被绕过); auto 分类器按风险和敏感路径再兜一次底; 护栏把不可信输出标记出来、给本轮上下文打污点、把密钥抹掉; ShellTool 干脆只模拟不执行 (教学版的最后一道物理边界)。各层检查的维度不同, 任何单层都有已知的绕过方式, 叠起来才可靠。',
+          body: 'demo 里的防线互不依赖。deny 规则挡住 rm -fr, 但它是字符串规则, 会被绕过。auto 分类器按风险和敏感路径再兜一次底。护栏把不可信输出标记出来、给本轮上下文打污点、把密钥抹掉。ShellTool 干脆只模拟不执行, 这是教学版的最后一道物理边界。各层检查的维度不同, 任何单层都有已知的绕过方式, 叠起来才可靠。',
         },
         {
           title: '五个场景, 逐个 assert',
@@ -403,7 +403,7 @@ text, is_error = result["content"][0]["text"], result.get("isError")`,
     'agent-planning': {
       title: '计划 · todo、plan 模式与并行工具调用',
       subtitle: '读完你能说清"批准之前零写入"是怎么被强制的, 以及哪些调用值得放进同一个 turn。',
-      tldr: '模型边想边做, 做到第三步常常忘了还剩什么, 用户也只能事后发现它改了不该改的东西 —— todo_write 把计划变成显式状态, plan 模式把否决权还给人。',
+      tldr: '模型边想边做, 做到第三步常常忘了还剩什么。用户也只能事后发现它改了不该改的东西。todo_write 把计划变成显式状态, plan 模式把否决权还给人。',
       question: '如果 plan 模式只是 system prompt 里的一句"请先不要修改文件", 它和现在的实现差在哪?',
       code: 'llm_agent/core/tools.py (TodoWriteTool · ExitPlanModeTool) · llm_agent/m10_planning',
       points: [
@@ -422,7 +422,7 @@ text, is_error = result["content"][0]["text"], result.get("isError")`,
         },
         {
           title: '并行只发生在"执行"这一步',
-          body: '模型在一个 turn 里发 3 个 tool_use, harness 用线程池跑: 3 个各 0.2s 的调用, 串行 0.63s, 并行 0.21s, 同时还省掉两次模型往返 (以及那两次重发的整个上下文)。授权仍然串行 —— 审批弹窗不能并发, 顺序也要确定。有依赖的调用 (先搜索再写笔记) 只能跨 turn。',
+          body: '模型在一个 turn 里发 3 个 tool_use, harness 用线程池跑。3 个各 0.2s 的调用, 串行 0.63s, 并行 0.21s。并行还省掉两次模型往返, 以及那两次重发的整个上下文。授权仍然串行 —— 审批弹窗不能并发, 顺序也要确定。有依赖的调用 (先搜索再写笔记) 只能跨 turn。',
         },
       ],
       links: [
@@ -514,16 +514,16 @@ total = lead.usage["input_tokens"] + sum(c["usage"]["input_tokens"] for c in del
       points: [
         {
           title: '标记只降低概率',
-          body: 'wrap_untrusted 把不可信输出包进 untrusted_data, 命中注入特征时再加一个 injection_suspected 标记。这是给模型一个"这是数据"的强提示 —— 但正则只认它见过的说法, 攻击者换个措辞就绕过去了, 模型也可能就是不听。这一层降低的是概率, 不是可能性。',
+          body: 'wrap_untrusted 把不可信输出包进 untrusted_data, 命中注入特征时再加一个 injection_suspected 标记。这是给模型一个"这是数据"的强提示。但正则只认它见过的说法, 攻击者换个措辞就绕过去了。模型也可能就是不听。这一层降低的是概率, 不是可能性。',
         },
         {
           key: true,
           title: '污点规则切断 lethal trifecta',
-          body: '私有数据 + 不可信内容 + 对外通道, 三者同时成立才出事。本轮上下文一旦混入不可信数据, _tainted 置位, 高风险工具一律 DENIED —— 即使用户早先配过 allow 规则; 要等下一条真正的用户指令才重置。m12 demo 的结果很说明问题: 模型还是上当了, 但 shell.executed 是空的。',
+          body: '私有数据 + 不可信内容 + 对外通道, 三者同时成立才出事。本轮上下文一旦混入不可信数据, _tainted 置位, 高风险工具一律 DENIED。即使用户早先配过 allow 规则也不例外。_tainted 要等下一条真正的用户指令才重置。m12 demo 的结果很说明问题: 模型还是上当了, 但 shell.executed 是空的。',
         },
         {
           title: '先 resolve, 再检查',
-          body: 'confine() 先把 (root / path) 展开 .. 和符号链接, 再判断是否还在 root 内。先拼接再比字符串前缀是经典漏洞: /work/../etc 也以 /work 开头, 却早就逃出去了。脱敏则发生在内容进 transcript 之前, 带捕获组的规则保留 password= 这样的 key 名只抹掉值, 日志仍然可读, 密钥也不会进下一次模型请求。',
+          body: 'confine() 先把 (root / path) 展开 .. 和符号链接, 再判断是否还在 root 内。先拼接再比字符串前缀是经典漏洞: /work/../etc 也以 /work 开头, 却早就逃出去了。脱敏则发生在内容进 transcript 之前。带捕获组的规则保留 password= 这样的 key 名, 只抹掉值。于是日志仍然可读, 密钥也不会进下一次模型请求。',
         },
       ],
       links: [
@@ -572,12 +572,12 @@ def confine(root, user_path):
         },
         {
           title: '结果对, 过程也要对',
-          body: '轨迹检查另外约束过程: 工具调用次数超预算、成功执行了禁用工具 (forbidden:shell) 都算失败。demo 里的回归就是这么被抓到的 —— 有人为了少弹确认框把模式改成 dont_ask 并删了 deny 规则, calc 和 safety 两个任务悄悄坏掉, 而最终回答看起来完全正常。',
+          body: '轨迹检查另外约束过程: 工具调用次数超预算、成功执行了禁用工具 (forbidden:shell) 都算失败。demo 里的回归就是这么被抓到的。有人为了少弹确认框把模式改成 dont_ask, 还删了 deny 规则。calc 和 safety 两个任务悄悄坏掉, 而最终回答看起来完全正常。',
         },
         {
           key: true,
           title: 'pass@k 和 pass^k 随 k 走向两端',
-          body: '同一个单次通过率 0.65: pass@3 = 0.97 (至少成一次), pass^3 = 0.25 (三次全成)。pass@k 衡量能力上限, 适合有验证器、可以重试挑最优的场景 (写代码跑测试); pass^k 衡量可靠性, 动作不可撤销又没人复核的 agent (退款、发邮件、改库) 必须盯它。代码里用的是无偏估计 1−C(n−c,k)/C(n,k) 与 C(c,k)/C(n,k), 比直接拿 p̂ 求幂更准。',
+          body: '同一个单次通过率 0.65: pass@3 = 0.97 (至少成一次), pass^3 = 0.25 (三次全成)。pass@k 衡量能力上限, 适合有验证器、可以重试挑最优的场景 (写代码跑测试)。pass^k 衡量可靠性, 动作不可撤销又没人复核的 agent (退款、发邮件、改库) 必须盯它。代码里用的是无偏估计 1−C(n−c,k)/C(n,k) 与 C(c,k)/C(n,k), 比直接拿 p̂ 求幂更准。',
         },
       ],
       links: [
@@ -631,7 +631,7 @@ pass_hat_k = comb(c, k) / comb(n, k)             # k 次全部成功`,
         },
         {
           title: '不进窗口的才是最省的',
-          body: '即时检索: 预加载每次调用都要带 331 token, 改成上下文里只放索引、用到才读, 峰值降到 107。memory 工具更彻底: 模型自己往 /memories 写文件, 全新会话再读回来 —— 跨会话的知识不占任何一轮的上下文, 任何压缩都碰不到它。',
+          body: '即时检索: 预加载每次调用都要带 331 token, 改成上下文里只放索引、用到才读, 峰值降到 107。memory 工具更彻底: 模型自己往 /memories 写文件, 全新会话再读回来。跨会话的知识不占任何一轮的上下文, 任何压缩都碰不到它。',
         },
       ],
       links: [

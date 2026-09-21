@@ -11,7 +11,7 @@
     run="python -m llm_train.m03_tensor_parallel.demo"
     :challenge="{
       ask: 'A 行切时, 为什么不能像列切那样先各算各的 GeLU、最后再求和? 关掉同步点 ① 看看 Δ。',
-      answer: '行切后每张卡算出的是 X·A 的一个「部分和」, 而 GeLU 不是线性的: GeLU(a+b) ≠ GeLU(a)+GeLU(b), 所以必须在 GeLU 之前先 all-reduce。列切则不同: 每张卡拿到的是 X·A 的一段完整的列, 逐元素的 GeLU 在本地做完全正确; 接着 B 行切正好吃下这一段, 得到部分和, 最后只需一次 all-reduce。Megatron 的「列切→行切」就是把通信推迟到唯一躲不掉的那个求和点。',
+      answer: '行切后每张卡算出的是 X·A 的一个「部分和」, 而 GeLU 不是线性的: GeLU(a+b) ≠ GeLU(a)+GeLU(b), 所以必须在 GeLU 之前先 all-reduce。列切则不同: 每张卡拿到的是 X·A 的一段完整的列, 逐元素的 GeLU 在本地做完全正确。接着 B 行切正好吃下这一段, 得到部分和, 最后只需一次 all-reduce。Megatron 的「列切→行切」就是把通信推迟到唯一躲不掉的那个求和点。',
     }"
   >
     <template #controls>

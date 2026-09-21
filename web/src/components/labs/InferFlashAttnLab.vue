@@ -2,7 +2,7 @@
 <template>
   <LabFrame
     title="FlashAttention — 分块 + online softmax"
-    sub="左边是 N×N 的注意力分数矩阵 (因果, 右上角被 mask)。它从不完整存在: 每次只有一个 tile (橙色) 进 SRAM。点左侧的 q 行号跟踪一行 query: 它只靠「运行最大值 m」和「运行分母 l」两个数, 就能在看完最后一个 tile 时得到和整行 softmax 完全相同的结果。"
+    sub="左边是 N×N 的注意力分数矩阵 (因果, 右上角被 mask)。它从不完整存在: 每次只有一个 tile (橙色) 进 SRAM。点左侧的 q 行号跟踪一行 query。这一行只靠「运行最大值 m」和「运行分母 l」两个数, 就能在看完最后一个 tile 时得到和整行 softmax 完全相同的结果。"
     module="llm_infer/m11"
     run="python -m llm_infer.m11_flash_attention.demo"
     :challenge="{

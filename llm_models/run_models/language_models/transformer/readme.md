@@ -19,7 +19,7 @@ python -m llm_models.run_models.language_models.transformer.train_transformer
 
 ## 运行后应该看到什么 (CPU 实测)
 - infer: `改未来 tgt → 过去 logits 变化 0.00e+00 | 改 src → 每个 tgt 位置至少变化 0.0214 | 改 src pad → 0.00e+00`, 随后打印 5 步贪心解码结果 (未训练, token 无意义)。
-- train: 初始 loss 6.972 (ln 1000 = 6.908) → 60 步后 0.046 (约 6 秒)。初始化修复前初始 loss 为 7.068。
+- train: 初始 loss 6.972 (ln 1000 = 6.908) → 60 步后 0.046 (约 6 秒)。
 - src 与 tgt 是**互不相关的固定随机序列**, 下降 = 背下这个 batch。
 
 ## 常见误区

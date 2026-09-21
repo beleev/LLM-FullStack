@@ -26,7 +26,7 @@ def main() -> None:
 
     print("\n[1] 一次完整闭环")
     final = agent.run("请计算 2 + 3 * 4")
-    assert "2 + 3 * 4 = 14" in final, final  # 旧版在 Python 3.12+ 上这里是 ERROR, 却照样打印 OK
+    assert "2 + 3 * 4 = 14" in final, final  # 没有这条 assert, 计算器报错也会照样打印 OK —— 无条件的 "OK" 起不到回归保护
 
     print("\n[transcript]")
     for msg in agent.messages:

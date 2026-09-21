@@ -10,7 +10,7 @@
     run="python -m llm_agent.m10_planning.demo"
     :challenge="{
       ask: '打开「配一条 allow write_note 规则」, 停在 plan 模式 —— write_note 会被放行吗? 再打开「把 delegate 标成只读」, 计划还没批准, 磁盘上为什么已经多了一条笔记?',
-      answer: 'allow 规则不放行。_evaluate_one 按 deny → ask → allow 的顺序查规则, 但 plan 模式下处理完 deny 就 break, ask 和 allow 规则根本不看; 否则一条早先配好的 allow 就能让 plan 模式形同虚设 (deny 规则在 plan 模式下照常生效, 连只读工具也能被拒)。delegate 那个洞更隐蔽: 它的 read_only 是工具作者自己声明的类属性, harness 无法验证, 标错就是漏洞。子 agent 跑的是自己那扇 auto 模式的门, 里面的 write_note 是 medium 风险, 直接放行 —— 于是「批准前零写入」的承诺被一层委托绕开了。所以 core/subagents.py 里 DelegateTool 显式写了 read_only = False, 并且在注释里说明了原因。',
+      answer: 'allow 规则不放行。_evaluate_one 按 deny → ask → allow 的顺序查规则。但 plan 模式下处理完 deny 就 break, ask 和 allow 规则根本不看。否则一条早先配好的 allow 就能让 plan 模式形同虚设。deny 规则在 plan 模式下照常生效, 连只读工具也能被拒。delegate 那个洞更隐蔽: 它的 read_only 是工具作者自己声明的类属性, harness 无法验证, 标错就是漏洞。子 agent 跑的是自己那扇 auto 模式的门, 里面的 write_note 是 medium 风险, 直接放行 —— 于是「批准前零写入」的承诺被一层委托绕开了。所以 core/subagents.py 里 DelegateTool 显式写了 read_only = False, 并且在注释里说明了原因。',
     }"
   >
     <template #controls>

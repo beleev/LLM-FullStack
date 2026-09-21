@@ -60,7 +60,7 @@ def main():
         ln = KVLink(gbps)
         print(f"  {name:<28} {gbps:>6} {ln.bytes_per_s / 1e9:>7.1f} {ln.transfer_ms(big):>9.1f}")
     ms_400 = KVLink(400).transfer_ms(big)
-    wrong_ms = big / (400 * 1e9) * 1e3                       # 旧版 bug: 把 Gbps 当 GB/s, 少除了 8
+    wrong_ms = big / (400 * 1e9) * 1e3                       # 常见错误: 把 Gbps 当 GB/s, 少除了 8
     kv("400 Gbps: 正确 / 把 Gbps 当 GB/s", f"{ms_400:.1f} ms / {wrong_ms:.1f} ms  (低估 {ms_400 / wrong_ms:.0f}x)")
     assert KVLink(400).bytes_per_s == 50e9 and abs(ms_400 / wrong_ms - 8) < 1e-9
     assert abs(ms_400 - 2147483648 / 50e9 * 1e3) < 1e-9

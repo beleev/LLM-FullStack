@@ -4,24 +4,34 @@
       <!-- 起点 / 终点 -->
       <div v-if="step.type === 'input'" class="flow-node input">
         <div class="node-label mono">{{ step.label }}</div>
-        <ShapeTuple :shape="step.shape" :ctx="ctx" />
+        <div class="shape-row">
+          <ShapeTuple :shape="step.shape" :ctx="ctx" />
+          <SizeBar :shape="step.shape" :ctx="ctx" :max="maxNumel" />
+        </div>
         <div v-if="step.note" class="node-note">{{ step.note }}</div>
       </div>
 
       <div v-else-if="step.type === 'output'" class="flow-node output">
         <div class="node-label mono">{{ step.label }}</div>
-        <ShapeTuple :shape="step.shape" :ctx="ctx" />
+        <div class="shape-row">
+          <ShapeTuple :shape="step.shape" :ctx="ctx" />
+          <SizeBar :shape="step.shape" :ctx="ctx" :max="maxNumel" />
+        </div>
       </div>
 
       <!-- 单步 op -->
       <div v-else-if="step.type === 'op'"
-           :class="['flow-node', 'op', step.kind || 'matmul', { highlight: step.highlight }]">
+           :class="['flow-node', 'op', step.kind || 'matmul',
+                    { highlight: step.highlight, lit: usesParam(step) }]">
         <div class="op-line">
           <code class="op-expr">{{ step.op }}</code>
           <span v-if="step.out" class="arrow">→</span>
           <span v-if="step.out" class="out-name mono">{{ step.out }}</span>
         </div>
-        <ShapeTuple v-if="step.shape" :shape="step.shape" :ctx="ctx" />
+        <div v-if="step.shape" class="shape-row">
+          <ShapeTuple :shape="step.shape" :ctx="ctx" />
+          <SizeBar :shape="step.shape" :ctx="ctx" :max="maxNumel" />
+        </div>
         <div v-if="step.note" class="node-note">{{ step.note }}</div>
       </div>
 
@@ -30,13 +40,17 @@
         <div v-if="step.note" class="branch-note">↓ {{ step.note }}</div>
         <div class="branch-row">
           <div v-for="(b, j) in step.items" :key="j"
-               :class="['flow-node', 'op', 'branch-item', b.kind || 'matmul']">
+               :class="['flow-node', 'op', 'branch-item', b.kind || 'matmul',
+                        { lit: usesParam(b) }]">
             <div class="op-line">
               <code class="op-expr">{{ b.op }}</code>
               <span v-if="b.out" class="arrow">→</span>
               <span v-if="b.out" class="out-name mono">{{ b.out }}</span>
             </div>
-            <ShapeTuple v-if="b.shape" :shape="b.shape" :ctx="ctx" />
+            <div v-if="b.shape" class="shape-row">
+              <ShapeTuple :shape="b.shape" :ctx="ctx" />
+              <SizeBar :shape="b.shape" :ctx="ctx" :max="maxNumel" />
+            </div>
             <div v-if="b.note" class="node-note">{{ b.note }}</div>
           </div>
         </div>
@@ -49,12 +63,31 @@
 </template>
 
 <script setup>
+import { computed } from 'vue'
 import ShapeTuple from './ShapeTuple.vue'
+import SizeBar from './SizeBar.vue'
+import { numelOf } from '@/data/inspector.js'
 
-defineProps({
+const props = defineProps({
   steps: { type: Array, required: true },
   ctx:   { type: Object, required: true },
+  // 鼠标停在左边哪个权重上 —— 用到它的那几步会亮起来
+  activeParam: { type: String, default: '' },
 })
+
+// 全流程里最大的那个张量; 每条的长度都相对它, 所以 [B,H,T,T] 会明显压过别人
+const maxNumel = computed(() => {
+  let m = 0
+  for (const s of props.steps) {
+    for (const x of s.type === 'branch' ? s.items : [s]) {
+      if (x.shape) m = Math.max(m, numelOf(x.shape, props.ctx))
+    }
+  }
+  return m || 1
+})
+
+const usesParam = (step) =>
+  !!props.activeParam && String(step.op || '').includes(props.activeParam)
 </script>
 
 <style scoped>
@@ -86,6 +119,13 @@ defineProps({
   font-weight: 600;
   margin-bottom: 4px;
   color: var(--text);
+}
+
+.shape-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* 被左边权重表点亮的那几步 */
+.flow-node.op.lit {
+  background: color-mix(in srgb, var(--warn) 12%, var(--bg-elev));
+  border-color: var(--warn);
 }
 
 /* 分类颜色 (左边框) */

@@ -7,7 +7,7 @@
     run="python -m llm_infer.m06_chunked_prefill.demo"
     :challenge="{
       ask: '把 token 预算 B 从 128 拖到 1024, decode 用户的最大卡顿和新请求的 TTFT 各往哪边走? 有没有两头都好的 B?',
-      answer: '没有。B 越小, 每步耗时上限 20 + 0.25·B 越低, decode 用户的最大 TBT 越小; 但长 prompt 被切成更多块, 每块都要多付一次 20 ms 固定开销、还要和 decode 分享预算, 所以新请求的 TTFT 变长 (默认参数: 276 ms → 445 ms)。B 是延迟抖动和首 token 延迟之间的旋钮, 不是免费午餐。',
+      answer: '没有。B 越小, 每步耗时上限 20 + 0.25·B 越低, decode 用户的最大 TBT 越小。但 B 越小, 长 prompt 就被切成更多块: 每块都要多付一次 20 ms 固定开销, 还要和 decode 分享预算。所以新请求的 TTFT 变长 (默认参数: 276 ms → 445 ms)。B 是延迟抖动和首 token 延迟之间的旋钮, 不是免费午餐。',
     }"
   >
     <template #controls>

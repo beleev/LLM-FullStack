@@ -10,7 +10,7 @@
     run="python -m llm_infer.m14_structured_output.demo"
     :challenge="{
       ask: '重置后, 用最少的 token 拼出 {&quot;id&quot;:42}。需要几个? 再勾上「只用单字符词表」拼同一个串。为什么 true 这个 token 在「等 value」状态合法, 而 tru 也合法、}} 却永远非法?',
-      answer: '多字符词表 5 个 token: {&quot; → id → &quot;: → 42 → }, 再加 EOS (其中 &quot;: 一口气跨了 2 个状态); 单字符要 9 个。合法性的定义是「整段字符都能沿 DFA 走通」: true 从 value? 走 4 步落到「, 或 }」; tru 走 3 步停在字面量中间 (之后只能接 e); }} 的第二个 } 在结束态无路可走, 对所有状态都是 −1。这张 S×V 表离线算一次, 在线每步只查一行 —— 否则每步要对全词表逐字符试走, 纯 CPU 开销卡在 GPU 前向和采样之间。',
+      answer: '多字符词表 5 个 token: {&quot; → id → &quot;: → 42 → }, 再加 EOS (其中 &quot;: 一口气跨了 2 个状态); 单字符要 9 个。合法性的定义是「整段字符都能沿 DFA 走通」。true 从 value? 走 4 步落到「, 或 }」。tru 走 3 步停在字面量中间, 之后只能接 e。}} 的第二个 } 在结束态无路可走, 对所有状态都是 −1。这张 S×V 表离线算一次, 在线每步只查一行 —— 否则每步要对全词表逐字符试走, 纯 CPU 开销卡在 GPU 前向和采样之间。',
     }"
   >
     <template #controls>

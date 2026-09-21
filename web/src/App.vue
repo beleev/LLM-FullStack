@@ -127,7 +127,6 @@
 
         <div class="section-label">关于</div>
         <div class="footer">
-          <p class="mono">v0.4.0</p>
           <p>六个目录已接入 Web 教程, 每章都对照原始代码阅读。</p>
           <p>键盘 ← / → 翻章。进度只存在本机浏览器。</p>
         </div>

@@ -7,7 +7,7 @@
     run="python -m llm_infer.m22_sparse_attention.demo"
     :challenge="{
       ask: '把「针的强度」拖到 0, 再比较 Quest 打分和随机选块的误差。稀疏注意力还有用吗?',
-      answer: '几乎没用。强度为 0 时所有 key 都是噪声, 注意力均匀弥散在 1024 个 token 上 —— 没有「少数重要 token」, 读 1/8 的 KV 就只能拿到约 1/8 的注意力质量, 怎么打分都和随机差不多。稀疏 decode 的收益完全来自注意力高度集中这个经验事实 (训练过的 LLM 成立; 随机权重的 TinyLM 不成立, Python demo 也如实展示了这一点)。',
+      answer: '几乎没用。强度为 0 时所有 key 都是噪声, 注意力均匀弥散在 1024 个 token 上。没有「少数重要 token」, 读 1/8 的 KV 就只能拿到约 1/8 的注意力质量。这时怎么打分都和随机差不多。稀疏 decode 的收益完全来自注意力高度集中这个经验事实 (训练过的 LLM 成立; 随机权重的 TinyLM 不成立, Python demo 也如实展示了这一点)。',
     }"
   >
     <template #controls>

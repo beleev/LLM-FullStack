@@ -1,10 +1,12 @@
 # LLM 全栈教具库
 
-从 numpy 手写反向传播 → PyTorch 现代架构 → 规模化训练 → 微调对齐 → 推理优化 → Agent 应用层 —— **六个递进阶段**，把"训出一个能用、能部署、能行动的大模型系统"拆成可独立运行的教学模块。
+把"训出一个能用、能部署、能行动的大模型系统"拆成**六个递进阶段**，每个阶段都能单独跑。
+
+numpy 手写反向传播 → PyTorch 现代架构 → 规模化训练 → 微调对齐 → 推理优化 → Agent 应用层。
 
 - 每个模块 `python -m xxx.demo` 单独跑，CPU 几秒到几十秒，零 GPU 依赖。
 - 每个 demo 末尾都用 `assert` 验证它声称的结论（与单卡基线逐位相等、与朴素解码逐 token 相同……），不是打印一句 OK。
-- 配套 **交互式 Web 教程**：84 个可拖、可点、可单步播放的实验台，218 道章末自测，术语速查，页面上的代码直接取自仓库里的 Python 源文件。
+- 配套 **交互式 Web 教程**：84 个可拖、可点、可单步播放的实验台，218 道章末自测，还有术语速查。页面上的代码直接取自仓库里的 Python 源文件。
 
 **在线教程**: https://beleev.github.io/LLM-FullStack/
 
@@ -24,7 +26,9 @@
 阶段 6 · llm_agent       Agent 循环 / 工具 / 权限 / 上下文工程 / Hook / Skill / MCP / 子智能体 / 护栏 / 评测
 ```
 
-推荐节奏：**先在网页上拖实验台建立直觉 → 做章末自测 → 再跑对应的 Python demo 读源码**。每个模块目录下的 README 都是同一个结构：直觉 / 核心公式 / 运行后应该看到什么（真实数字）/ 与真实系统的差距 / 常见误区 / 3 道自测题。
+推荐节奏：**先在网页上拖实验台建立直觉 → 做章末自测 → 再跑对应的 Python demo 读源码**。每个模块目录下的 README 都是同一个结构：
+
+> 直觉 → 核心公式 → 运行后应该看到什么（真实数字）→ 与真实系统的差距 → 常见误区 → 3 道自测题
 
 ## 安装与运行
 
@@ -100,17 +104,42 @@ npm run check:sources        # 校验页面引用的每个 Python 符号都还�
 
 ### 阶段 4 · 微调对齐 (llm_finetune)
 
-SFT（prompt mask）· LoRA · QLoRA（NF4 真 4-bit 打包）· DoRA · DPO · SimPO · ORPO · Reward Model（Bradley–Terry）· GRPO（重要性比率 + clip）及 DAPO / Dr.GRPO / GSPO 变体 · 离线蒸馏（forward KL）· on-policy 蒸馏（reverse KL）。合成任务是**依赖 prompt 的可学习任务**，用留出集指标而不是"loss 下降了"来验证。
+| 类别 | 方法 |
+|------|------|
+| 指令微调 | SFT（prompt mask） |
+| 参数高效 | LoRA · QLoRA（NF4 真 4-bit 打包）· DoRA |
+| 偏好对齐 | DPO · SimPO · ORPO · Reward Model（Bradley–Terry） |
+| 在线 RL | GRPO（重要性比率 + clip），及 DAPO / Dr.GRPO / GSPO 变体 |
+| 蒸馏 | 离线（forward KL）· on-policy（reverse KL） |
+
+合成任务是**依赖 prompt 的可学习任务**。验证看留出集指标，不看"loss 下降了"。
 
 ### 阶段 5 · 推理优化 (llm_infer)
 
-KV Cache · PagedAttention · Continuous Batching（含抢占）· Prefix Cache · Radix Cache · Chunked Prefill（Sarathi 混批）· Speculative Decoding（拒绝采样 + 分布保持检验）· INT8 / group-wise INT4 / AWQ / KIVI KV 量化 · Tensor Parallel · Sampling · FlashAttention（Q/KV 双向分块 + LSE）· CUDA Graph · Multi-LoRA · Structured Output（token 级预编译语法 mask）· P/D 分离 · Attention Sinks（SinkCache）· EAGLE · KV 占用对比 / MLA 解码 · 树状投机 · 分层 KV offload · MoE 推理 EP + EPLB · 稀疏注意力解码。
+| 方向 | 模块 |
+|------|------|
+| 省 KV 显存 | KV Cache · PagedAttention · Prefix Cache · Radix Cache · KV 占用对比 / MLA 解码 · 分层 KV offload |
+| 调度 | Continuous Batching（含抢占）· Chunked Prefill（Sarathi 混批）· P/D 分离 |
+| 少算几次 | Speculative Decoding（拒绝采样 + 分布保持检验）· EAGLE · 树状投机 · 稀疏注意力解码 |
+| 压缩 | INT8 / group-wise INT4 / AWQ · KIVI KV 量化 |
+| 算子与并行 | FlashAttention（Q/KV 双向分块 + LSE）· Tensor Parallel · CUDA Graph · MoE 推理 EP + EPLB |
+| 输出控制 | Sampling · Structured Output（token 级预编译语法 mask）· Attention Sinks（SinkCache）· Multi-LoRA |
 
 `full_engine` 是真分页的 mini-vLLM：物理 KV block 池、前缀命中真的跳过计算、分块 prefill 混批、recompute 抢占，**每条输出与朴素 greedy 逐 token 相同**。
 
 ### 阶段 6 · Agent (llm_agent)
 
-Agent 循环（`tool_use` / `tool_result` content block）· JSON Schema 工具 + 并行调用 · 权限门（deny > ask > allow，六种模式，命令归一化与分段）· 上下文压缩与文件记忆 · Hooks / Skills 渐进式披露 · JSONL 持久化与恢复 · 子智能体 · BM25 检索（中文 bigram）· 真 MCP（stdio JSON-RPC）· 计划模式 · orchestrator–workers · 护栏（注入、路径围栏、脱敏）· Agent 评测（pass@k / pass^k）· 上下文工程 · 可选的 Claude API 适配器（默认不联网）。工具全部是模拟或沙箱内的，可以放心跑。
+| 层 | 内容 |
+|------|------|
+| 循环 | Agent 循环（`tool_use` / `tool_result` content block）· JSON Schema 工具 + 并行调用 |
+| 安全 | 权限门（deny > ask > allow，六种模式，命令归一化与分段）· 护栏（注入、路径围栏、脱敏） |
+| 上下文 | 压缩与文件记忆 · 上下文工程 · BM25 检索（中文 bigram） |
+| 扩展 | Hooks · Skills 渐进式披露 · 真 MCP（stdio JSON-RPC） |
+| 编排 | 计划模式 · 子智能体 · orchestrator–workers |
+| 运维 | JSONL 持久化与恢复 · Agent 评测（pass@k / pass^k） |
+| 接真模型 | 可选的 Claude API 适配器，默认不联网 |
+
+工具全部是模拟或沙箱内的，可以放心跑。
 
 ## Web 教程
 
@@ -129,19 +158,23 @@ Agent 循环（`tool_use` / `tool_result` content block）· JSON Schema 工具 
 - **真源码**：章节里的代码块在构建期直接读 `llm_*/**/*.py` 并按符号截取，CI 校验每个引用都有效，不会和仓库漂移。
 - **学习辅助**：章末自测（全对侧栏打 ✓）、学习进度与"接着上次学"（只存本机）、术语速查页、键盘 ← / → 翻章、移动端可用。
 - **加内容只加文件**：实验台、章节、自测、术语都按阶段分文件自动注册，见 [`web/LABS.md`](web/LABS.md)。章节正文全部住在 `web/src/data/topics/<stage>.js`。
-- **说人话**：全部 73 章的正文按"先说具体的再说抽象的、拆掉名词堆、一个数字胜过一个形容词、先说为什么疼再说怎么治"重写过一遍。每章的三条要点里，最该带走的那条有「重点」徽章。
+- **说人话**：73 章正文按四条规矩写成——先说具体的再说抽象的、拆掉名词堆、一个数字胜过一个形容词、先说为什么疼再说怎么治。每章的三条要点里，最该带走的那条有「重点」徽章。
 
-## 2026 更新说明
+## 这个教具的边界
 
-这一版除了新增技术，还修掉了一批"看起来在演示、其实没演示"的地方。几个有代表性的：
+教具最容易骗人的地方，是演示了一个名字却没演示那件事。
 
-- **初始化**：tied lm_head + `nn.Embedding` 默认 N(0,1) 让所有 LM 的首步 CE ≈ 250（ln V 只有 6.9），此前"loss 下降"的断言主要在纠正初始化。现统一 std=0.02，训练脚本断言首步 CE ≈ ln V。
-- **1F1B** 调度此前没有限制在途 micro-batch，激活峰值与 GPipe 相同；**ZeRO** 三档此前代码无区别；**激活重算**此前从不计算梯度；**aux-loss-free** 偏置此前从不更新；**DSA indexer** 此前拿不到梯度；**VAR** 此前是光栅顺序。现在都是真的，且有断言。
-- **推理引擎**此前会活锁、分页只记账、前缀命中仍整段重算；**SFT / DPO 的 prompt mask** 多屏蔽了回答的第一个 token；**Agent** 的 PreToolUse hook 改写可以绕过 deny 规则。均已修复并有回归断言。
+所以这里的每个 demo 都在末尾 `assert` 它声称的结论：与单卡基线逐位相等、与朴素解码逐 token 相同、梯度确实非空。"看起来在跑"和"真的在做"因此是分开的。
 
-不兼容变化：GPT3 的 state_dict 键 `attn.heads.i.w_*` → `attn.w_*`；`VARModel` / `ImageTokenizer` 签名重写；Flow Matching 的 `t_norm` 值域变为 [0, 1000)；MoE 层去掉 `dropout` 参数；`Mamba.generate` 去掉 `do_sample`；`llm_train.core.set_seed` → `make_rng`。
+有几个结论在玩具规模上就是不成立，各模块 README 的"与真实系统的差距"一节写得更细：
 
-**教具的诚实边界**（各模块 README 的"与真实系统的差距"一节有完整说明）：随机权重的小模型没有 attention sink 现象，稀疏解码的打分也不优于随机选块，这两个效应只在植入了 sink / needle 的合成数据上演示；FP8 的 per-tensor 与 block scaling 在玩具任务上打平，outlier 超过约 1e5 倍才拉开差距；llm_basic 的 2 层配置并不优于 1 层；CUDA Graph 的加速来自显式注入的 launch 开销模型。这些都如实写在输出和文档里，没有构造数据让结论好看。
+- 随机权重的小模型**没有 attention sink 现象**，稀疏解码的块打分也**不优于随机选块**。这两个效应只在植入了 sink / needle 的合成数据上演示。
+- FP8 的 per-tensor 与 block scaling 在玩具任务上**打平**，outlier 要超过约 1e5 倍才拉开差距。
+- `llm_basic` 的 2 层配置**不优于** 1 层（val 2.045 vs 1.981）。
+- CUDA Graph 的加速比来自**显式注入的 launch 开销模型**，不是实测。
+- 同步数下**全参微调优于 LoRA**（留出集 EM 0.809 vs 0.352）。LoRA 买的是显存和分发，不是收敛速度。
+
+这些都如实写在程序输出和文档里，没有构造数据让结论好看。
 
 ## 参考文献
 
@@ -206,7 +239,7 @@ Agent 循环（`tool_use` / `tool_result` content block）· JSON Schema 工具 
 - *Knowledge Distillation* — Hinton et al., 2015 ([arXiv:1503.02531](https://arxiv.org/abs/1503.02531))
 
 
-### 2026 更新新增
+### 长上下文 / 低精度 / 新架构
 - *YaRN* — Peng et al., 2023 ([arXiv:2309.00071](https://arxiv.org/abs/2309.00071))
 - *QK-Norm / OLMo 2* — Team OLMo, 2024 ([arXiv:2501.00656](https://arxiv.org/abs/2501.00656)); *Qwen3 Technical Report*, 2025
 - *gpt-oss model card* — OpenAI, 2025

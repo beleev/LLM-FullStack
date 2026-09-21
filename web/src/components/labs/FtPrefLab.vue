@@ -11,7 +11,7 @@
     module="llm_finetune/methods/simpo.py · orpo.py"
     :challenge="{
       ask: '保持两条回答每 token 的平均 log p 都是 −1.5 (模型对两者毫无偏好), 把 rejected 从 8 点到 24 token。「裸 sum 差」的 z 变成多少? 它的梯度权重还剩多少? DPO 和 SimPO 为什么不上当?',
-      answer: '裸 sum 差 = (−1.5×8) − (−1.5×24) = +24, σ(−24) ≈ 0: 模型什么偏好都没学, loss 却已经是 0 —— 只因为长序列的 log 概率之和天然更小。数据里 rejected 普遍更长时, 这个目标学到的只是「短的好」。DPO 不上当, 因为 ref 对同一条长回答也给出同样低的 sum log p, 相减后只剩 policy 相对 ref 的变化。SimPO 没有 ref, 改成按长度取平均 (每 token log p 之差), 长度直接约掉; 代价是平均后数值范围很小, 所以 β 要取 2 左右, 再减一个目标间隔 γ 逼模型把差距拉到 γ/β 以上才停手。ORPO 同样用每 token 平均概率算 odds, 再靠 SFT 项 (chosen 的 NLL) 锚住模型 —— 一个阶段、一个模型, 连单独的 SFT 都省了。',
+      answer: '裸 sum 差 = (−1.5×8) − (−1.5×24) = +24, σ(−24) ≈ 0: 模型什么偏好都没学, loss 却已经是 0 —— 只因为长序列的 log 概率之和天然更小。数据里 rejected 普遍更长时, 这个目标学到的只是「短的好」。DPO 不上当, 因为 ref 对同一条长回答也给出同样低的 sum log p, 相减后只剩 policy 相对 ref 的变化。SimPO 没有 ref, 改成按长度取平均 (每 token log p 之差), 长度直接约掉。代价是平均后数值范围很小, 所以 β 要取 2 左右。SimPO 还会再减一个目标间隔 γ, 逼模型把差距拉到 γ/β 以上才停手。ORPO 同样用每 token 平均概率算 odds, 再靠 SFT 项 (chosen 的 NLL) 锚住模型 —— 一个阶段、一个模型, 连单独的 SFT 都省了。',
     }"
   >
     <template #controls>

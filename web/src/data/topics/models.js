@@ -19,8 +19,8 @@ export default {
     'models-mtp': {
       widgets: ['AttnMaskLab', 'MtpLab'],
       title: 'SWA · MTP · 混合线性 — 三种给 Transformer 减负的改法',
-      subtitle: '读完这章, 你看一个新模型时能马上分辨它动了哪一处: 是把 mask 裁窄了 (Mistral), 是让每个位置多预测几步 (MTP), 还是干脆把装历史的容器换掉 (Qwen3-Next)。',
-      tldr: 'SWA 不新增任何一个类, 只换一张 mask —— T=64、W=8 时可见格子从 2080 降到 484, KV cache 从 O(T) 封顶到 O(W); MTP 用共享 lm_head 的级联模块, 把每个位置的监督从 1 份变成 K+1 份, 推理时还白送一份投机解码草稿。',
+      subtitle: '读完这章, 你看一个新模型时能马上分辨它动了哪一处。是把 mask 裁窄了 (Mistral)? 是让每个位置多预测几步 (MTP)? 还是干脆把装历史的容器换掉 (Qwen3-Next)?',
+      tldr: 'SWA 不新增任何一个类, 只换一张 mask。T=64、W=8 时可见格子从 2080 降到 484, KV cache 从 O(T) 封顶到 O(W)。MTP 用共享 lm_head 的级联模块, 把每个位置的监督从 1 份变成 K+1 份。推理时它还白送一份投机解码草稿。',
       question: '每层只看最近 W 个 token, 远处的信息怎么过来? 一次预测好几个 token, 为什么不算偷看未来?',
       code: 'llm_models/models/language_models/{mistral.py,mtp.py,qwen3_next.py} · llm_models/layers/sparse/linear_attention.py',
       points: [
@@ -108,7 +108,7 @@ c_kv = cat([cache["c_kv"], c_new]); k, v = k_up(c_kv), v_up(c_kv)  # MLA`,
       points: [
         { title: 'logit 随范数二次增长', body: 'q·k/√d 里的 √d 只抵消维度带来的方差, 不抵消范数。训练中 q、k 的范数一起涨 2 倍, logit 就涨 4 倍。demo 把权重 ×10: 最大 logit 从 1.20 冲到 120.31。这时 softmax 塌成 one-hot, 雅可比 diag(p)−ppᵀ → 0, 这个 head 收不到梯度; 低精度下还会直接溢出。', key: true },
         { title: 'QK-Norm 只留方向和一个增益', body: '对 q、k 各做一次 RMSNorm (Qwen3 / OLMo-2 / Gemma-3 都这么干): logit = g²·√d·cosθ。同样把权重 ×10, 最大 logit 稳在 3.44 不动。模型仍可以调可学的 g 来决定注意力有多尖, 但只剩这一个旋钮。必须放在 RoPE 之前 —— RoPE 是纯旋转, 不改变范数, 反过来先旋转再乘逐维增益就会破坏成对维度的旋转结构。' },
-        { title: '低频维度没见过那么大的角度', body: '把 RoPE 的每对维度想成一根表针。高频针在训练长度 L 内转了几百圈, 什么角度都见过; 波长大于 L 的低频针连一圈都没转完, 位置一超过 L 就指向训练分布之外。PI 让所有针一律慢 s 倍, 高频被压扁、相邻 token 分不开; NTK-aware 只改 base, 高频几乎不动但中段压不够; YaRN 按圈数 r 分段, 两头都保住 —— d_head=64、L=2048、s=4 时, 9 个最高频维度完全不动, 11 个低频维度被拉回 1.00×。' },
+        { title: '低频维度没见过那么大的角度', body: '把 RoPE 的每对维度想成一根表针。高频针在训练长度 L 内转了几百圈, 什么角度都见过。波长大于 L 的低频针连一圈都没转完, 位置一超过 L 就指向训练分布之外。PI 让所有针一律慢 s 倍, 高频被压扁、相邻 token 分不开。NTK-aware 只改 base, 高频几乎不动, 但中段压不够。YaRN 按圈数 r 分段, 两头都保住 —— d_head=64、L=2048、s=4 时, 9 个最高频维度完全不动, 11 个低频维度被拉回 1.00×。' },
       ],
       links: [
         { from: 'position · RoPE', to: 'scaled_inv_freq', body: '位置编码一章讲 RoPE 为什么编码相对位置; 这里只改 θ_i 这一张频率表, 旋转公式一行不动。' },
@@ -185,7 +185,7 @@ return y + D_skip * x`,
       code: 'llm_models/models/moe/deepseekV3.py · llm_models/training/loss.py',
       points: [
         { title: '选人和加权解耦', body: 'top-k 的排序用 sigmoid(logit) + b, 但乘到专家输出上的权重取自不带 b 的 sigmoid 分数再归一化。b 只改变 “谁上场”, 不改变 “上场后信多少”。', key: true },
-        { title: '这是一个符号控制器, 不是一个 loss', body: 'b 不在计算图里 (@torch.no_grad), 更新规则只看符号: 过载就 −γ, 欠载就 +γ。步长恒为 γ、与 batch 大小无关, 所以好调; 但 γ 大过专家分数之间的典型差距就会来回震荡 (demo 实测 γ=1e-2 的均衡效果反而不如 1e-3), γ 太小又追不上路由器的漂移。' },
+        { title: '这是一个符号控制器, 不是一个 loss', body: 'b 不在计算图里 (@torch.no_grad), 更新规则只看符号: 过载就 −γ, 欠载就 +γ。步长恒为 γ、与 batch 大小无关, 所以好调。但 γ 大过专家分数之间的典型差距就会来回震荡: demo 实测 γ=1e-2 的均衡效果反而不如 1e-3。γ 太小又追不上路由器的漂移。' },
         { title: 'aux loss 的代价', body: 'L_aux = α·E·Σ f_e·P_e 的梯度直接压低热门专家的路由 logit: α 大了干扰语言建模, 小了又均衡不住。教学代码保留了 MoELMLoss 作为对照。真实的 V3 还留了一个权重极小的序列级 aux loss, 防极端情况。' },
       ],
       links: [
@@ -261,8 +261,8 @@ index_loss = (p * (log(p) - log_softmax(I))).sum(-1).mean()`,
       code: `llm_models/models/moe/gpt_oss.py · ${A} · llm_models/utils/masks.py`,
       points: [
         { title: '交替排布: 用一半的 KV 买全部感受野', body: '纯滑窗的 L 层模型感受野只有 L·(W−1)+1, 远处信息每接力一次就被压缩一遍。隔一层插一层全注意力, 任何位置一步就能够到全部历史。滑窗层的 KV 是滚动缓冲 (上限 W, 与上下文长度无关), 所以长上下文下 cache 几乎只由全注意力层决定 —— gpt-oss-20b (24 层, W=128) 在 T=131072 时约省 50%。', key: true },
-        { title: 'softmax 不会弃权', body: 'softmax 只看 logit 的相对差, 一行概率和恒为 1。一个 head 在某个位置没什么可看时, 也得输出一堆无关 value 的加权平均。没有 sink 的模型于是自己找了个垃圾桶: 把多余概率倒在开头几个 token 上 —— 这就是 attention sink 现象, 也是把首 token 滑出窗口后模型崩掉的原因。' },
-        { title: '把 sink 做成参数, 而不是 token', body: 'StreamingLLM 的补救是永远保留开头 4 个 token (masks.py 里的 sink_tokens 参数)。GPT-OSS 直接给每个 head 一个可学 logit 参与 softmax: 概率分给它就等于丢掉, 行和 < 1, 不占 KV, 也不依赖任何特定 token 留在窗口里。注意 demo 的诚实结论 —— 在随机 token 上训练, sink logit 只动了约 ±0.01 (随机数据没有 “该不该看” 的结构, 模型没理由用它), 它证明的是梯度通路是通的; 真实模型里这些值会明显非零, 而且各 head 不同。' },
+        { title: 'softmax 不会弃权', body: 'softmax 只看 logit 的相对差, 一行概率和恒为 1。一个 head 在某个位置没什么可看时, 也得输出一堆无关 value 的加权平均。没有 sink 的模型于是自己找了个垃圾桶: 把多余概率倒在开头几个 token 上。这就是 attention sink 现象, 也是把首 token 滑出窗口后模型崩掉的原因。' },
+        { title: '把 sink 做成参数, 而不是 token', body: 'StreamingLLM 的补救是永远保留开头 4 个 token (masks.py 里的 sink_tokens 参数)。GPT-OSS 直接给每个 head 一个可学 logit 参与 softmax: 概率分给它就等于丢掉, 行和 < 1, 不占 KV, 也不依赖任何特定 token 留在窗口里。注意 demo 的诚实结论: 在随机 token 上训练, sink logit 只动了约 ±0.01。随机数据没有 “该不该看” 的结构, 模型没理由用 sink。所以 demo 证明的是梯度通路是通的。真实模型里这些值会明显非零, 而且各 head 不同。' },
       ],
       links: [
         { from: 'models-mtp · SWA', to: '交替排布', body: 'Mistral 全部层都是滑窗; GPT-OSS 与 Gemma 系列改成滑窗与全注意力交替 (Gemma 2 是 1:1, Gemma 3 是 5:1)。' },
@@ -302,7 +302,7 @@ kv_entries = W if layer % 2 == 0 else T`,
       code: 'llm_models/models/language_models/llada.py',
       points: [
         { title: '随机遮盖比例 = 一整族去噪任务', body: 'BERT 固定遮 15%, 只学会了 “补少量空”, 从没见过几乎全是 [MASK] 的输入。LLaDA 的 t 均匀铺满 (0,1): t≈1 时几乎从零生成, t≈0 时只补一两个词。采样过程正是从 t=1 走到 t=0, 每一步遇到的遮盖比例训练时都见过。', key: true },
-        { title: '1/t 权重让 loss 成为似然上界', body: 't 小的样本被遮的 token 少, 不加权的话几乎不贡献 loss; 乘 1/t 之后 E[被遮数/t] = L, 均匀瞎猜时 loss 的期望正好是 ln V, 和自回归 CE 同量纲、可以直接比。代码里用分层采样铺 t, 压住 1/t 带来的方差。' },
+        { title: '1/t 权重让 loss 成为似然上界', body: 't 小的样本被遮的 token 少, 不加权的话几乎不贡献 loss。乘 1/t 之后 E[被遮数/t] = L: 均匀瞎猜时 loss 的期望正好是 ln V, 和自回归 CE 同量纲、可以直接比。代码里用分层采样铺 t, 压住 1/t 带来的方差。' },
         { title: '生成顺序由置信度决定', body: '低置信度重遮: 先把 “显然” 的 token 定下来, 它们成为上下文之后再去定难的。已定稿的 token 置信度记 +∞, 永不重遮。demo 的填空准确率: 15 步低置信度重遮 1.000, 15 步随机重遮 0.910, 1 步并行 0.887 —— 同一步里定下的 token 互相看不见对方, 这就是代价。双向注意力没有 KV cache, 每步整段重算, 步数是质量/速度旋钮。续写、倒推、两头填是同一个函数。' },
       ],
       links: [

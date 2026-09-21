@@ -20,7 +20,7 @@ python -m llm_models.run_models.multimodal.whisper.train_whisper
 ## 运行后应该看到什么 (CPU 实测)
 - infer: `mel (2, 80, 100) -> encoder (2, 50, 128) | 换音频 logits 变化 0.0305 | 改未来 token 过去变化 0.0e+00`。
 - train: 2 条样本**文本输入相同、音频不同、标签不同**。初始 loss 6.157 (ln 500 = 6.215) → 150 步后 0.041,
-  远低于"不听音频"的理论下界 ln 2 = 0.693 ⇒ cross-attention 在起作用。初始化修复前初始 loss 是 **82.30**。
+  远低于"不听音频"的理论下界 ln 2 = 0.693 ⇒ cross-attention 在起作用。若换成默认 N(0,1) 初始化 + 绑权重: 初始 loss 是 **82.30**。
 - 数据是固定随机 batch: 这是记忆, 不是语音识别。
 
 ## 常见误区
