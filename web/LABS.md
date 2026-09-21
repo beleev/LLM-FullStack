@@ -15,7 +15,7 @@
 | 术语 | `src/data/glossary/<stage>.js` → `[{ term, aka?, stage, oneliner, number?, route }]` | 出现在"术语速查"页 |
 | 真源码 | 章节 page 里写 `source: ['llm_x/path/file.py:函数或类名']` | 构建期直接读 Python 文件，不会和仓库漂移 |
 
-`<stage>` 取 `basic | models | train | finetune | infer | agent`。章节字段说明见 `src/data/topics/index.js` 顶部注释，现有章节写法见 `src/data/models.js` 的 `baseTopicPages`。
+`<stage>` 取 `basic | models | train | finetune | infer | agent`。章节字段说明见 `src/data/topics/index.js` 顶部注释，现有章节写法见 `src/data/topics/<stage>.js`——所有正文都住在那里，`models.js` 只留结构性数据（阶段、目录、模块表、时间轴）。
 
 **不要手抄 Python 代码到页面里**——用 `source`。`snippet` 只放刻意简化过的骨架/伪代码。
 
@@ -52,3 +52,36 @@ import { mulberry32, randn, softmax, entropy, clamp, lerp, sum, range, argmax, f
 cd web && npm run dev          # 手动点一遍
 npx vite build --outDir /tmp/llm-dist --emptyOutDir   # 必须零报错 (共享卷上直接 build 到 dist/ 偶尔会因清目录失败, 与代码无关)
 ```
+
+## 划重点：主干 / 扩展 / 冲刺
+
+`src/data/tiers.js` 把每一章分成三层，**只影响阅读建议，不影响内容和可达性**：
+
+| 层 | 标记 | 含义 |
+|---|---|---|
+| 冲刺 | ★ | 12 章。只有一天就读这些，每个阶段不读就接不上下一阶段的那几页 |
+| 主干 | ● | 37 章（含冲刺）。完整课程主线 |
+| 扩展 | ○ | 36 章。深水区与分支；跳过不影响主线 |
+
+分层出现在三个地方：侧栏的档位筛选、面包屑的标记、`/fast-track` 速成路线页。新增章节默认归为扩展——主线是要守住的，加内容不该让它变长。要改归类就改 `tiers.js` 里的两个数组，其余全是算出来的。
+
+**章内划重点**：每个章节的 `points` 里，给最该带走的那一条加 `key: true`，页面会渲染一个「重点」徽章。一章只标一条。
+
+```js
+points: [
+  { title: 'cache 是手写 autograd tape', body: '…', key: true },
+  { title: '形状先行', body: '…' },
+]
+```
+
+## 写文案的规矩（说人话）
+
+这是教程，不是文档。读者读一遍就要懂。
+
+1. **先说具体的，再说抽象的。** 先讲发生了什么，再给它起名字。
+2. **拆掉名词堆。** 「每个 forward 返回反向需要的输入、权重、归一化统计」→ 谁把什么交给谁，写成有动词的句子。
+3. **一个数字胜过一个形容词。** 「显著更省」→「省 56.9×」。数字必须来自真实跑出来的 demo。
+4. **先说为什么疼，再说怎么治。** 每个技术都是因为上一代出了问题才存在的。
+5. **短句。** 不要「值得注意的是」「我们可以看到」「综上所述」。
+6. `tldr` 是一句能背下来的话；`question` 是读者真会问的问题；`subtitle` 是读完这页你能做什么。
+7. **诚实的结论比好看的结论重要。** 实测不符合流行说法就照实写，并说明是在什么规模下测的。

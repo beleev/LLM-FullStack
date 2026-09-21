@@ -2,18 +2,20 @@
   <div>
     <h1 class="page-title">任务适配 · 从 SFT / LoRA 到 DPO / GRPO / 蒸馏</h1>
     <p class="page-subtitle">
-      微调的核心问题是: <strong>用尽量少的数据和算力, 把一个通用 base model 拨到具体任务上</strong>。
-      <RepoLink path="llm_finetune/" label="llm_finetune/" tiny /> 用一组最小可跑的实现串起完整脉络: 本页先讲三根主柱 —— 全参 SFT、PEFT (LoRA)、无 RM 的偏好对齐 (DPO);
-      QLoRA / DoRA、SimPO / ORPO、奖励模型、GRPO 及其变体 (DAPO · Dr.GRPO · GSPO)、离线与 on-policy 蒸馏各有专章, 每章都带可拖拽的实验台。
+      预训练给了你一个只会接龙的模型。微调要回答的是:
+      <strong>怎么用尽量少的数据和算力, 把它拨到你手上这个任务上</strong>。
+      <RepoLink path="llm_finetune/" label="llm_finetune/" tiny /> 把这条路上的 11 种方法都写成了能跑的最小实现。
+      本页先立三根主柱 —— 全参 SFT、LoRA、不要 RM 的偏好对齐 (DPO); QLoRA / DoRA、SimPO / ORPO、奖励模型、
+      GRPO 及其变体 (DAPO · Dr.GRPO · GSPO)、离线与 on-policy 蒸馏各有专章, 每章都带一个能拖的实验台。
     </p>
 
     <ChapterIntro
-      tldr="SFT 把语言模型变对话模型, LoRA 把全参微调压到 0.5%, DPO 把 RLHF 三阶段塌缩成一个分类 loss。每一步都是上一步在「数据 / 参数 / 流程」上的简化。"
-      question="同样的偏好数据, 为什么 PPO 要维持 4 个模型, 而 DPO 只需要 2 个 + 一行 logsigmoid?"
+      tldr="SFT 教模型按指令回答, LoRA 把可训参数压到百分之零点几, DPO 把 RLHF 的三个阶段塌缩成一个分类 loss。每一步都是上一步在「数据 / 参数 / 流程」上的减法。"
+      question="同样的偏好数据, 为什么 PPO 要同时养 4 个模型, 而 DPO 只要 2 个加一行 logsigmoid?"
       :goals="[
-        '区分 SFT / LoRA / DPO 三类方法的输入数据形态和 loss',
-        '理解 LoRA 把可训参数压到 0.5% 的核心数学',
-        '知道 DPO 为什么能用一个分类 loss 替换 PPO 三阶段',
+        '说出 SFT / LoRA / DPO 各自要什么数据、动哪些参数、每步几次前向',
+        '算清 LoRA 为什么能把可训参数压到 2r/d',
+        '讲明白 DPO 是怎么把 RM + PPO 合成一个分类 loss 的',
       ]"
       :codes="[
         { path: 'llm_finetune/methods/sft.py' },
@@ -29,9 +31,9 @@
     <section class="section">
       <h2>1. 三阶段 alignment 与 DPO 的塌缩</h2>
       <p class="lead">
-        ChatGPT (2022) 之后, 把通用 LM 变成可用助手的标准流程是
-        <strong>SFT → Reward Model → PPO</strong>。DPO (2023) 给了一条捷径 —
-        把后两步合成"基于偏好对的分类 loss", 跳过 RM 与 RL。
+        ChatGPT (2022) 之后, 把通用 LM 变成能用的助手, 标准流程是
+        <strong>SFT → Reward Model → PPO</strong>。三步各要一次训练, PPO 那步还要同时养 4 个模型。
+        DPO (2023) 把后两步合成一个"对偏好对的分类 loss", RM 和 RL 都不用了。
       </p>
 
       <EvolutionChain
@@ -45,10 +47,12 @@
     <section class="section">
       <h2>2. SFT · 在 prompt 上 mask 掉 loss</h2>
       <p class="lead">
-        和预训练唯一的代码差别只有一行: 把 prompt 区域的 labels 改成
-        <code class="inline">-100</code>, 让 cross-entropy 跳过这些位置。
-        这一行最容易写错的是边界: labels 已经左移一格, 所以要 mask 的是前 P−1 格而不是前 P 格 ——
-        <router-link :to="{ name: 'finetune-sft' }">SFT 一章的实验台</router-link>可以亲手把这个 off-by-one 点出来。
+        和预训练的代码差别只有一行: 把 prompt 位置的 labels 改成
+        <code class="inline">-100</code>, cross-entropy 就会跳过它们。
+        这一行最容易写错的是边界 —— labels 已经左移一格, 该盖的是前 P−1 格, 不是前 P 格。
+        盖多一格, loss 曲线看不出异常, 但模型永远学不会"回答该怎么开头":
+        同配置实测留出集 exact-match 从 1.000 掉到 0.000。
+        <router-link :to="{ name: 'finetune-sft' }">SFT 一章的实验台</router-link>可以亲手把这一格点出来。
       </p>
 
       <div class="grid grid-2" style="gap: 16px;">
@@ -56,21 +60,19 @@
           <h3>labels 怎么构造 <span class="tag">关键</span></h3>
           <pre class="code">{{ sftLabels }}</pre>
           <p class="hint">
-            为什么要 mask prompt? 因为 prompt 来自人 — 模型不该把"用户问题"也学成
-            自己要生成的内容。只在 response 上算 CE = "教模型怎么回答", 而不是
-            "教模型怎么提问"。
+            为什么要 mask prompt? prompt 是人写的, 模型不该把"用户怎么提问"也学成自己要生成的东西。
+            mask 不省显存也不省计算 (前向照样要算完整条序列), 它只是把监督信号全部押在 response 上。
           </p>
         </div>
 
         <div class="card">
-          <h3>SFTLoss 实际上等价于什么 <span class="tag">代码对照</span></h3>
+          <h3>SFTLoss 就是预训练那个 loss <span class="tag">代码对照</span></h3>
           <pre class="code">{{ sftLoss }}</pre>
           <p class="hint">
-            技术上和预训练的 <code class="inline">StandardLMLoss</code> 完全一样
-            (都是带 -100 的 cross_entropy)。单独命名是为了:
-            <strong>1)</strong> 教学叙事清晰; <strong>2)</strong> 留扩展位
-            (NEFTune 噪声 / focal-style 加权); <strong>3)</strong> 与 DPOLoss 命名对仗。
-            对应代码: <RepoLink path="llm_finetune/methods/sft.py:SFTLoss" label="llm_finetune/methods/sft.py:SFTLoss" tiny />
+            仓库里没有第二个类: <code class="inline">SFTLoss</code> 是
+            <code class="inline">StandardLMLoss</code> 的别名, 一行赋值。
+            SFT 与预训练的差别 100% 在 labels 里, 不在 loss 里 —— 这也是本章最该记住的一句。
+            对应代码: <RepoLink path="llm_finetune/methods/sft.py" label="llm_finetune/methods/sft.py" tiny />
           </p>
         </div>
       </div>
@@ -80,8 +82,10 @@
     <section class="section">
       <h2>3. LoRA · 给冻结的 W 加一对低秩补丁</h2>
       <p class="lead">
-        论文 (Hu et al., 2021) 的关键观察: 微调引起的增量 ΔW <strong>本征秩很低</strong>,
-        可以用一对 r 维矩阵表达。训练时只更新这对矩阵, 推理时合并回去, 零额外开销。
+        论文 (Hu et al., 2021) 的关键观察: 微调带来的增量 ΔW <strong>本征秩很低</strong>,
+        一对 r 维矩阵就装得下。训练时只更新这对矩阵, 推理时合并回去, 零额外开销。
+        注意 LoRA 买到的是什么: 显存、存储、多租户可插拔。<strong>不是收敛速度</strong> ——
+        本仓库同一基座各训 300 步, 全参留出集 EM 0.809, LoRA(r=8) 只有 0.352。
       </p>
 
       <div class="grid grid-2" style="gap: 16px;">
@@ -89,9 +93,10 @@
           <h3>数学形式 <span class="tag">3 行</span></h3>
           <pre class="code">{{ loraMath }}</pre>
           <p class="hint">
-            <strong>无害启动</strong>: B 全零初始化 ⇒ 训练第 1 步 BA=0 ⇒
-            forward 输出与原模型完全一致。这是 LoRA 最关键的设计:
-            微调起点 = 预训练终点, 不会一上来就破坏已有能力。
+            <strong>无害启动</strong>: B 全零 ⇒ 第 0 步 BA = 0 ⇒ forward 输出与原模型逐位相同。
+            微调起点就是预训练终点, 不会一上来先把已有能力砸坏。
+            为什么是 B 而不是 A? 置零哪个都能让 BA = 0, 但被置零的那个第 1 步就有梯度, 另一个要等第 2 步;
+            两个都置零则梯度永远是 0。
           </p>
         </div>
 
@@ -119,8 +124,9 @@
             </tbody>
           </table>
           <p class="hint">
-            r 可调: 任务越难/数据越大 → r 越大。α 用 2r 或 r,
-            <code class="inline">scale = α/r</code> 让你改 r 不必重调学习率。
+            r 可调: 任务越难、数据越多, r 就要越大。α 一般取 2r 或 r,
+            <code class="inline">scale = α/r</code> 让你改 r 之后不必重调学习率。
+            另外 LoRA 常常要比全参高 3~10 倍的 lr: B 从 0 起步, ΔW 的有效步长本来就小。
           </p>
         </div>
       </div>
@@ -140,9 +146,9 @@
             加进 base.weight, 之后 forward 走单分支 — 与原 nn.Linear 同速。</span>
           </div>
           <div class="point">
-            <strong>落盘只 ~MB</strong>
-            <span class="muted"><code class="inline">get_lora_state_dict</code> 仅抽出
-            A, B 两个矩阵 — 部署时基座共享, 适配器单独存。</span>
+            <strong>落盘只有适配器</strong>
+            <span class="muted"><code class="inline">get_lora_state_dict</code> 只抽出 A、B 两个矩阵 —
+            本仓库 76 KB, 整模型 389 KB。基座共享, 适配器单独分发。</span>
           </div>
         </div>
         <p class="hint">
@@ -164,16 +170,17 @@
         </table>
         <p class="hint">
           <code class="inline">apply_lora</code> 用 <code class="inline">named_modules</code>
-          匹配最后一段属性名 (例如 "w_q"), 与具体层路径无关 —
-          所以同一份代码能注入到 LLaMA / Mistral / 任何沿用同名属性的模型。
+          匹配属性名的最后一段 (例如 "w_q"), 跟层在第几块、叫什么路径无关 —
+          所以同一份代码能注进 LLaMA / Mistral / 任何沿用同名属性的模型。
         </p>
         <p class="hint">
           LoRA 的两个直系后代各有专章:
           <router-link :to="{ name: 'finetune-qlora' }">QLoRA</router-link>
-          把冻结的基座再压到 4 bit (NF4 分位数码本 + 每 block 一个 absmax scale, 约 4.5 bit/参数,
-          对应 <RepoLink path="llm_finetune/methods/qlora.py" label="llm_finetune/methods/qlora.py" tiny />);
+          把冻结的基座再压到 4 bit (NF4 分位数码本 + 每 block 一个 absmax scale, 约 4.5 bit/参数;
+          本仓库整模型 389 KB → 59 KB, 对应
+          <RepoLink path="llm_finetune/methods/qlora.py" label="llm_finetune/methods/qlora.py" tiny />);
           <router-link :to="{ name: 'finetune-dora' }">DoRA</router-link>
-          把权重拆成"幅度 × 方向", 让低秩更新只管方向。
+          把权重拆成"幅度 × 方向", 低秩更新只管转方向, 长度单独学一个标量。
         </p>
       </div>
     </section>
@@ -182,8 +189,11 @@
     <section class="section">
       <h2>4. DPO · 把偏好学习写成一行 logsigmoid</h2>
       <p class="lead">
-        DPO 的洞见: KL 约束的策略提升问题有<strong>解析最优解</strong>, 把它代回原优化目标后,
-        loss 退化成"chosen vs rejected 的 logit 差"的二分类。RM 和 PPO 都不需要了。
+        DPO 的洞见: KL 约束下的策略提升问题有<strong>解析最优解</strong>, 把它代回 Bradley-Terry,
+        loss 就退化成"chosen 比 rejected 领先多少"的二分类。RM 和 PPO 都不用了。
+        代价也要说清楚: 它只优化差值, 所以
+        <router-link :to="{ name: 'finetune-dpo' }">chosen 自己的概率可能一路往下掉</router-link>
+        (实测 log π(chosen) −4.03 → −4.18, 贪心 EM 0.332 → 0.137)。
       </p>
 
       <div class="grid grid-2" style="gap: 16px;">
@@ -191,21 +201,23 @@
           <h3>核心公式 <span class="tag">Bradley-Terry</span></h3>
           <pre class="code">{{ dpoMath }}</pre>
           <p class="hint">
-            <strong>π_θ</strong>: 被微调的 policy (起点 = SFT 终态);
-            <strong>π_ref</strong>: 冻结的 reference (一般就是 SFT 终态的副本);
-            <strong>β</strong>: KL 约束强度, 0.1~0.5。
-            β 越大 → log_sigmoid 输入越陡 → 模型更保守贴近 ref。
+            <strong>π_θ</strong>: 被微调的 policy, 起点是 SFT 终态;
+            <strong>π_ref</strong>: 冻结的 reference, 一般就是 SFT 终态的副本;
+            <strong>β</strong>: KL 约束强度, 0.1~0.5。β 越大, σ 越早饱和, policy 越贴着 ref 不动 —— 它不是"用力程度"。
+            第 0 步 policy = ref, 两个 log-ratio 都是 0, loss 恰好是 −log σ(0) = ln 2 = 0.6931。
+            初始 loss 不是这个数, 基本就是 ref 没对齐或 mask 写错了。
           </p>
         </div>
 
         <div class="card">
-          <h3>每步训练做什么 <span class="tag">4 次前向</span></h3>
+          <h3>每步训练做什么 <span class="tag">2 次 LM 前向</span></h3>
           <pre class="code">{{ dpoStep }}</pre>
           <p class="hint">
-            为什么 ref 用 <code class="inline">no_grad</code> + <code class="inline">eval()</code>?
-            前者省激活显存, 后者关掉 dropout 让 log π_ref 是确定函数。
-            否则随机性会污染偏好梯度。
-            代码: <RepoLink path="llm_finetune/methods/dpo.py:DPOLoss" label="llm_finetune/methods/dpo.py:DPOLoss / DPOTrainer.train_step" tiny />
+            chosen 和 rejected 拼成一个 2B 条的 batch, policy 前向一次、ref 前向一次 —— 每步 2 次 LM 前向,
+            常驻权重两份 (本仓库 778 KB)。ref 前向不带梯度、不存激活, 所以实测每步只慢约 35%, 不是 100%。
+            ref 用 <code class="inline">no_grad</code> + <code class="inline">eval()</code>:
+            前者省激活显存, 后者关掉 dropout, 让 log π_ref 是个确定函数, 随机性不会污染偏好梯度。
+            代码: <RepoLink path="llm_finetune/methods/dpo.py:DPOLoss" label="llm_finetune/methods/dpo.py:DPOLoss / PairwiseForward" tiny />
           </p>
         </div>
       </div>
@@ -215,9 +227,10 @@
         <pre class="code">{{ seqLogprob }}</pre>
         <p class="hint">
           为什么不直接用 <code class="inline">F.cross_entropy(reduction='sum')</code>?
-          那个会把 batch 里所有样本的 NLL 求和, 失去逐样本粒度。
-          DPO 需要 <strong>每个样本独立的 Σ log p</strong>, 才能 element-wise 做
-          (chosen - rejected) 差分。
+          那个会把 batch 里所有样本的 NLL 加成一个数, 逐样本的粒度就没了。
+          DPO 要的是 <strong>每个样本各自的 Σ log p</strong>, 才能逐对做 (chosen − rejected) 差分。
+          注意求和范围包含<strong>第一个回复 token</strong>: prompt mask 多盖一位就丢掉了 log p(y₁|x),
+          而 chosen 与 rejected 的 y₁ 恰恰可能不同。
         </p>
       </div>
     </section>
@@ -259,8 +272,10 @@
           </li>
         </ol>
         <p class="hint">
-          一个常见的实战 pipeline: <strong>base → LoRA-SFT → 解锁基座 → DPO</strong>。
-          先用 LoRA 在指令数据上廉价预热, 再用 DPO 在偏好对上做对齐。
+          一条常见的实战路线: <strong>base → LoRA-SFT → 解锁基座 → DPO</strong>。
+          先用 LoRA 在指令数据上廉价预热, 再用 DPO 在偏好对上对齐。
+          这张表只给方向; 想把"每步几次前向、常驻几份权重、落盘什么"一起摆出来比,
+          去<router-link :to="{ name: 'finetune-runs' }">训练脚本与落盘一章的选型计算器</router-link>。
         </p>
       </div>
     </section>
@@ -318,14 +333,14 @@ labels = x[1:]  = [-100 ] [-100][-100][A1] [A2] [<eos>]
 
 # pad 也置 -100`
 
-const sftLoss = `class SFTLoss(LossComputer):
-    def compute(self, logits, labels, **kw):
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            ignore_index=-100,        # ← prompt 这样被跳过
-        )
-        return {"total_loss": loss, "sft_loss": loss}`
+const sftLoss = `# llm_finetune/methods/sft.py 的全部内容 (去掉 docstring):
+from llm_models.training.loss import StandardLMLoss
+
+SFTLoss = StandardLMLoss        # ← 别名, 没有新实现
+
+# StandardLMLoss 里就是一句:
+#   F.cross_entropy(logits.reshape(-1, V), labels.reshape(-1),
+#                   ignore_index=-100)     # prompt / pad 在这里被跳过`
 
 const loraMath = `# 原层
 y = W x                                  # W ∈ ℝ^{d_out × d_in}, 冻结
@@ -359,23 +374,19 @@ const dpoMath = `L_DPO = - E_{(x, y_w, y_l)}  log σ(
 # - 但任何变化都「相对 reference」度量, 防止策略漂移
 # - σ 把无界 logit 差压到 (0, 1), 形成稳定二分类`
 
-const dpoStep = `# DPOTrainer.train_step
-chosen, rejected = batch.chosen, batch.rejected
+const dpoStep = `# PairwiseForward.with_frozen_copy(policy) 包住的一步
+# chosen 与 rejected 拼成一个 2B 条的 batch, 一次前向算完
+both = cat([chosen.input_ids, rejected.input_ids])   # [2B, T]
 
-# 2 次 policy 前向 (要梯度)
-p_chosen   = model(chosen.input_ids)
-p_rejected = model(rejected.input_ids)
-
-# 2 次 ref 前向 (no_grad + eval)
+p_logits = model(both)                 # 1) policy 前向, 要梯度
 with torch.no_grad():
-    r_chosen   = ref_model(chosen.input_ids)
-    r_rejected = ref_model(rejected.input_ids)
+    r_logits = ref(both)               # 2) ref 前向, 不要梯度、不存激活
 
-loss = DPOLoss().compute(
-    {"policy_chosen_logits": p_chosen,  ...},
+loss = DPOLoss(beta).compute(
+    {"policy_chosen_logits": ..., "ref_chosen_logits": ..., ...},
     {"chosen_labels": ..., "rejected_labels": ...},
 )["total_loss"]
-loss.backward();  optimizer.step()`
+loss.backward();  optimizer.step()     # 没有 DPOTrainer, 走通用 Trainer`
 
 const seqLogprob = `def compute_sequence_logprobs(logits, labels, ignore=-100):
     log_p_full = F.log_softmax(logits, dim=-1)            # [B, T, V]
@@ -388,23 +399,25 @@ const seqLogprob = `def compute_sequence_logprobs(logits, labels, ignore=-100):
 
 const pillars = [
   { dim: '数据形态',     sft: '(instruction, response)',  lora: '(instruction, response)',  dpo: '(prompt, chosen, rejected)' },
-  { dim: '可训练参数',   sft: '100% 模型',                lora: '0.4% 左右 (A, B)',         dpo: '100% policy, ref 冻结' },
+  { dim: '可训练参数',   sft: '100% 模型',                lora: '2r/d; d=4096, r=8 → 0.39%', dpo: '100% policy, ref 冻结' },
   { dim: 'loss',         sft: '带 -100 mask 的 CE',       lora: '同 SFT (只是参数更少)',    dpo: '-log σ(β·logit_diff)' },
   { dim: '需要 ref?',    sft: '否',                       lora: '否',                       dpo: '是 (deepcopy + freeze + eval)' },
   { dim: '需要 RM?',     sft: '否',                       lora: '否',                       dpo: '否 (DPO 的核心收益)' },
-  { dim: '一步前向次数', sft: '1',                        lora: '1',                        dpo: '4 (policy/ref × chosen/rejected)' },
-  { dim: '部署成本',     sft: '一份完整权重',             lora: '~MB 适配器 + 共享基座',     dpo: '一份完整权重' },
+  { dim: '每步 LM 前向', sft: '1',                        lora: '1',                        dpo: '2 (chosen+rejected 拼 2B 条, policy 1 次 + ref 1 次)' },
+  { dim: '常驻权重',     sft: '1 份 (389 KB)',            lora: '1 份冻结 + 适配器',         dpo: '2 份 (778 KB)' },
+  { dim: '落盘',         sft: '一份完整权重',             lora: '适配器 (本仓库 76 KB) + 共享基座', dpo: '一份完整权重' },
 ]
 
 const decisions = [
-  { q: '只有 (问, 答) 数据, 显卡足够大?',           a: '全参 SFT — 上限最高' },
-  { q: '只有 (问, 答) 数据, 显卡紧?',                a: 'LoRA SFT — 0.5% 参数, 适配器易切换' },
-  { q: '已有 SFT 模型, 现在拿到 (chosen, rejected)?', a: 'DPO — 跳过 RM 与 PPO, 一行 loss' },
-  { q: '想做风格 / 角色微调, 需要快速切换?',         a: 'LoRA — 多个适配器共享基座' },
-  { q: '连冻结的基座都放不进显存?',                  a: 'QLoRA — 基座 NF4 量化到约 4.5 bit/参数, 只训 adapter' },
-  { q: '偏好数据有了, 但不想多驻留一个 ref 模型?',    a: 'SimPO / ORPO — 无参考的偏好优化' },
-  { q: '答案能被程序判对错 (数学 / 代码)?',           a: 'GRPO 系 (DAPO · Dr.GRPO · GSPO) — 在线采样 + 可验证奖励' },
-  { q: '有一个强 teacher, 想把能力压进小模型?',       a: '蒸馏 — 离线软标签起步, on-policy 蒸馏收尾' },
+  { q: '只有 (问, 答), 显卡够大?',                    a: '全参 SFT — 上限最高, 同步数下也最快' },
+  { q: '只有 (问, 答), 显卡紧?',                      a: 'LoRA SFT — 可训参数 2r/d, 适配器好切换' },
+  { q: '连冻结的基座都塞不进显存?',                   a: 'QLoRA — 基座 NF4 约 4.5 bit/参数, 只训 adapter' },
+  { q: '同样的 r, 想再往全参靠一点?',                 a: 'DoRA — 低秩只管方向, 长度另学一个标量' },
+  { q: '有 SFT 模型, 又拿到了 (chosen, rejected)?',   a: 'DPO — 跳过 RM 与 PPO, 一行 loss' },
+  { q: '有偏好对, 但不想再养一个 ref?',               a: 'SimPO / ORPO — 前向次数和常驻权重都减半' },
+  { q: '连 SFT 阶段都想省掉?',                        a: 'ORPO — loss 里的 NLL 项就是 SFT' },
+  { q: '答案能被程序判对错 (数学 / 代码)?',            a: 'GRPO 系 (DAPO · Dr.GRPO · GSPO) — 在线采样 + 可验证奖励' },
+  { q: '有一个强 teacher, 想把能力压进小模型?',        a: '离线蒸馏起步, on-policy 蒸馏收尾' },
 ]
 </script>
 

@@ -2,18 +2,19 @@
   <div>
     <h1 class="page-title">Agent 应用层 · 把模型接成可行动系统</h1>
     <p class="page-subtitle">
-      <RepoLink path="llm_agent/" label="llm_agent/" tiny /> 不接真实 LLM API, 而是用可预测的
-      <code class="inline">RuleBasedLLM</code> 把应用层 harness 摊开:
-      工具、权限、上下文、记忆、扩展、持久化和子智能体如何围绕一个很薄的 loop 工作。
+      <RepoLink path="llm_agent/" label="llm_agent/" tiny /> 默认不接真实 API, 用行为完全确定的
+      <code class="inline">RuleBasedLLM</code> 顶上 —— 这样每个 demo 都能用 <code class="inline">assert</code>
+      证明自己声称的事。这一阶段要看的不是模型多聪明, 而是它的输出怎么被结构化、检查、执行和记录。
+      设计刻意对齐 Claude Code: 权限模式名、hook 事件名、<code class="inline">mcp__server__tool</code> 命名、content block 格式。
     </p>
 
     <ChapterIntro
-      tldr="Agent 的核心不是复杂 while-loop, 而是 loop 周围的确定性系统: tool registry、permission gate、context/memory、hooks、JSONL transcript 和 subagent isolation。"
+      tldr="loop 本身只有十几行, 从 m01 到 m14 几乎没改过; 可靠性全在它周围: 工具注册表、权限门、上下文与记忆、hooks、JSONL transcript、子智能体隔离。"
       question="为什么一个能调用工具的模型, 还不能直接等价于一个可靠 Agent 产品?"
       :goals="[
-        '看清一个 Agent loop 的最小骨架: messages / tool / result',
-        '知道 permission / context / hooks / persistence 各自负责什么',
-        '理解一个真实 Agent harness 是怎么从这些零件搭起来的',
+        '读懂一个 Agent loop 的最小骨架: messages / tool_use / tool_result',
+        '说清权限门、上下文、hooks、持久化各自拦住了什么',
+        '看出一个真实 Agent harness 是从这些零件怎么搭起来的',
       ]"
       :codes="[
         { path: 'llm_agent/core/' },
@@ -28,8 +29,8 @@
     <section class="section">
       <h2>1. 应用层依赖链</h2>
       <p class="lead">
-        从能生成 token 到能执行任务, 中间多出来的是控制面。先把 loop 跑通,
-        再逐层加工具、权限、上下文、扩展、持久化和子智能体。
+        从"能生成 token"到"能把事做完", 中间多出来的全是控制面。先把 loop 跑通,
+        再一层层加工具、权限、上下文、扩展、持久化和子智能体 —— 每加一层能力, 就得同时加一道边界。
       </p>
       <EvolutionChain
         title="从 completion 到 mini Agent harness"
@@ -41,7 +42,7 @@
     <section class="section">
       <h2>2. Agent harness 的六个账本</h2>
       <p class="lead">
-        读 Agent 代码时, 不要只盯模型调用。先找下面六个账本分别在哪里维护。
+        读 Agent 代码时别只盯着那句模型调用。先把下面六个账本各自在哪儿维护找出来, 整个系统就清楚了。
       </p>
       <div class="grid grid-3">
         <div v-for="p in primitives" :key="p.name" class="card primitive-card">
@@ -56,23 +57,24 @@
     <section class="section">
       <h2>3. 模型与 harness 的边界</h2>
       <p class="lead">
-        教学版 <code class="inline">RuleBasedLLM</code> 故意很弱, 因为本章要看的不是模型聪明程度,
-        而是模型输出如何被结构化、检查、执行和记录。
+        <code class="inline">RuleBasedLLM</code> 故意写得很弱。这一分工才是重点: 模型负责"选哪个动作"(概率性),
+        harness 负责"这个动作能不能做、做出来记在哪"(确定性)。安全相关的判断一条都不能依赖模型听话。
       </p>
       <div class="grid grid-2" style="gap: 16px;">
         <div class="card">
           <h3>模型负责选择动作 <span class="tag">probabilistic</span></h3>
           <pre class="code">{{ modelSide }}</pre>
           <p class="hint">
-            换成真实 LLM 时, 这里会变成 function calling / tool calling 的 JSON 输出。
-            后面的工具执行和权限逻辑不需要跟着模型一起重写。
+            换成真实 LLM, 这里就变成 tool calling 的 JSON 输出。后面的工具执行和权限逻辑一行都不用跟着改
+            —— loop 对模型的全部要求只有一个 <code class="inline">next()</code>。
           </p>
         </div>
         <div class="card">
           <h3>harness 负责执行边界 <span class="tag">deterministic</span></h3>
           <pre class="code">{{ harnessSide }}</pre>
           <p class="hint">
-            Agent 产品的可靠性主要来自这里: 能否拒绝危险动作、恢复状态、压缩上下文并留下审计记录。
+            Agent 产品的可靠性几乎全在这几行里: 能不能拒掉危险动作、能不能恢复状态、能不能压住上下文、
+            出事之后能不能逐行复盘。
           </p>
         </div>
       </div>

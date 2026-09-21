@@ -54,10 +54,10 @@ export default {
       why: 'B = 0 保证起点与原模型完全一致; 同时 A 非零让 B 的梯度不为零, 训练能正常启动。两个都为 0 则梯度全为 0。',
     },
     {
-      q: '关于 merge (W ← W + (α/r)·BA), 哪句话是对的?',
-      options: ['merge 后推理更慢, 因为矩阵变大了', 'merge 后就是普通 Linear, 推理零额外开销; 代价是不能再按请求热切换 adapter', 'merge 会损失精度, 输出与 merge 前不同', 'merge 之后仍需保留 A、B 才能推理'],
-      answer: 1,
-      why: 'W + BA 与 W 同形状, 数学上等价 (只差浮点舍入)。多租户服务想共享基座、动态换 adapter 时才选择不 merge。',
+      q: '同一个基座、同一份数据、同样 300 步, 本仓库实测全参留出集 EM 0.809, LoRA(r=8) 只有 0.352。这说明 LoRA 买到的是什么?',
+      options: ['更快的收敛', '更高的效果上限', '显存、存储和多租户可插拔 —— 效果上限 ≤ 全参, 步数也不会更少', '更好的泛化'],
+      answer: 2,
+      why: '旧版 README 里"LoRA 收敛更快"来自病态初始化 (初始 loss ≈ 250) + 只背 2 条样本 + 10× 学习率。修好初始化、改用留出集重测后, 同步数下全参更快更好。',
     },
   ],
   'finetune-dpo': [
@@ -68,10 +68,10 @@ export default {
       why: 'policy = ref 时隐式奖励差 Δ = 0, −log σ(0) = ln 2, 与 β 无关。初始 loss 不是 0.693 通常意味着 ref/policy 没对齐或 mask 有 bug。',
     },
     {
-      q: 'DPO 对每个偏好对的梯度权重是 σ(−βΔ)。这意味着什么?',
-      options: ['所有样本贡献相同', '排错的样本会被忽略', 'Δ 越大梯度越大', '模型已经排对且差距够大的样本几乎不再产生梯度, 训练集中在排错的样本上'],
-      answer: 3,
-      why: 'Δ 很大时 σ(−βΔ) → 0, 样本自动"退出"; Δ < 0 时权重 > 0.5, 被重点纠正 —— 与 logistic 回归的行为一致。',
+      q: '本仓库 200 步 DPO: 留出集偏好准确率 0.965 → 0.996, log π(chosen) −4.03 → −4.18, 贪心 EM 0.332 → 0.137。怎么解释?',
+      options: ['评估脚本有 bug', 'loss 只看 chosen 与 rejected 的差; 两边一起降、rejected 降得更快, loss 照样变小 —— margin 变大不等于模型变好', '步数不够, 再训一会儿就好了', 'β 设得太小'],
+      answer: 1,
+      why: 'likelihood displacement: 优化目标里没有任何一项要求 chosen 自己的概率上升。所以盯 margin 之外还要盯 log π(chosen); ORPO 的 NLL 项正是为此而设。',
     },
     {
       q: '把 β 调大, 效果是?',
@@ -114,10 +114,10 @@ export default {
       why: 'loss 下降和显存都不能证明 base 被冻结; 参数统计 (本仓库的 print_trainable_parameters) 才是直接证据。',
     },
     {
-      q: 'DPO 训练脚本里 ref 模型必须满足什么?',
-      options: ['eval 模式 + no_grad, 且全程不更新', '与 policy 共享同一份权重对象', '比 policy 更大', '用更高的学习率'],
-      answer: 0,
-      why: 'ref 是固定的锚点; 如果它跟着更新 (或与 policy 是同一个对象), 隐式奖励差恒为 0, loss 永远停在 ln 2。',
+      q: '手上只有 (问, 答), 显存只够常驻一份权重加上 adapter 的优化器状态。下面哪一组还能用?',
+      options: ['DPO', 'GRPO 系', 'LoRA / QLoRA / DoRA', 'SimPO / ORPO'],
+      answer: 2,
+      why: 'DPO 要常驻 policy + ref 两份 (778 KB, 加全参 Adam 合计 1556 KB); GRPO 还得有 verifier 并能在线采样; SimPO / ORPO 要的是成对偏好。只有 (问, 答) 且显存紧, 剩下的就是 PEFT 三兄弟。',
     },
   ],
   'finetune-qlora': [
@@ -185,19 +185,19 @@ export default {
       q: 'clip 的上界 1+ε 实际上约束的是哪类 token?',
       options: ['所有 token 一视同仁', '高概率 token, 因为它们涨得快', '低概率 token: ρ ≤ 1/π_old, 高概率 token 根本碰不到上界, 被卡住的只有想翻身的探索 token', '只约束 Â < 0 的 token'],
       answer: 2,
-      why: 'π_old = 0.9 时 ρ 最大 1.11 < 1.2; π_old = 0.01 的 token 每轮最多涨到 0.012。DAPO 的 clip-higher 因此只放宽上界。',
+      why: 'π_old = 0.9 时 ρ 最大 1.11 < 1.2; π_old = 0.01 的 token 每轮最多涨到 0.012。DAPO 的 clip-higher 因此只放宽上界。另外: 一批样本只更新一次时 ρ ≡ 1 (实测第 1 个 epoch |ρ−1| = 0.000), clip 根本没上场。',
     },
     {
       q: 'GRPO 的 loss 先对每条回答内部按长度平均 (1/|o_i|)。它带来的偏置是?',
       options: ['短回答被过度惩罚, 模型越写越短', '又长又错的回答每个 token 挨的罚更轻, 模型倾向于"错的时候写长点"', '没有偏置', '长回答的奖励被放大'],
       answer: 1,
-      why: '同样的负优势被摊到更多 token 上。Dr.GRPO 用常数分母, DAPO 用 token 级平均, 都是为了去掉这个长度偏置。',
+      why: '同样的负优势被摊到更多 token 上: 实测 3-token 回复的单 token 权重是 9-token 的 3.0 倍。Dr.GRPO 用常数分母, DAPO 用 token 级平均, 两者都把这个比值压回 1.0。',
     },
     {
       q: '一个 prompt 的 G 条回答全部正确。对这一组, 哪种处理是 DAPO 的做法?',
       options: ['优势全为 0、没有梯度: 丢弃该组继续采样, 直到 batch 里每组都有对有错', '给全组正优势', '把 σ 加一个大 ε 后照常训练', '只保留最长的一条'],
       answer: 0,
-      why: '零方差的组不提供任何学习信号, 却占着 batch 名额; 动态采样保证每个 batch 的有效梯度样本数恒定。',
+      why: '零方差的组不提供任何学习信号, 却占着 batch 名额。实测这类 prompt 占 32%: 开了动态采样后, 进 loss 的 A=0 样本从 32.1% 降到 0.0%。本仓库只过滤不补采, batch 会变小; DAPO 原版会继续采到凑满。',
     },
   ],
   'finetune-onpolicy-distill': [
@@ -217,7 +217,7 @@ export default {
       q: '相对 GRPO 这类 RL, on-policy 蒸馏的监督信号有什么不同?',
       options: ['更稀疏', '每个 token 都有老师的完整分布作为信号 (稠密), 而 RL 每条序列只有一个标量奖励', '需要人工标注', '只能用于分类任务'],
       answer: 1,
-      why: '同样是 on-policy 采样, 蒸馏把"整条序列一个分"换成"每个位置一个分布", 样本效率高得多, 前提是有一个好老师。',
+      why: '同样是 on-policy 采样, 蒸馏把"整条序列一个分"换成"每个位置一个分布", 样本效率高得多, 前提是有一个好老师。实测样本合格率: 离线 0.059 → on-policy 0.402; 代价是老师的少数派答法被压到 log π = −33。',
     },
   ],
   'finetune-rlvr': [

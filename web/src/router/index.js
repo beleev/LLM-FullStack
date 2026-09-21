@@ -259,6 +259,12 @@ const routes = [
     meta: { title: '总览对照表', stage: 'outro', chapter: '终章' },
   },
   {
+    path: '/fast-track',
+    name: 'fast-track',
+    component: () => import('@/views/FastTrack.vue'),
+    meta: { title: '速成路线', stage: 'outro', chapter: '怎么读' },
+  },
+  {
     path: '/glossary',
     name: 'glossary',
     component: () => import('@/views/Glossary.vue'),

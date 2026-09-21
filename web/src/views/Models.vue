@@ -2,18 +2,19 @@
   <div>
     <h1 class="page-title">常见模型结构 · 把主流模型拆成四类零件</h1>
     <p class="page-subtitle">
-      阶段 2 从 <RepoLink path="llm_basic/" label="llm_basic/" tiny /> 进入
-      <RepoLink path="llm_models/" label="llm_models/" tiny />：不再手写每个梯度，
-      而是把 attention、FFN、norm、position 这些零件组合成 Transformer、MoE、多模态和扩散模型。
+      阶段 1 在 <RepoLink path="llm_basic/" label="llm_basic/" tiny /> 里手写了每一个梯度，原理那一关已经过了。
+      阶段 2 进 <RepoLink path="llm_models/" label="llm_models/" tiny /> 换成 PyTorch，
+      把 attention、FFN、norm、position 四种零件装进同一个 Block，堆出 Transformer、MoE、多模态和扩散模型。
+      <strong>换一个零件只需要改前向，反向交给 autograd</strong> —— 这才有可能在一个仓库里放下二十多种架构。
     </p>
 
     <ChapterIntro
-      tldr="主流模型的差别大多落在 4 个槽位: attention 怎么省 KV cache, FFN 是否门控/稀疏, norm 放哪里, position 怎么注入。"
-      question="读一个新模型时, 能不能先判断它只是替换了哪些零件, 而不是把整套架构重新读一遍?"
+      tldr="主流模型的差别几乎都落在 4 个槽位: attention 怎么省 KV cache, FFN 门不门控、稀不稀疏, norm 放在子层前还是后, 位置信息从哪注入。"
+      question="拿到一个没读过的模型, 能不能先认出它只换了哪几个零件, 而不是把整套架构从头读一遍?"
       :goals="[
-        '用同一张零件表理解 Transformer / LLaMA / Mixtral / DeepSeek',
-        '把多模态和扩散模型放回 token 化 + Transformer block 的主线',
-        '知道阶段 2 每个小标题应该对照哪一组源码',
+        '用同一张零件表读懂 Transformer / LLaMA / Mixtral / DeepSeek',
+        '把多模态和扩散模型放回 “先 token 化, 再过 Transformer block” 这条主线',
+        '知道每个小标题该对着哪一组源码看',
       ]"
       :codes="[
         { path: 'llm_models/layers/core/' },
@@ -30,7 +31,10 @@
     <section class="section">
       <h2>阶段 2 的阅读顺序</h2>
       <p class="lead">
-        先看注意力，因为它决定长上下文推理成本；再看位置编码和 Block 组装；最后进入 MoE 与扩散生成两条分支。
+        先看注意力，因为它直接决定长上下文的推理成本：一个 token 在全部层上的 KV，
+        LLaMA-2-7B (MHA) 要 512 KiB，LLaMA-3-8B 换成 GQA 后 128 KiB，DeepSeek-V3 换成 MLA 后 68.6 KiB。
+        再看位置编码和 Block 组装，最后分两条分支：MoE 把 FFN 拆稀疏，扩散换一套生成方式。
+        每一章的形状都一样 —— 上一代哪里疼，这一代怎么止疼，又引出了什么新疼。
       </p>
       <div class="grid grid-3">
         <router-link
@@ -48,7 +52,7 @@
 
     <section class="section">
       <h2>四个源码入口</h2>
-      <p class="lead">读模型代码时先从这些入口找槽位，再进入具体模型实现。</p>
+      <p class="lead">读一个模型时先来这四个文件认槽位，认完再去看它自己的实现文件，一般只剩几十行。</p>
       <div class="card" style="padding: 0; overflow-x: auto;">
         <table class="models-table">
           <thead>
@@ -71,7 +75,10 @@
 
     <section class="section">
       <h2>模型族谱</h2>
-      <p class="lead">阶段 2 时间线上的 {{ timeline.length }} 个模型共享同一套元数据，源码列已全部跳转到 GitHub。</p>
+      <p class="lead">
+        时间线上这 {{ timeline.length }} 个模型共用同一套元数据，源码列直接跳到 GitHub。
+        按年份读一遍，你会发现新模型几乎从不从零开始，都是在上一个的某个槽位上改。
+      </p>
       <div class="card" style="padding: 0; overflow-x: auto;">
         <table class="models-table">
           <thead>
@@ -119,10 +126,10 @@ import RepoLink from '@/components/RepoLink.vue'
 import { modelChapters, timeline } from '@/data/models.js'
 
 const sourceRows = [
-  { slot: 'Attention', problem: 'MHA / GQA / MLA / DSA 如何改变 KV cache 和长上下文成本', file: 'llm_models/layers/core/attention.py' },
-  { slot: 'Position', problem: 'Sin / Learnable / RoPE / M-RoPE 如何把位置信息注入模型', file: 'llm_models/layers/core/position_encoding.py' },
-  { slot: 'Block', problem: 'attn、ffn、norm、pos 如何拼成可复用 Transformer block', file: 'llm_models/layers/core/blocks.py' },
-  { slot: 'Sparse / Generative', problem: 'MoE、SSM、DiT、MM-DiT、VAR 如何扩展主干结构', file: 'llm_models/layers/sparse/' },
+  { slot: 'Attention', problem: '每个 token 要缓存多少东西: MHA → GQA → MLA → DSA 一路在砍这个数', file: 'llm_models/layers/core/attention.py' },
+  { slot: 'Position', problem: '位置信息从哪进模型: Sin / Learnable 加在 embedding 上, RoPE / M-RoPE 乘在 Q/K 上', file: 'llm_models/layers/core/position_encoding.py' },
+  { slot: 'Block', problem: '把 attn、ffn、norm、pos 装进同一个壳: 所有模型共用的那段控制流', file: 'llm_models/layers/core/blocks.py' },
+  { slot: 'Sparse / Generative', problem: '主干之外的扩展: MoE 把 FFN 拆稀疏, SSM 换掉注意力, DiT / MM-DiT / VAR 换掉生成方式', file: 'llm_models/layers/sparse/' },
 ]
 
 const sortedTimeline = computed(() =>

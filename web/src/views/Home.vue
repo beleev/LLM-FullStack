@@ -41,6 +41,17 @@
       </div>
     </section>
 
+    <!-- ── 该读哪些: 75 章太多, 先给一条路线 ─────────────────── -->
+    <section class="section">
+      <div class="card route-cta">
+        <div>
+          <p class="cta-k">75 章不用全读</p>
+          <p class="cta-t">主干 {{ coreCount }} 章走完整条链路, 冲刺 {{ sprintCount }} 章一天读完; 其余是分支和深水区, 随时回来补。</p>
+        </div>
+        <router-link :to="{ name: 'fast-track' }"><button type="button" class="active">看速成路线 →</button></router-link>
+      </div>
+    </section>
+
     <!-- ── 新手 30 秒导览 ─────────────────────────────────────── -->
     <section class="section onboarding">
       <h2>新手 30 秒导览 <span class="lead-inline">第一次来? 先看这里</span></h2>
@@ -273,6 +284,7 @@ import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { tracks, timeline, years, findModel, stages, learningPath } from '@/data/models.js'
 import { useProgress } from '@/composables/useProgress.js'
+import { inLevel } from '@/data/tiers.js'
 import ChapterIntro from '@/components/ChapterIntro.vue'
 import ChapterNav from '@/components/ChapterNav.vue'
 import RepoLink from '@/components/RepoLink.vue'
@@ -282,6 +294,8 @@ const progress = useProgress()
 const chapters = learningPath.filter((p) => p.route !== 'home')
 const resume = computed(() => chapters.find((p) => p.route === progress.state.last) || null)
 const nextUnread = computed(() => chapters.find((p) => !progress.isVisited(p.route)) || null)
+const coreCount = computed(() => chapters.filter((c) => inLevel(c.route, 'core')).length)
+const sprintCount = computed(() => chapters.filter((c) => inLevel(c.route, 'sprint')).length)
 const readCount = computed(() => learningPath.filter((p) => progress.isVisited(p.route)).length)
 const masteredCount = computed(() => learningPath.filter((p) => progress.isMastered(p.route)).length)
 
@@ -358,6 +372,9 @@ const toFor = (s) => {
 </script>
 
 <style scoped>
+.route-cta { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; border-left: 3px solid var(--accent); }
+.cta-k { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.8px; }
+.cta-t { font-size: 14px; margin-top: 4px; max-width: 70ch; line-height: 1.7; }
 .resume { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; border-left: 3px solid var(--left); }
 .resume-k { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.8px; }
 .resume-t { font-size: 16px; font-weight: 600; margin: 2px 0 4px; }

@@ -1,4 +1,5 @@
-// 阶段 4 · llm_finetune: 章节路由 -> 实验台。finetune-rlhf 另有 models.js 里的 widgets (GrpoLab, SoftmaxTempLab)。
+// 阶段 4 · llm_finetune: 章节路由 -> 实验台。
+// finetune-rlhf 另有 topics/finetune.js 里的 widgets (GrpoLab, SoftmaxTempLab)。
 export default {
   'finetune-sft': ['FtSftMaskLab'],
   'finetune-lora': ['FtLoraLab'],
@@ -10,4 +11,5 @@ export default {
   'finetune-grpo-variants': ['FtClipLab', 'FtGrpoAdvLab', 'FtGspoLab'],
   'finetune-onpolicy-distill': ['FtKlLab', 'FtDistillT2Lab'],
   'finetune-rlvr': ['FtRlvrLab'],
+  'finetune-runs': ['FtChooseLab'],
 }
